@@ -14,7 +14,9 @@
 //! random client id.
 
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, GetString, OffsetKind, Options, Text, TextRef, Transact, Update};
+use yrs::{
+    Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, TextRef, Transact, Update,
+};
 
 pub const TEXT_NAME: &str = "content";
 
@@ -83,6 +85,23 @@ impl FileDoc {
         let mut txn = self.doc.transact_mut();
         txn.apply_update(update)
             .map_err(|e| DocError::Apply(e.to_string()))
+    }
+
+    /// The whole document as one update, to rebuild it later with
+    /// [`FileDoc::from_snapshot`].
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// A document in exactly the state `snapshot` recorded, editing under
+    /// `client_id`. Used to make an edit *relative to that moment* and merge
+    /// it into the live document — a three-way merge done by the CRDT.
+    pub fn from_snapshot(client_id: u64, snapshot: &[u8]) -> Result<Self, DocError> {
+        let doc = Self::new(client_id);
+        doc.apply(snapshot)?;
+        Ok(doc)
     }
 
     pub fn content(&self) -> String {

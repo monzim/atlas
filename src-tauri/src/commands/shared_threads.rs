@@ -436,6 +436,7 @@ fn view_of(app: &AppHandle, shared_thread_id: &str) -> Option<SharedThreadView> 
     running.get(shared_thread_id).map(|r| SharedThreadView {
         entry: r.entry.clone(),
         status: r.status.borrow().clone(),
+        session_id: local_session(app, shared_thread_id),
         shared_files: Vec::new(),
         blocked_files: Vec::new(),
     })

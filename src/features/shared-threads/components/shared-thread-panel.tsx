@@ -215,6 +215,19 @@ function ThreadCard({
         <span>{status.materialized ? "Checked out" : "Not checked out yet"}</span>
       </div>
       {status.error && <p className="text-warning">{status.error}</p>}
+      {status.held.length > 0 && (
+        <div className="flex flex-col gap-1 rounded bg-warning-muted p-2 text-warning">
+          <span className="flex items-center gap-1.5 font-medium">
+            <ShieldAlert size={12} /> Not syncing — looks like it holds a secret
+          </span>
+          {status.held.map((path) => (
+            <span key={path} className="font-mono">
+              {path}
+            </span>
+          ))}
+          <span className="text-[var(--secondary-foreground)]">Remove it and save; your edits merge with the team's.</span>
+        </div>
+      )}
 
       {result && result.blockedFiles.length > 0 && (
         <div className="flex flex-col gap-1 rounded bg-warning-muted p-2 text-warning">

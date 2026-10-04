@@ -20,6 +20,8 @@ export interface SharedThreadStatus {
   /** Where the replica worktree is (or will be) — never the person's own checkout. */
   worktree: string;
   files: number;
+  /** Files kept on this machine because they now look like they hold a secret. */
+  held: string[];
   error: string | null;
 }
 

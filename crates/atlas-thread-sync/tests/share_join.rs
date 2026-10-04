@@ -422,3 +422,53 @@ async fn a_secret_created_in_the_replica_stays_local() {
     );
     assert_eq!(server.head(), before);
 }
+
+#[tokio::test]
+async fn a_secret_pasted_into_a_tracked_file_is_held_then_merged_when_removed() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
+    joy.share_working_changes(&w.joy).await.unwrap();
+    let mut monzim = open(
+        &server,
+        &w.monzim,
+        &w.base,
+        &w.replicas.join("monzim"),
+        "monzim",
+    )
+    .await;
+    let joy_root = joy.materialize().unwrap();
+    let monzim_root = monzim.materialize().unwrap();
+
+    // Joy pastes a credential into a file the thread already holds.
+    let leaked =
+        "todo: red?\nconst db = \"postgres://admin:hunter2hunter2@db.internal:5432/prod\";\n";
+    write(&joy_root, "notes.md", leaked);
+    let before = server.head();
+    assert_eq!(joy.file_saved("notes.md").await.unwrap(), LocalChange::Echo);
+    assert_eq!(
+        server.head(),
+        before,
+        "nothing about the held file was sent"
+    );
+    assert_eq!(joy.replica().held_files(), vec!["notes.md".to_string()]);
+
+    // Monzim edits the same file meanwhile; Joy's disk keeps her bytes.
+    write(
+        &monzim_root,
+        "notes.md",
+        "monzim: blue is fine\ntodo: red?\n",
+    );
+    monzim.file_saved("notes.md").await.unwrap();
+    joy.pump(QUIET).await.unwrap();
+    assert_eq!(read(&joy_root, "notes.md"), leaked);
+
+    // She removes the secret and keeps her other edit: both edits merge.
+    write(&joy_root, "notes.md", "todo: red?\njoy: using green\n");
+    joy.file_saved("notes.md").await.unwrap();
+    assert!(joy.replica().held_files().is_empty());
+    let merged = "monzim: blue is fine\ntodo: red?\njoy: using green\n";
+    assert_eq!(read(&joy_root, "notes.md"), merged);
+    monzim.pump(QUIET).await.unwrap();
+    assert_eq!(read(&monzim_root, "notes.md"), merged);
+}

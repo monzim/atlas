@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::doc::{random_client_id, FileDoc};
 use crate::git;
 use crate::path;
+use crate::secrets::secret_reason;
 
 /// Prefix of the temporary files atomic writes go through. The watcher and
 /// [`path::relative`] ignore anything named like this.
@@ -81,6 +82,12 @@ struct TrackedFile {
     /// What this replica last wrote to, or read from, disk for this file.
     /// `None` until the worktree exists.
     disk: Option<Hash>,
+    /// Set while the file on disk holds something that looks like a secret:
+    /// the document as it was at that moment. Nothing from disk is sent and
+    /// nothing is written to disk until the secret is gone; then the person's
+    /// edit is made relative to this snapshot and merged, so changes the
+    /// thread took meanwhile survive.
+    held: Option<Vec<u8>>,
 }
 
 /// What a save on disk amounts to.
@@ -191,6 +198,7 @@ impl Replica {
                 path: rel.to_string(),
                 doc,
                 disk: None,
+                held: None,
             },
         );
         self.by_path.insert(rel.to_string(), file_id);
@@ -243,8 +251,13 @@ impl Replica {
         // A save we have not seen yet goes into the document before the
         // remote change, or writing the merge back would erase it.
         let pending = self.ingest_disk(file_id)?;
-        self.files[&file_id].doc.apply(update)?;
-        self.sync_disk(file_id)?;
+        let file = &self.files[&file_id];
+        file.doc.apply(update)?;
+        // A held file keeps the person's bytes on disk; the change waits in
+        // the document and lands with the merge when the secret is removed.
+        if file.held.is_none() {
+            self.sync_disk(file_id)?;
+        }
         Ok(pending)
     }
 
@@ -294,8 +307,43 @@ impl Replica {
         if file.disk == Some(seen) || !looks_textual(&bytes) {
             return Ok(None);
         }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+
+        // The same gate as sharing and new files, for every later save: a
+        // credential pasted into a tracked file is held on this machine.
+        if secret_reason(&file.path, &content).is_some() {
+            if file.held.is_none() {
+                tracing::info!(target: "atlas_thread_sync", path = %file.path, "holding a file that now looks secret");
+                file.held = Some(file.doc.snapshot());
+            }
+            return Ok(None);
+        }
+
         file.disk = Some(seen);
-        Ok(file.doc.set_content(&String::from_utf8_lossy(&bytes)))
+        match file.held.take() {
+            None => Ok(file.doc.set_content(&content)),
+            Some(snapshot) => {
+                // Resume: the person's edit, relative to the moment the file
+                // was held, merged into whatever the thread did since. Then
+                // disk gets the merge.
+                let fork = FileDoc::from_snapshot(self.client_id, &snapshot)?;
+                let update = fork.set_content(&content);
+                if let Some(update) = &update {
+                    file.doc.apply(update)?;
+                }
+                self.sync_disk(file_id)?;
+                Ok(update)
+            }
+        }
+    }
+
+    /// Files held back because they now look like they contain a secret.
+    pub fn held_files(&self) -> Vec<String> {
+        self.files
+            .values()
+            .filter(|f| f.held.is_some())
+            .map(|f| f.path.clone())
+            .collect()
     }
 
     /// Write the document to disk if disk differs, atomically, and remember

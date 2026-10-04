@@ -57,6 +57,9 @@ pub struct SyncStatus {
     pub materialized: bool,
     pub worktree: PathBuf,
     pub files: usize,
+    /// Files held on this machine because they now look like they contain a
+    /// secret. They resume syncing once it is removed.
+    pub held: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -73,6 +76,7 @@ fn status_of<T: Transport>(
         materialized: replica.is_materialized(),
         worktree: replica.root().to_path_buf(),
         files: replica.files().count(),
+        held: replica.held_files(),
         error,
     }
 }
