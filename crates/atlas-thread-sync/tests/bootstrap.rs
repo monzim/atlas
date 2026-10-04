@@ -115,7 +115,7 @@ async fn a_joiner_with_an_older_clone_receives_only_the_missing_history_and_conv
     assert_eq!(bundles.len(), 1);
     assert_eq!(bundles[0].1.prerequisites, vec![w.older.clone()]);
 
-    let root = alice.materialize().unwrap();
+    let root = alice.materialize().await.unwrap();
     assert_eq!(read(&root, "src/feature.ts"), "export const feature = 1;\n");
     assert_eq!(read(&root, "README.md"), "# Site\n\nNow with a feature.\n");
     assert_eq!(
@@ -147,7 +147,7 @@ async fn a_joiner_with_no_repository_receives_a_full_bundle_and_converges() {
     assert_eq!(bundles.len(), 1);
     assert!(bundles[0].1.prerequisites.is_empty(), "a full bundle");
 
-    let root = alice.materialize().unwrap();
+    let root = alice.materialize().await.unwrap();
     assert_eq!(read(&root, "src/feature.ts"), "export const feature = 1;\n");
     assert_eq!(
         read(&root, "src/banner.css"),
@@ -186,7 +186,7 @@ async fn over_the_bundle_limit_the_joiner_watches_and_is_told_why() {
         ".banner {\n  color: green;\n}\n"
     );
     // But nothing can be checked out, and nothing is sent.
-    assert!(alice.materialize().is_err());
+    assert!(alice.materialize().await.is_err());
     assert_eq!(
         alice.file_saved("src/banner.css").await.unwrap(),
         LocalChange::Ignored
@@ -296,7 +296,7 @@ async fn ignored_files_never_sync_from_a_share_or_a_replica() {
     let report = joy.share_working_changes(&w.joy, &[]).await.unwrap();
     assert!(!report.shared.iter().any(|p| p == "debug.log" || p.starts_with("dist/")));
 
-    let root = joy.materialize().unwrap();
+    let root = joy.materialize().await.unwrap();
     write(&root, "dist/out.js", "built();\n");
     write(&root, "trace.log", "more noise\n");
     write(&root, "src/new.ts", "export {};\n");

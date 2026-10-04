@@ -334,7 +334,7 @@ async fn typing_during_a_run_never_touches_its_worktree_and_both_survive() {
 
     let joy_run = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
     // Monzim types in his replica while Joy's agent works.
-    let root = monzim.materialize().unwrap();
+    let root = monzim.materialize().await.unwrap();
     write(&root, "README.md", "# Site\n\nTyped by Monzim.\n");
     monzim.file_saved("README.md").await.unwrap();
     joy.pump(QUIET).await.unwrap();

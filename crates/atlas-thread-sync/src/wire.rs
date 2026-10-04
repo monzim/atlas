@@ -153,12 +153,24 @@ pub struct TreeEntry {
     /// `merge.submit` compares. Absent from servers before ATL-398.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_version: Option<u64>,
+    /// A binary file's content now: a blob under the thread (ATL-403).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// Deleted. The entry stays, with its id and history.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    /// The path the file entered the thread under, when a rename moved it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
+/// How a file syncs (ATL-403): co-edited text, or whole blobs — what git's NUL
+/// heuristic calls binary, or anything over 1 MiB — last writer wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileKind {
     Text,
+    Binary,
 }
 
 /// A thread role, as the server names it.
@@ -211,6 +223,23 @@ pub enum ClientControl {
         /// this replica could not say.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_blob: Option<Option<String>>,
+    },
+    /// Move a file: the same id at a new path (ATL-403).
+    #[serde(rename = "tree.rename", rename_all = "camelCase")]
+    TreeRename {
+        client_seq: u64,
+        file_id: u64,
+        path: String,
+    },
+    /// Delete a file; its entry stays.
+    #[serde(rename = "tree.delete", rename_all = "camelCase")]
+    TreeDelete { client_seq: u64, file_id: u64 },
+    /// A binary file's content is now this blob, uploaded first.
+    #[serde(rename = "blob.set", rename_all = "camelCase")]
+    BlobSet {
+        client_seq: u64,
+        file_id: u64,
+        blob: String,
     },
     /// This replica lacks the Base: `have` lists the commits it holds, so a
     /// thin bundle can be built. Empty asks for a full one (ATL-402).

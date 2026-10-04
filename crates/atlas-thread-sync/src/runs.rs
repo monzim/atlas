@@ -39,6 +39,10 @@ pub struct Fork {
     /// The thread's `seq` the Run forked at.
     pub seq: u64,
     pub files: BTreeMap<u64, ForkFile>,
+    /// Paths the Base has and canonical state does not: deleted files, and
+    /// where renamed ones used to be (ATL-403). Binary files stay at their
+    /// Base content in a Run worktree; a Run edits text.
+    pub removed: Vec<String>,
 }
 
 /// A Run this replica started and has not finished.
@@ -88,6 +92,14 @@ impl RunWorktree {
             }
             git::add_worktree(&self.repo, &self.root, &self.base)?;
         }
+        for rel in &fork.removed {
+            let target = crate::path::resolve(&self.root, rel)?;
+            match fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(ReplicaError::Io { path: target, source }),
+            }
+        }
         for file in fork.files.values() {
             let target = crate::path::resolve(&self.root, &file.path)?;
             write_atomic(&target, file.content.as_bytes())?;
@@ -109,6 +121,8 @@ impl RunWorktree {
         let mut seen = std::collections::BTreeSet::new();
         // Anything git sees as changed against the Base, plus every file the
         // thread holds (its fork text already differs from the Base).
+        // A removed path the Run left alone shows as deleted and is skipped;
+        // one it wrote again comes back into the thread.
         let mut candidates: Vec<String> = git::dirty_paths(&self.root)?
             .into_iter()
             .filter(|d| !d.deleted)

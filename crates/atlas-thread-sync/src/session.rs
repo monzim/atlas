@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::git;
 use crate::merge::{self, MergeError};
-use crate::replica::{LocalChange, Replica, ReplicaError};
+use crate::replica::{kind_of, LocalChange, Replica, ReplicaError};
 use crate::runs::{ActiveRun, Fork, RunReport, RunSpec, RunWorktree};
 use crate::secrets::{secret_reason, SecretReason};
 use crate::share::{self, ShareKind};
@@ -151,7 +151,10 @@ pub struct ThreadSession<T: Transport> {
     head: u64,
     next_client_seq: u64,
     /// `tree.ensure` frames awaiting their ack, by `client_seq`.
-    pending_tree: HashMap<u64, String>,
+    pending_tree: HashMap<u64, (String, FileKind)>,
+    /// Files gone from disk, not yet known to be deleted rather than moved
+    /// (ATL-403). Settled by [`ThreadSession::settle_removals`].
+    missing: Vec<u64>,
     gaps: u64,
     updates_sent: u64,
     last_nack: Option<(String, String)>,
@@ -211,6 +214,7 @@ impl<T: Transport> ThreadSession<T> {
             head: 0,
             next_client_seq: 1,
             pending_tree: HashMap::new(),
+            missing: Vec::new(),
             gaps: 0,
             updates_sent: 0,
             last_nack: None,
@@ -508,6 +512,7 @@ impl<T: Transport> ThreadSession<T> {
         let fork = Fork {
             seq: self.head,
             files: self.replica.fork_files(),
+            removed: self.replica.removed_paths(),
         };
         Ok(worktree.reset(&fork)?)
     }
@@ -523,6 +528,7 @@ impl<T: Transport> ThreadSession<T> {
         let fork = Fork {
             seq: self.head,
             files: self.replica.fork_files(),
+            removed: self.replica.removed_paths(),
         };
         worktree.reset(&fork)?;
         let client_seq = self.take_client_seq();
@@ -658,7 +664,7 @@ impl<T: Transport> ThreadSession<T> {
             for (file_id, base_version, path, merged) in planned {
                 let file_id = match file_id {
                     Some(id) => id,
-                    None => self.ensure_file(&path, true).await?,
+                    None => self.ensure_file(&path, true, FileKind::Text).await?,
                 };
                 ready.push((file_id, base_version, path, merged));
             }
@@ -825,9 +831,20 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Check the worktree out (lazily, once) and write the canonical state on
-    /// it. Called when the person first opens a file or prompts.
-    pub fn materialize(&mut self) -> Result<PathBuf, SessionError> {
-        Ok(self.replica.materialize()?.to_path_buf())
+    /// it — binary files fetched from the thread. Called when the person first
+    /// opens a file or prompts.
+    pub async fn materialize(&mut self) -> Result<PathBuf, SessionError> {
+        let root = self.replica.materialize()?.to_path_buf();
+        for (file_id, sha) in self.replica.blobs_to_fetch() {
+            self.fetch_blob(file_id, sha).await?;
+        }
+        Ok(root)
+    }
+
+    /// Fetch a binary file's canonical blob and write it.
+    async fn fetch_blob(&mut self, file_id: u64, sha: String) -> Result<(), SessionError> {
+        let bytes = self.store.get_blob(sha).await?;
+        Ok(self.replica.write_blob(file_id, &bytes)?)
     }
 
     /// Receive and apply whatever arrives, until nothing has for `idle`.
@@ -867,26 +884,127 @@ impl<T: Transport> ThreadSession<T> {
                     update: Vec::new(),
                 })
             }
+            LocalChange::Blob {
+                file_id,
+                sha256,
+                bytes,
+            } => {
+                self.set_blob(file_id, &sha256, bytes).await?;
+                Ok(LocalChange::Blob {
+                    file_id,
+                    sha256,
+                    bytes: Vec::new(),
+                })
+            }
+            LocalChange::Missing { file_id } => {
+                // Deleted, or moved: which is known once the new path is seen
+                // (or is not, by the time removals are settled).
+                if !self.missing.contains(&file_id) {
+                    self.missing.push(file_id);
+                }
+                Ok(LocalChange::Missing { file_id })
+            }
+            LocalChange::Renamed { file_id, from, to } => {
+                if self.ignores(&to)? {
+                    return Ok(LocalChange::Ignored);
+                }
+                let client_seq = self.take_client_seq();
+                let rename = ClientControl::TreeRename {
+                    client_seq,
+                    file_id,
+                    path: to.clone(),
+                };
+                self.expect_ack(client_seq, &rename).await?;
+                self.replica.rename(file_id, &to)?;
+                self.missing.retain(|id| *id != file_id);
+                Ok(LocalChange::Renamed { file_id, from, to })
+            }
             LocalChange::NewFile { path } => {
                 // Build output, dependencies and whatever `.atlas/shareignore`
                 // names never sync, wherever they are written.
                 if self.ignores(&path)? {
                     return Ok(LocalChange::Ignored);
                 }
+                let bytes = self.replica.read_bytes(&path)?;
+                let kind = kind_of(&bytes);
                 // A credential created in the replica stays on this machine,
-                // for the same reason it is held back at share time.
-                let content = self.replica.read_disk(&path)?;
+                // for the same reason it is held back at share time. Binary
+                // content is judged by its name.
+                let content = match kind {
+                    FileKind::Text => String::from_utf8_lossy(&bytes).into_owned(),
+                    FileKind::Binary => String::new(),
+                };
                 if let Some(reason) = secret_reason(&path, &content) {
                     tracing::info!(target: "atlas_thread_sync", ?reason, "holding back a new file that looks secret");
                     return Ok(LocalChange::Ignored);
                 }
-                let file_id = self.ensure_file(&path, true).await?;
-                if let LocalChange::Update { update, .. } = self.replica.local_change(&path)? {
-                    self.send_update(file_id, update).await?;
+                let file_id = self.ensure_file(&path, true, kind).await?;
+                match kind {
+                    FileKind::Text => {
+                        if let LocalChange::Update { update, .. } = self.replica.local_change(&path)? {
+                            self.send_update(file_id, update).await?;
+                        }
+                    }
+                    FileKind::Binary => {
+                        let sha = bootstrap::sha256_hex(&bytes);
+                        self.replica.saw_bytes(file_id, &bytes);
+                        self.set_blob(file_id, &sha, bytes).await?;
+                    }
                 }
                 Ok(LocalChange::NewFile { path })
             }
             other => Ok(other),
+        }
+    }
+
+    /// Files that went missing and did not turn up elsewhere are deleted in
+    /// the thread. The app's loop calls this once saves have been quiet for a
+    /// moment, so a move — reported as a removal and a creation, in either
+    /// order — is seen as the rename it is.
+    pub async fn settle_removals(&mut self) -> Result<Vec<String>, SessionError> {
+        let mut deleted = Vec::new();
+        for file_id in std::mem::take(&mut self.missing) {
+            if !self.replica.is_missing(file_id) {
+                continue;
+            }
+            let path = self
+                .replica
+                .files()
+                .find(|(id, _)| *id == file_id)
+                .map(|(_, p)| p.to_string());
+            let client_seq = self.take_client_seq();
+            self.expect_ack(client_seq, &ClientControl::TreeDelete { client_seq, file_id })
+                .await?;
+            self.replica.delete(file_id)?;
+            deleted.extend(path);
+        }
+        Ok(deleted)
+    }
+
+    /// Are removals waiting to be settled?
+    pub fn removals_pending(&self) -> bool {
+        !self.missing.is_empty()
+    }
+
+    /// Upload a binary file's bytes and make them canonical (ATL-403).
+    async fn set_blob(&mut self, file_id: u64, sha: &str, bytes: Vec<u8>) -> Result<(), SessionError> {
+        self.store.put_blob(sha.to_string(), bytes).await?;
+        let client_seq = self.take_client_seq();
+        let set = ClientControl::BlobSet {
+            client_seq,
+            file_id,
+            blob: sha.to_string(),
+        };
+        self.expect_ack(client_seq, &set).await?;
+        Ok(self.replica.set_blob(file_id, sha)?)
+    }
+
+    /// Send a frame the server answers with a plain ack.
+    async fn expect_ack(&mut self, client_seq: u64, frame: &ClientControl) -> Result<(), SessionError> {
+        match self.ask(client_seq, frame).await? {
+            Answer::Ack => Ok(()),
+            Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
+            other => Err(unexpected(&other)),
         }
     }
 
@@ -909,18 +1027,37 @@ impl<T: Transport> ThreadSession<T> {
             }
         }
         for file in preview.uploads(include) {
-            // Deleted and binary files are tree and blob changes (ATL-403).
-            if file.deleted || file.kind != ShareKind::Text {
+            if file.deleted {
+                // Deleted since the Base: the thread holds it, deleted, so
+                // every replica removes the Base's copy too.
+                let Some(base) = self.replica.base_bytes(&file.path)? else {
+                    continue;
+                };
+                let file_id = self.ensure_file(&file.path, true, kind_of(&base)).await?;
+                let client_seq = self.take_client_seq();
+                self.expect_ack(client_seq, &ClientControl::TreeDelete { client_seq, file_id })
+                    .await?;
+                self.replica.delete(file_id)?;
+                report.shared.push(file.path.clone());
                 continue;
             }
             let target = crate::path::resolve(checkout, &file.path).map_err(ReplicaError::from)?;
             let Ok(bytes) = std::fs::read(&target) else {
                 continue;
             };
-            let content = String::from_utf8_lossy(&bytes);
-            let file_id = self.ensure_file(&file.path, true).await?;
-            if let Some(update) = self.replica.set_text(file_id, &content)? {
-                self.send_update(file_id, update).await?;
+            match file.kind {
+                ShareKind::Text => {
+                    let content = String::from_utf8_lossy(&bytes);
+                    let file_id = self.ensure_file(&file.path, true, FileKind::Text).await?;
+                    if let Some(update) = self.replica.set_text(file_id, &content)? {
+                        self.send_update(file_id, update).await?;
+                    }
+                }
+                ShareKind::Binary => {
+                    let file_id = self.ensure_file(&file.path, true, FileKind::Binary).await?;
+                    let sha = bootstrap::sha256_hex(&bytes);
+                    self.set_blob(file_id, &sha, bytes).await?;
+                }
             }
             report.shared.push(file.path.clone());
         }
@@ -968,7 +1105,12 @@ impl<T: Transport> ThreadSession<T> {
     /// seed: harmless if another replica already did, since seeds are
     /// byte-identical everywhere, and it lets a replica without the Base
     /// rebuild the file from the journal alone.
-    async fn ensure_file(&mut self, path: &str, introduced: bool) -> Result<u64, SessionError> {
+    async fn ensure_file(
+        &mut self,
+        path: &str,
+        introduced: bool,
+        kind: FileKind,
+    ) -> Result<u64, SessionError> {
         if let Some(id) = self.replica.file_id(path) {
             return Ok(id);
         }
@@ -982,11 +1124,11 @@ impl<T: Transport> ThreadSession<T> {
             None
         };
         let client_seq = self.take_client_seq();
-        self.pending_tree.insert(client_seq, path.to_string());
+        self.pending_tree.insert(client_seq, (path.to_string(), kind));
         let ensure = ClientControl::TreeEnsure {
             client_seq,
             path: path.to_string(),
-            kind: FileKind::Text,
+            kind,
             base_blob,
         };
         self.send_control(&ensure).await?;
@@ -1004,7 +1146,8 @@ impl<T: Transport> ThreadSession<T> {
                 .ok_or(SessionError::ClosedEarly)?;
             self.handle(message).await?;
         };
-        if publish_base {
+        // A binary file's Base is its blob; only text is seeded.
+        if publish_base && kind == FileKind::Text {
             for seed in self.replica.seed_for(path)? {
                 self.send_update(file_id, seed).await?;
             }
@@ -1083,7 +1226,13 @@ impl<T: Transport> ThreadSession<T> {
                         if let Some(version) = entry.merge_version {
                             self.versions.insert(entry.file_id, version);
                         }
-                        self.replica.add_entry(entry.file_id, &entry.path)?;
+                        if let Some(sha) = self.replica.learn(&entry)? {
+                            // A blob that cannot be fetched now is fetched at
+                            // the next checkout; the change is not lost.
+                            if let Err(e) = self.fetch_blob(entry.file_id, sha).await {
+                                tracing::warn!(target: "atlas_thread_sync", path = %entry.path, "blob fetch failed: {e}");
+                            }
+                        }
                     }
                     ServerControl::Ack {
                         client_seq,
@@ -1092,10 +1241,13 @@ impl<T: Transport> ThreadSession<T> {
                     } => {
                         self.saw_seq(seq);
                         self.answer(client_seq, Answer::Ack);
-                        if let (Some(path), Some(file_id)) =
+                        if let (Some((path, kind)), Some(file_id)) =
                             (self.pending_tree.remove(&client_seq), file_id)
                         {
-                            self.replica.add_entry(file_id, &path)?;
+                            // A file this replica knew was deleted is revived.
+                            if !self.replica.add_entry(file_id, &path, kind)? {
+                                self.replica.revive(file_id, &path)?;
+                            }
                         }
                     }
                     ServerControl::Nack {

@@ -46,7 +46,7 @@ async fn sharer_work_reaches_a_joiner_who_already_has_the_base() {
     assert!(!monzim_root.exists());
     assert!(!monzim.replica().is_materialized());
 
-    let root = monzim.materialize().unwrap();
+    let root = monzim.materialize().await.unwrap();
     assert_eq!(
         read(&root, "src/banner.css"),
         ".banner {\n  color: green;\n}\n"
@@ -82,8 +82,8 @@ async fn saves_from_any_editor_converge_both_ways_without_echo() {
         "monzim",
     )
     .await;
-    let joy_root = joy.materialize().unwrap();
-    let monzim_root = monzim.materialize().unwrap();
+    let joy_root = joy.materialize().await.unwrap();
+    let monzim_root = monzim.materialize().await.unwrap();
 
     // Monzim saves from an external editor.
     write(
@@ -144,8 +144,8 @@ async fn concurrent_saves_to_one_file_merge() {
         "monzim",
     )
     .await;
-    let joy_root = joy.materialize().unwrap();
-    let monzim_root = monzim.materialize().unwrap();
+    let joy_root = joy.materialize().await.unwrap();
+    let monzim_root = monzim.materialize().await.unwrap();
 
     // Both save before either has heard from the other.
     write(
@@ -182,8 +182,8 @@ async fn a_save_racing_a_remote_change_is_kept() {
         "monzim",
     )
     .await;
-    let joy_root = joy.materialize().unwrap();
-    let monzim_root = monzim.materialize().unwrap();
+    let joy_root = joy.materialize().await.unwrap();
+    let monzim_root = monzim.materialize().await.unwrap();
 
     write(&joy_root, "notes.md", "todo: red?\njoy was here\n");
     joy.file_saved("notes.md").await.unwrap();
@@ -226,7 +226,7 @@ async fn a_reconnecting_replica_does_not_reuse_client_seqs() {
     // Same replica id: the welcome says how far the server got, and new frames
     // continue above it rather than being acked as duplicates and lost.
     let mut again = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    let root = again.materialize().unwrap();
+    let root = again.materialize().await.unwrap();
     write(&root, "notes.md", "after reconnect\n");
     again.file_saved("notes.md").await.unwrap();
     again.pump(QUIET).await.unwrap();
@@ -309,7 +309,7 @@ async fn a_secret_created_in_the_replica_stays_local() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    let root = joy.materialize().unwrap();
+    let root = joy.materialize().await.unwrap();
     write(
         &root,
         "config/prod.env",
@@ -337,8 +337,8 @@ async fn a_secret_pasted_into_a_tracked_file_is_held_then_merged_when_removed() 
         "monzim",
     )
     .await;
-    let joy_root = joy.materialize().unwrap();
-    let monzim_root = monzim.materialize().unwrap();
+    let joy_root = joy.materialize().await.unwrap();
+    let monzim_root = monzim.materialize().await.unwrap();
 
     // Joy pastes a credential into a file the thread already holds.
     let leaked =

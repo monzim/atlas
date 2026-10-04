@@ -25,13 +25,14 @@ use crate::doc::{random_client_id, FileDoc};
 use crate::git;
 use crate::path;
 use crate::secrets::secret_reason;
+use crate::wire::{FileKind, TreeEntry};
 
 /// Prefix of the temporary files atomic writes go through. The watcher and
 /// [`path::relative`] ignore anything named like this.
 pub const TEMP_PREFIX: &str = ".atlas-sync-tmp-";
 
-/// Files at or above this size are not co-edited as text (ATL-403 syncs them
-/// whole).
+/// Files at or above this size are not co-edited as text: they sync whole, as
+/// blobs (ATL-403).
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +55,8 @@ pub enum ReplicaError {
     BadBase(String),
     #[error("no file {0} in this thread")]
     UnknownFile(u64),
+    #[error("{0} did not hash to the blob it was fetched as")]
+    CorruptBlob(String),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ReplicaError + '_ {
@@ -69,6 +72,19 @@ fn hash(bytes: &[u8]) -> Hash {
     Sha256::digest(bytes).into()
 }
 
+fn hex(hash: &Hash) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How `bytes` sync: as co-edited text, or whole (ATL-403).
+pub fn kind_of(bytes: &[u8]) -> FileKind {
+    if looks_textual(bytes) {
+        FileKind::Text
+    } else {
+        FileKind::Binary
+    }
+}
+
 /// Git's own heuristic: a NUL in the first 8000 bytes means binary.
 pub fn looks_textual(bytes: &[u8]) -> bool {
     bytes.len() < MAX_TEXT_BYTES
@@ -78,6 +94,8 @@ pub fn looks_textual(bytes: &[u8]) -> bool {
 
 struct TrackedFile {
     path: String,
+    kind: FileKind,
+    /// The text, for a text file; unused for a binary one.
     doc: FileDoc,
     /// What this replica last wrote to, or read from, disk for this file.
     /// `None` until the worktree exists.
@@ -88,6 +106,14 @@ struct TrackedFile {
     /// edit is made relative to this snapshot and merged, so changes the
     /// thread took meanwhile survive.
     held: Option<Vec<u8>>,
+    /// A binary file's canonical content: the hex SHA-256 of its blob.
+    blob: Option<String>,
+    /// Deleted in the thread. The entry and document stay, so a revival
+    /// brings the same file back.
+    deleted: bool,
+    /// The path it entered the thread under; a checkout at the Base still
+    /// holds the file there after a rename.
+    origin: String,
 }
 
 /// What a save on disk amounts to.
@@ -97,10 +123,21 @@ pub enum LocalChange {
     Echo,
     /// An edit to a file the thread already holds: send this update.
     Update { file_id: u64, update: Vec<u8> },
-    /// A text file the thread does not hold yet: it needs a tree entry first.
+    /// A file the thread does not hold yet: it needs a tree entry first.
     NewFile { path: String },
-    /// Not something this slice syncs (binary, too large, deleted, or the
-    /// worktree does not exist yet).
+    /// A binary file's bytes changed: upload them, then set the blob.
+    Blob {
+        file_id: u64,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    /// A file the thread holds is gone from disk. A deletion — unless the
+    /// same bytes turn up at a new path, which makes it a rename.
+    Missing { file_id: u64 },
+    /// The same bytes as a file that went missing, at a new path: a rename.
+    Renamed { file_id: u64, from: String, to: String },
+    /// Not something that syncs (a file that turned binary or grew past the
+    /// text limit, or the worktree does not exist yet).
     Ignored,
 }
 
@@ -197,6 +234,7 @@ impl Replica {
     pub fn fork_files(&self) -> BTreeMap<u64, ForkFile> {
         self.files
             .iter()
+            .filter(|(_, f)| !f.deleted && f.kind == FileKind::Text)
             .map(|(id, f)| {
                 (
                     *id,
@@ -238,8 +276,42 @@ impl Replica {
         self.by_path.get(path).copied()
     }
 
+    /// Every live file the thread holds, by id and path.
     pub fn files(&self) -> impl Iterator<Item = (u64, &str)> {
-        self.files.iter().map(|(id, f)| (*id, f.path.as_str()))
+        self.files
+            .iter()
+            .filter(|(_, f)| !f.deleted)
+            .map(|(id, f)| (*id, f.path.as_str()))
+    }
+
+    pub fn kind(&self, file_id: u64) -> Option<FileKind> {
+        self.files.get(&file_id).map(|f| f.kind)
+    }
+
+    pub fn is_deleted(&self, file_id: u64) -> bool {
+        self.files.get(&file_id).is_some_and(|f| f.deleted)
+    }
+
+    /// A binary file's canonical blob.
+    pub fn blob(&self, file_id: u64) -> Option<&str> {
+        self.files.get(&file_id)?.blob.as_deref()
+    }
+
+    /// Paths a checkout at the Base holds that canonical state does not:
+    /// deleted files, and where renamed ones used to be.
+    pub fn removed_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in self.files.values() {
+            if f.deleted && !self.by_path.contains_key(&f.path) {
+                out.push(f.path.clone());
+            }
+            if f.origin != f.path && !self.by_path.contains_key(&f.origin) {
+                out.push(f.origin.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// A file's canonical text as this replica holds it.
@@ -269,7 +341,12 @@ impl Replica {
 
     /// Learn a tree entry: create its document and seed it from the Base. A
     /// file already known is left alone. Answers whether it was new.
-    pub fn add_entry(&mut self, file_id: u64, rel: &str) -> Result<bool, ReplicaError> {
+    pub fn add_entry(
+        &mut self,
+        file_id: u64,
+        rel: &str,
+        kind: FileKind,
+    ) -> Result<bool, ReplicaError> {
         if self.files.contains_key(&file_id) {
             return Ok(false);
         }
@@ -277,8 +354,10 @@ impl Replica {
             return Err(path::PathError::Invalid(rel.to_string()).into());
         }
         let doc = FileDoc::new(self.client_id);
-        for update in self.seed_for(rel)? {
-            doc.apply(&update)?;
+        if kind == FileKind::Text {
+            for update in self.seed_for(rel)? {
+                doc.apply(&update)?;
+            }
         }
         // Nothing is written here, even with the worktree checked out: what is
         // on disk at this path is either the Base (equal to the seed) or the
@@ -288,13 +367,188 @@ impl Replica {
             file_id,
             TrackedFile {
                 path: rel.to_string(),
+                kind,
                 doc,
                 disk: None,
                 held: None,
+                blob: None,
+                deleted: false,
+                origin: rel.to_string(),
             },
         );
         self.by_path.insert(rel.to_string(), file_id);
         Ok(true)
+    }
+
+    /// Bring one tree entry into this replica — a new file, a rename, a
+    /// deletion, a revival or a binary file's new blob — moving or removing
+    /// the file on disk to match. Answers a blob to fetch and write with
+    /// [`Replica::write_blob`] when disk does not hold the canonical one.
+    pub fn learn(&mut self, entry: &TreeEntry) -> Result<Option<String>, ReplicaError> {
+        let id = entry.file_id;
+        if !path::is_valid(&entry.path) {
+            return Err(path::PathError::Invalid(entry.path.clone()).into());
+        }
+        if self.add_entry(id, &entry.path, entry.kind)? {
+            let file = self.files.get_mut(&id).ok_or(ReplicaError::UnknownFile(id))?;
+            if let Some(origin) = entry.origin.as_ref().filter(|o| path::is_valid(o)) {
+                file.origin.clone_from(origin);
+            }
+        }
+        // A rename: the bytes move with the file.
+        let old_path = self.files[&id].path.clone();
+        if old_path != entry.path {
+            if self.by_path.get(&old_path) == Some(&id) {
+                self.by_path.remove(&old_path);
+            }
+            if self.materialized && !self.files[&id].deleted {
+                self.move_on_disk(&old_path, &entry.path)?;
+            }
+            self.files.get_mut(&id).expect("known").path.clone_from(&entry.path);
+        }
+        // Deleted, or back.
+        let was_deleted = self.files[&id].deleted;
+        if entry.deleted && !was_deleted {
+            self.by_path.remove(&entry.path);
+            if self.materialized {
+                self.remove_on_disk(&entry.path)?;
+            }
+        } else if !entry.deleted {
+            self.by_path.insert(entry.path.clone(), id);
+        }
+        {
+            let file = self.files.get_mut(&id).expect("known");
+            file.deleted = entry.deleted;
+            if file.kind == FileKind::Binary {
+                file.blob.clone_from(&entry.blob);
+            }
+        }
+        if entry.deleted || !self.materialized {
+            return Ok(None);
+        }
+        match self.files[&id].kind {
+            FileKind::Text => {
+                if was_deleted {
+                    self.sync_disk(id)?;
+                }
+                Ok(None)
+            }
+            FileKind::Binary => Ok(self.blob_to_fetch(id)),
+        }
+    }
+
+    /// The canonical blob of a binary file, if disk does not hold it.
+    fn blob_to_fetch(&self, file_id: u64) -> Option<String> {
+        let file = self.files.get(&file_id)?;
+        let sha = file.blob.clone()?;
+        if file.deleted || file.disk.as_ref().map(hex).as_deref() == Some(sha.as_str()) {
+            return None;
+        }
+        Some(sha)
+    }
+
+    /// Every binary file's blob the worktree does not hold yet.
+    pub fn blobs_to_fetch(&self) -> Vec<(u64, String)> {
+        if !self.materialized {
+            return Vec::new();
+        }
+        self.files
+            .keys()
+            .filter_map(|id| self.blob_to_fetch(*id).map(|sha| (*id, sha)))
+            .collect()
+    }
+
+    /// Write a binary file's canonical bytes, fetched from the thread. Refused
+    /// unless they hash to the blob canonical state names.
+    pub fn write_blob(&mut self, file_id: u64, bytes: &[u8]) -> Result<(), ReplicaError> {
+        let file = self
+            .files
+            .get_mut(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        let seen = hash(bytes);
+        if file.blob.as_deref() != Some(hex(&seen).as_str()) {
+            return Err(ReplicaError::CorruptBlob(file.path.clone()));
+        }
+        if file.deleted || !self.materialized {
+            return Ok(());
+        }
+        let target = path::resolve(&self.root, &file.path)?;
+        file.disk = Some(seen);
+        write_atomic(&target, bytes)
+    }
+
+    /// This replica renamed a file itself (the person moved it on disk).
+    pub fn rename(&mut self, file_id: u64, to: &str) -> Result<(), ReplicaError> {
+        if !path::is_valid(to) {
+            return Err(path::PathError::Invalid(to.to_string()).into());
+        }
+        let file = self
+            .files
+            .get_mut(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        self.by_path.remove(&file.path);
+        file.path = to.to_string();
+        self.by_path.insert(to.to_string(), file_id);
+        Ok(())
+    }
+
+    /// The server answered this replica's `tree.ensure` with a file it knew
+    /// was deleted: the same file is back, at `rel`.
+    pub fn revive(&mut self, file_id: u64, rel: &str) -> Result<(), ReplicaError> {
+        if !path::is_valid(rel) {
+            return Err(path::PathError::Invalid(rel.to_string()).into());
+        }
+        let file = self
+            .files
+            .get_mut(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        file.deleted = false;
+        file.path = rel.to_string();
+        self.by_path.insert(rel.to_string(), file_id);
+        Ok(())
+    }
+
+    /// This replica deleted a file itself (the person removed it on disk).
+    pub fn delete(&mut self, file_id: u64) -> Result<(), ReplicaError> {
+        let file = self
+            .files
+            .get_mut(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        file.deleted = true;
+        file.disk = None;
+        self.by_path.remove(&file.path);
+        Ok(())
+    }
+
+    /// This replica set a binary file's blob itself.
+    pub fn set_blob(&mut self, file_id: u64, sha256: &str) -> Result<(), ReplicaError> {
+        let file = self
+            .files
+            .get_mut(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        file.blob = Some(sha256.to_string());
+        Ok(())
+    }
+
+    fn move_on_disk(&mut self, from: &str, to: &str) -> Result<(), ReplicaError> {
+        let source = path::resolve(&self.root, from)?;
+        let target = path::resolve(&self.root, to)?;
+        if !source.exists() || target.exists() {
+            return Ok(());
+        }
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir).map_err(io(dir))?;
+        }
+        fs::rename(&source, &target).map_err(io(&target))
+    }
+
+    fn remove_on_disk(&mut self, rel: &str) -> Result<(), ReplicaError> {
+        let target = path::resolve(&self.root, rel)?;
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io(&target)(e)),
+        }
     }
 
     /// A worktree file's text as it is on disk now (lossy UTF-8), for checks
@@ -336,7 +590,9 @@ impl Replica {
             .files
             .get(&file_id)
             .ok_or(ReplicaError::UnknownFile(file_id))?;
-        if !self.materialized {
+        // A deleted file's document still follows (a revival brings it back),
+        // but nothing is written where it used to be.
+        if !self.materialized || file.deleted {
             file.doc.apply(update)?;
             return Ok(None);
         }
@@ -353,25 +609,88 @@ impl Replica {
         Ok(pending)
     }
 
-    /// The person saved `rel` in their replica (from any editor).
+    /// The person saved, created, moved or removed `rel` in their replica
+    /// (from any editor, or a shell).
     pub fn local_change(&mut self, rel: &str) -> Result<LocalChange, ReplicaError> {
         if !self.materialized || !path::is_valid(rel) {
             return Ok(LocalChange::Ignored);
         }
-        match self.by_path.get(rel).copied() {
-            Some(file_id) => Ok(match self.ingest_disk(file_id)? {
-                Some(update) => LocalChange::Update { file_id, update },
-                None => LocalChange::Echo,
-            }),
-            None => {
-                let target = path::resolve(&self.root, rel)?;
-                match fs::read(&target) {
-                    Ok(bytes) if looks_textual(&bytes) => Ok(LocalChange::NewFile {
-                        path: rel.to_string(),
-                    }),
-                    _ => Ok(LocalChange::Ignored),
+        let target = path::resolve(&self.root, rel)?;
+        let bytes = match fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // A directory, or unreadable: nothing to sync.
+            Err(_) => return Ok(LocalChange::Ignored),
+        };
+        match (self.by_path.get(rel).copied(), bytes) {
+            (Some(file_id), None) => Ok(LocalChange::Missing { file_id }),
+            (Some(file_id), Some(bytes)) => match self.files[&file_id].kind {
+                FileKind::Text => Ok(match self.ingest_disk(file_id)? {
+                    Some(update) => LocalChange::Update { file_id, update },
+                    None => LocalChange::Echo,
+                }),
+                FileKind::Binary => {
+                    let seen = hash(&bytes);
+                    let file = self.files.get_mut(&file_id).expect("known");
+                    if file.disk == Some(seen) {
+                        return Ok(LocalChange::Echo);
+                    }
+                    file.disk = Some(seen);
+                    Ok(LocalChange::Blob {
+                        file_id,
+                        sha256: hex(&seen),
+                        bytes,
+                    })
                 }
+            },
+            (None, None) => Ok(LocalChange::Ignored),
+            (None, Some(bytes)) => {
+                // The same bytes as a file that is gone from where it was: the
+                // person moved it.
+                let seen = hash(&bytes);
+                if let Some(file_id) = self.vanished_with(&seen) {
+                    let from = self.files[&file_id].path.clone();
+                    return Ok(LocalChange::Renamed {
+                        file_id,
+                        from,
+                        to: rel.to_string(),
+                    });
+                }
+                Ok(LocalChange::NewFile {
+                    path: rel.to_string(),
+                })
             }
+        }
+    }
+
+    /// A live file whose bytes, as this replica last saw them, were `seen`,
+    /// and which is no longer on disk where it was.
+    fn vanished_with(&self, seen: &Hash) -> Option<u64> {
+        self.files.iter().find_map(|(id, f)| {
+            let gone = !f.deleted
+                && f.disk.as_ref() == Some(seen)
+                && path::resolve(&self.root, &f.path).is_ok_and(|p| !p.exists());
+            gone.then_some(*id)
+        })
+    }
+
+    /// Is a tracked file still missing from disk?
+    pub fn is_missing(&self, file_id: u64) -> bool {
+        self.files.get(&file_id).is_some_and(|f| {
+            !f.deleted && path::resolve(&self.root, &f.path).is_ok_and(|p| !p.exists())
+        })
+    }
+
+    /// Read a new file's bytes to introduce it.
+    pub fn read_bytes(&self, rel: &str) -> Result<Vec<u8>, ReplicaError> {
+        let target = path::resolve(&self.root, rel)?;
+        fs::read(&target).map_err(io(&target))
+    }
+
+    /// Remember the bytes this replica just introduced a binary file with.
+    pub fn saw_bytes(&mut self, file_id: u64, bytes: &[u8]) {
+        if let Some(file) = self.files.get_mut(&file_id) {
+            file.disk = Some(hash(bytes));
         }
     }
 
@@ -396,6 +715,8 @@ impl Replica {
             }
         };
         let seen = hash(&bytes);
+        // A text file that turned binary, or grew past the text limit, stays
+        // as it was in the thread: a file's kind is fixed when it enters.
         if file.disk == Some(seen) || !looks_textual(&bytes) {
             return Ok(None);
         }
@@ -433,7 +754,7 @@ impl Replica {
     pub fn held_files(&self) -> Vec<String> {
         self.files
             .values()
-            .filter(|f| f.held.is_some())
+            .filter(|f| f.held.is_some() && !f.deleted)
             .map(|f| f.path.clone())
             .collect()
     }
@@ -475,10 +796,20 @@ impl Replica {
         }
         git::add_worktree(&repo, &self.root, &self.base)?;
         self.materialized = true;
-        let ids: Vec<u64> = self.files.keys().copied().collect();
+        // Renamed and deleted files leave the Base's copy behind.
+        for rel in self.removed_paths() {
+            self.remove_on_disk(&rel)?;
+        }
+        let ids: Vec<u64> = self
+            .files
+            .iter()
+            .filter(|(_, f)| !f.deleted && f.kind == FileKind::Text)
+            .map(|(id, _)| *id)
+            .collect();
         for id in ids {
             self.sync_disk(id)?;
         }
+        // Binary files are fetched by the session: see `blobs_to_fetch`.
         Ok(&self.root)
     }
 }

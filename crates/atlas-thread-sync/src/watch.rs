@@ -2,8 +2,8 @@
 //!
 //! Any editor writes the file; the watcher reports it; the session decides
 //! whether it was a real change or this replica's own write coming back (see
-//! `replica.rs`). Paths under `.git` and the atomic-write temporaries are
-//! dropped here.
+//! `replica.rs`) — or, for a path that is gone, a deletion or half a move.
+//! Paths under `.git` and the atomic-write temporaries are dropped here.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,11 @@ pub fn watch(root: &Path) -> notify::Result<(RecommendedWatcher, mpsc::Unbounded
     let canonical: PathBuf = root.canonicalize().unwrap_or_else(|_| base.clone());
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
-        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+        // Removals too: a deletion, or half of a move (ATL-403).
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
             return;
         }
         for changed in event.paths {

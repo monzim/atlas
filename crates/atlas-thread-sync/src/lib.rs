@@ -150,7 +150,13 @@ enum Event {
     Socket(Option<Message>),
     Command(Option<Command>),
     Saved(String),
+    /// Saves have been quiet: files still missing were deleted, not moved.
+    Settle,
 }
+
+/// How long saves must be quiet before a missing file counts as deleted — a
+/// move arrives as a removal and a creation, a moment apart (ATL-403).
+const SETTLE_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Drive one joined thread until it is stopped or its socket closes.
 ///
@@ -175,6 +181,7 @@ pub async fn run<T: Transport>(
         }
     }
     let _ = status.send(status_of(&session, true, None));
+    let mut settle_at: Option<tokio::time::Instant> = None;
 
     loop {
         let event = tokio::select! {
@@ -186,7 +193,16 @@ pub async fn run<T: Transport>(
                     None => std::future::pending().await,
                 }
             } => Event::Saved(path),
+            () = async {
+                match settle_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => Event::Settle,
         };
+        if matches!(event, Event::Saved(_)) {
+            settle_at = Some(tokio::time::Instant::now() + SETTLE_AFTER);
+        }
         let outcome = match event {
             Event::Socket(None) => break,
             Event::Command(None) | Event::Command(Some(Command::Stop)) => {
@@ -274,8 +290,12 @@ pub async fn run<T: Transport>(
             }
             Event::Socket(Some(message)) => session.receive(message).await.map(|_| ()),
             Event::Saved(path) => session.file_saved(&path).await.map(|_| ()),
+            Event::Settle => {
+                settle_at = None;
+                session.settle_removals().await.map(|_| ())
+            }
             Event::Command(Some(Command::Materialize(reply))) => {
-                let result = session.materialize();
+                let result = session.materialize().await;
                 if let Ok(root) = &result {
                     if watcher.is_none() {
                         match watch::watch(root) {

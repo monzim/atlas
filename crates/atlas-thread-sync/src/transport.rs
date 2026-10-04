@@ -19,8 +19,8 @@ use base64::Engine as _;
 
 use crate::store::FakeStore;
 use crate::wire::{
-    self, BundleFailure, ClientControl, FileVersion, Frame, FrameKind, MergedFile, Role,
-    RunOutcome, ServerControl, ThreadRun, TreeEntry,
+    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergedFile,
+    Role, RunOutcome, ServerControl, ThreadRun, TreeEntry,
 };
 
 /// One message on the socket.
@@ -158,6 +158,8 @@ struct Hub {
     /// Open bundle requests: the id, and the connection that asked.
     bundle_requests: HashMap<String, u64>,
     next_request: u64,
+    /// The plan's touched-files limit (`threads.shared`), when one is set.
+    touched_files: Option<usize>,
 }
 
 struct FakeRun {
@@ -276,6 +278,11 @@ impl FakeThreadServer {
     pub fn tree(&self) -> Vec<TreeEntry> {
         self.hub.lock().expect("hub").tree.clone()
     }
+
+    /// The Organisation's touched-files limit for the thread.
+    pub fn set_touched_files_limit(&self, limit: Option<usize>) {
+        self.hub.lock().expect("hub").touched_files = limit;
+    }
 }
 
 impl Hub {
@@ -367,6 +374,62 @@ impl Hub {
                 blob: "0".repeat(64),
             }],
         });
+    }
+
+    /// Journal one change to a tree entry, ack it, and relay the entry as it
+    /// is now — the real server's `treeChange`.
+    fn tree_change(
+        &mut self,
+        conn: u64,
+        user: String,
+        client: String,
+        client_seq: u64,
+        file_id: u64,
+        change: impl FnOnce(&mut TreeEntry),
+    ) {
+        if let Some(prior) = self.prior(&user, &client, client_seq) {
+            let seq = prior.seq;
+            return self.reply(
+                conn,
+                &ServerControl::Ack {
+                    client_seq,
+                    seq,
+                    file_id: None,
+                },
+            );
+        }
+        let Some(entry) = self.tree.iter_mut().find(|e| e.file_id == file_id) else {
+            return self.nack(conn, client_seq, "unknown_file");
+        };
+        change(entry);
+        let entry = entry.clone();
+        let seq = self.journal.len() as u64 + 1;
+        self.journal.push(Journaled {
+            seq,
+            tree: Some(entry.clone()),
+            frame: None,
+            author: user,
+            client,
+            client_seq,
+        });
+        // Named on the ack, as for any `tree.ensure` — a revival is one.
+        self.reply(
+            conn,
+            &ServerControl::Ack {
+                client_seq,
+                seq,
+                file_id: Some(file_id),
+            },
+        );
+        let relayed = ServerControl::Tree { seq, entry };
+        self.relay(
+            conn,
+            Message::Text(serde_json::to_string(&relayed).expect("json")),
+        );
+    }
+
+    fn live(&self, path: &str) -> Option<&TreeEntry> {
+        self.tree.iter().find(|e| e.path == path && !e.deleted)
     }
 
     fn run_mut(&mut self, run_id: &str) -> Option<&mut FakeRun> {
@@ -561,7 +624,22 @@ impl Hub {
                     ..
                 }) => {
                     let Some(client) = client else { return };
-                    if let Some(existing) = self.tree.iter().find(|e| e.path == path) {
+                    // A deleted file at this path comes back under its id.
+                    if self.live(&path).is_none() {
+                        let gone = self
+                            .tree
+                            .iter()
+                            .rev()
+                            .find(|e| e.path == path && e.deleted && e.kind == kind)
+                            .map(|e| e.file_id);
+                        if let Some(file_id) = gone {
+                            self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                                e.deleted = false;
+                            });
+                            return;
+                        }
+                    }
+                    if let Some(existing) = self.live(&path) {
                         let seq = self
                             .journal
                             .iter()
@@ -578,12 +656,30 @@ impl Hub {
                         );
                         return;
                     }
+                    if let Some(limit) = self.touched_files {
+                        if self.tree.len() >= limit {
+                            return self.reply(
+                                conn,
+                                &ServerControl::Nack {
+                                    client_seq,
+                                    code: "limit_reached".into(),
+                                    message: format!(
+                                        "This thread already touches {} files, the most your organisation's plan allows (touched files per thread: {limit}).",
+                                        self.tree.len()
+                                    ),
+                                },
+                            );
+                        }
+                    }
                     let seq = self.journal.len() as u64 + 1;
                     let entry = TreeEntry {
                         file_id: self.tree.len() as u64 + 1,
                         path,
                         kind,
                         merge_version: Some(0),
+                        blob: None,
+                        deleted: false,
+                        origin: None,
                     };
                     self.tree.push(entry.clone());
                     self.journal.push(Journaled {
@@ -607,6 +703,54 @@ impl Hub {
                         conn,
                         Message::Text(serde_json::to_string(&relayed).expect("json")),
                     );
+                }
+                Ok(ClientControl::TreeRename {
+                    client_seq,
+                    file_id,
+                    path,
+                }) => {
+                    let Some(client) = client else { return };
+                    if self.live(&path).is_some_and(|e| e.file_id != file_id) {
+                        return self.nack(conn, client_seq, "path_taken");
+                    }
+                    if self.tree.iter().any(|e| e.file_id == file_id && e.deleted) {
+                        return self.nack(conn, client_seq, "unknown_file");
+                    }
+                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                        if e.origin.is_none() {
+                            e.origin = Some(e.path.clone());
+                        }
+                        e.path = path;
+                        if e.origin.as_deref() == Some(e.path.as_str()) {
+                            e.origin = None;
+                        }
+                    });
+                }
+                Ok(ClientControl::TreeDelete { client_seq, file_id }) => {
+                    let Some(client) = client else { return };
+                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                        e.deleted = true;
+                    });
+                }
+                Ok(ClientControl::BlobSet {
+                    client_seq,
+                    file_id,
+                    blob,
+                }) => {
+                    let Some(client) = client else { return };
+                    match self.tree.iter().find(|e| e.file_id == file_id) {
+                        Some(e) if e.kind != FileKind::Binary => {
+                            return self.nack(conn, client_seq, "unsupported_kind")
+                        }
+                        Some(e) if e.deleted => return self.nack(conn, client_seq, "unknown_file"),
+                        _ => {}
+                    }
+                    if self.store.blob(&blob).is_none() {
+                        return self.nack(conn, client_seq, "blob_missing");
+                    }
+                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                        e.blob = Some(blob);
+                    });
                 }
                 Ok(ClientControl::RunStart {
                     client_seq,
@@ -844,6 +988,13 @@ impl Hub {
                 }
                 if frame.kind != FrameKind::CanonicalUpdate as u8 {
                     return;
+                }
+                if self
+                    .tree
+                    .iter()
+                    .any(|e| e.file_id == frame.file_id && e.kind != FileKind::Text)
+                {
+                    return self.nack(conn, frame.client_seq, "unsupported_kind");
                 }
                 self.received_updates += 1;
                 if let Some(prior) = self.prior(&user, &client, frame.client_seq) {
