@@ -109,16 +109,21 @@ impl FileDoc {
     }
 
     /// Make the text equal `next` with the smallest single edit, and answer the
-    /// update to send — or `None` when it already was.
+    /// updates to send — none when it already was.
     ///
     /// One replace between the common prefix and suffix rather than a full
     /// diff: a save from an editor is usually one region, and a replace of the
     /// changed span keeps concurrent edits elsewhere in the file intact. The
     /// span is widened so it never splits a surrogate pair.
-    pub fn set_content(&self, next: &str) -> Option<Vec<u8>> {
+    ///
+    /// A large insertion — a pasted file, an edit made offline — is made in
+    /// pieces of at most [`SEED_CHUNK_BYTES`], one update each, so every
+    /// update fits one wire frame (ATL-404). Applied in order they are the
+    /// same edit.
+    pub fn set_content(&self, next: &str) -> Vec<Vec<u8>> {
         let current = self.content();
         if current == next {
-            return None;
+            return Vec::new();
         }
         let old: Vec<u16> = current.encode_utf16().collect();
         let new: Vec<u16> = next.encode_utf16().collect();
@@ -140,15 +145,30 @@ impl FileDoc {
         let removed = old.len() - prefix - suffix;
         let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
 
-        let mut txn = self.doc.transact_mut();
-        if removed > 0 {
-            self.text
-                .remove_range(&mut txn, prefix as u32, removed as u32);
+        let mut updates = Vec::new();
+        let mut at = prefix as u32;
+        let mut rest = inserted.as_str();
+        let mut first = true;
+        while first || !rest.is_empty() {
+            let mut cut = rest.len().min(SEED_CHUNK_BYTES);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (chunk, tail) = rest.split_at(cut);
+            let mut txn = self.doc.transact_mut();
+            if first && removed > 0 {
+                self.text.remove_range(&mut txn, at, removed as u32);
+            }
+            if !chunk.is_empty() {
+                self.text.insert(&mut txn, at, chunk);
+            }
+            updates.push(txn.encode_update_v1());
+            drop(txn);
+            at += chunk.encode_utf16().count() as u32;
+            rest = tail;
+            first = false;
         }
-        if !inserted.is_empty() {
-            self.text.insert(&mut txn, prefix as u32, &inserted);
-        }
-        Some(txn.encode_update_v1())
+        updates
     }
 }
 
@@ -248,13 +268,40 @@ mod tests {
             a.apply(&u).unwrap();
             b.apply(&u).unwrap();
         }
-        let ua = a.set_content("ALPHA\nbeta\ngamma\n").unwrap();
-        let ub = b.set_content("alpha\nbeta\nGAMMA 🚀\n").unwrap();
-        a.apply(&ub).unwrap();
-        b.apply(&ua).unwrap();
+        let ua = a.set_content("ALPHA\nbeta\ngamma\n");
+        let ub = b.set_content("alpha\nbeta\nGAMMA 🚀\n");
+        for u in &ub {
+            a.apply(u).unwrap();
+        }
+        for u in &ua {
+            b.apply(u).unwrap();
+        }
         assert_eq!(a.content(), "ALPHA\nbeta\nGAMMA 🚀\n");
         assert_eq!(a.content(), b.content());
-        assert!(a.set_content(&a.content()).is_none());
+        assert!(a.set_content(&a.content()).is_empty());
+    }
+
+    #[test]
+    fn a_large_edit_goes_in_pieces_that_each_fit_a_frame() {
+        let a = FileDoc::new(random_client_id());
+        let b = FileDoc::new(random_client_id());
+        let big = format!("head\n{}tail\n", "é🚀 lockfile line\n".repeat(30_000));
+        let updates = a.set_content(&big);
+        assert!(updates.len() > 1);
+        assert!(updates
+            .iter()
+            .all(|u| u.len() < crate::wire::MAX_PAYLOAD_BYTES));
+        for u in &updates {
+            b.apply(u).unwrap();
+        }
+        assert_eq!(b.content(), big);
+        // And a large replacement in the middle of existing text.
+        let replaced = format!("head\n{}tail\n", "x".repeat(400_000));
+        for u in a.set_content(&replaced) {
+            assert!(u.len() < crate::wire::MAX_PAYLOAD_BYTES);
+            b.apply(&u).unwrap();
+        }
+        assert_eq!(b.content(), replaced);
     }
 
     #[test]

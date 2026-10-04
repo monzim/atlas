@@ -80,8 +80,17 @@ impl<T: Transport> Connector for NoReconnect<T> {
     }
 }
 
-/// Close codes after which dialling again cannot help.
-pub const FINAL_CLOSE_CODES: &[u16] = &[1008, 4400, 4403, 4410];
+/// Why the server closed the socket for good, for the person — or `None` for
+/// a close that dialling again can get past.
+pub fn final_close(code: u16) -> Option<&'static str> {
+    Some(match code {
+        1008 => "Your access to this thread ended — you were removed from the organization or the project. Your replica is kept, but it no longer syncs.",
+        4410 => "This thread was closed. Your replica is kept, but it no longer syncs.",
+        4403 => "You can no longer open this thread. Your replica is kept, but it no longer syncs.",
+        4400 => "This version of Atlas cannot talk to the thread. Update Atlas to keep syncing.",
+        _ => return None,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // The real socket

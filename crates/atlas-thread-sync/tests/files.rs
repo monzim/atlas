@@ -436,3 +436,20 @@ async fn a_rename_onto_the_persons_file_sets_it_aside_even_when_the_source_is_go
         .any(|p| p.windows(9).any(|w| w == b"own list\n")));
     let _ = sent;
 }
+
+#[tokio::test]
+async fn a_text_file_that_grows_past_the_text_limit_is_said_to_have_stopped_syncing() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, _monzim, joy_root, _) = both(&w, &server).await;
+    write(&joy_root, "notes.md", &"x".repeat(1024 * 1024 + 1));
+    assert_eq!(joy.file_saved("notes.md").await.unwrap(), LocalChange::Echo);
+    assert_eq!(joy.replica().outgrown_files(), vec!["notes.md".to_string()]);
+    // Back under the limit, it syncs again and is no longer listed.
+    write(&joy_root, "notes.md", "todo: smaller\n");
+    assert!(matches!(
+        joy.file_saved("notes.md").await.unwrap(),
+        LocalChange::Update { .. }
+    ));
+    assert!(joy.replica().outgrown_files().is_empty());
+}

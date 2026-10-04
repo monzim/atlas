@@ -32,10 +32,13 @@ export function SharePreviewList({
   files,
   include,
   onToggle,
+  serveHistory = false,
 }: {
   files: ShareFile[];
   include: string[];
   onToggle: (path: string, included: boolean) => void;
+  /** Whether the person also agreed to send the repository's history. */
+  serveHistory?: boolean;
 }) {
   const going = uploads(files, include);
   return (
@@ -45,7 +48,9 @@ export function SharePreviewList({
           ? "No changed files will be uploaded — the thread starts at your checked-out commit."
           : `${going.length} changed ${going.length === 1 ? "file" : "files"} will be uploaded.`}{" "}
         <span className="text-[var(--secondary-foreground)]">
-          Your repository is not uploaded
+          {serveHistory
+            ? "Your repository is uploaded only as history, to a teammate who joins without your commit"
+            : "Your repository is not uploaded"}
         </span>
         , and ignored files (<span className="font-mono">.gitignore</span>,{" "}
         <span className="font-mono">.atlas/shareignore</span>) never are.

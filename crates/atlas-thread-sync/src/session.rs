@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
@@ -1097,7 +1096,7 @@ impl<T: Transport> ThreadSession<T> {
                     file_id: *file_id,
                     base_version: *base_version,
                     update: base64::engine::general_purpose::STANDARD.encode(&m.update),
-                    blob: sha256_hex(m.content.as_bytes()),
+                    blob: bootstrap::sha256_hex(m.content.as_bytes()),
                 })
                 .collect();
             let client_seq = self.take_client_seq();
@@ -1115,9 +1114,8 @@ impl<T: Transport> ThreadSession<T> {
                         // The server relays the merge to everybody else; this
                         // replica applies it itself. A save made meanwhile is
                         // folded in and goes out as its own change.
-                        if let Some(local) = self.replica.apply_remote(*file_id, &merged.update)? {
-                            self.send_update(*file_id, local).await?;
-                        }
+                        let local = self.replica.apply_remote(*file_id, &merged.update)?;
+                        self.send_updates(*file_id, local).await?;
                     }
                     for v in landed {
                         self.versions.insert(v.file_id, v.version);
@@ -1335,11 +1333,11 @@ impl<T: Transport> ThreadSession<T> {
 
     async fn save(&mut self, rel: &str) -> Result<LocalChange, SessionError> {
         match self.replica.local_change(rel)? {
-            LocalChange::Update { file_id, update } => {
-                self.send_update(file_id, update).await?;
+            LocalChange::Update { file_id, updates } => {
+                self.send_updates(file_id, updates).await?;
                 Ok(LocalChange::Update {
                     file_id,
-                    update: Vec::new(),
+                    updates: Vec::new(),
                 })
             }
             LocalChange::Blob {
@@ -1419,10 +1417,10 @@ impl<T: Transport> ThreadSession<T> {
                 let file_id = self.ensure_file(&path, true, kind).await?;
                 match kind {
                     FileKind::Text => {
-                        if let LocalChange::Update { update, .. } =
+                        if let LocalChange::Update { updates, .. } =
                             self.replica.local_change(&path)?
                         {
-                            self.send_update(file_id, update).await?;
+                            self.send_updates(file_id, updates).await?;
                         }
                     }
                     FileKind::Binary => {
@@ -1554,9 +1552,8 @@ impl<T: Transport> ThreadSession<T> {
                 ShareKind::Text => {
                     let content = String::from_utf8_lossy(&bytes);
                     let file_id = self.ensure_file(&file.path, true, FileKind::Text).await?;
-                    if let Some(update) = self.replica.set_text(file_id, &content)? {
-                        self.send_update(file_id, update).await?;
-                    }
+                    let updates = self.replica.set_text(file_id, &content)?;
+                    self.send_updates(file_id, updates).await?;
                 }
                 ShareKind::Binary => {
                     let file_id = self.ensure_file(&file.path, true, FileKind::Binary).await?;
@@ -1679,11 +1676,20 @@ impl<T: Transport> ThreadSession<T> {
         }
     }
 
+    /// Send an edit's updates, in order.
+    async fn send_updates(&mut self, file_id: u64, updates: Vec<Vec<u8>>) -> Result<(), SessionError> {
+        for update in updates {
+            self.send_update(file_id, update).await?;
+        }
+        Ok(())
+    }
+
     async fn send_update(&mut self, file_id: u64, update: Vec<u8>) -> Result<(), SessionError> {
         if update.len() > wire::MAX_PAYLOAD_BYTES {
-            // The server would refuse it. Splitting one edit across frames is
-            // part of offline buffering (ATL-404); until then it is reported
-            // rather than sent to be refused.
+            // The server would refuse it. Edits are made in frame-sized pieces
+            // (`FileDoc::set_content`), so only a pathological update — one
+            // edit's deletions alone over the cap — gets here, and it is
+            // reported rather than sent to be refused.
             return Err(SessionError::Refused {
                 code: "payload_too_large".into(),
                 message: format!("one edit of {} bytes is over the frame limit", update.len()),
@@ -1766,9 +1772,8 @@ impl<T: Transport> ThreadSession<T> {
                         // snapshot, before the tail that builds on it.
                         if self.pending_snapshots.remove(&entry.file_id) {
                             let bytes = self.store.get_snapshot(entry.file_id).await?;
-                            if let Some(local) = self.replica.apply_remote(entry.file_id, &bytes)? {
-                                self.send_update(entry.file_id, local).await?;
-                            }
+                            let local = self.replica.apply_remote(entry.file_id, &bytes)?;
+                            self.send_updates(entry.file_id, local).await?;
                         }
                         for aside in self.replica.take_set_aside() {
                             self.notice(format!(
@@ -1943,9 +1948,8 @@ impl<T: Transport> ThreadSession<T> {
                 self.saw_seq(frame.seq);
                 // A save the person made while this arrived is folded in and
                 // goes out as its own change.
-                if let Some(local) = self.replica.apply_remote(frame.file_id, &frame.payload)? {
-                    self.send_update(frame.file_id, local).await?;
-                }
+                let local = self.replica.apply_remote(frame.file_id, &frame.payload)?;
+                self.send_updates(frame.file_id, local).await?;
             }
         }
         Ok(Handled::Other)
@@ -1955,13 +1959,6 @@ impl<T: Transport> ThreadSession<T> {
 /// Largest total of updates one `merge.submit` may carry (the server's
 /// `THREAD_MAX_MERGE_BYTES`).
 const MAX_MERGE_BYTES: usize = 768 * 1024;
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 fn unexpected(answer: &Answer) -> SessionError {
     SessionError::Refused {

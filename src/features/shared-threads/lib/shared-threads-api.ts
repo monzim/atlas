@@ -76,6 +76,8 @@ export interface SharedThreadStatus {
   unsent: string[];
   /** The thread is closed: read-only on every replica until it is reopened. */
   closed: boolean;
+  /** Text files that stopped syncing: they grew past 1 MB or turned binary. */
+  outgrown: string[];
   error: string | null;
 }
 

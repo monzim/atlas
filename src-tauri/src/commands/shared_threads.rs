@@ -211,6 +211,14 @@ struct RunFrameEvent {
     delta: serde_json::Value,
 }
 
+/// Somebody asked to join, for the owner's panel (ATL-406).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinRequestEvent {
+    shared_thread_id: String,
+    user_id: String,
+}
+
 /// An error the renderer can branch on: `code` is the server's where there is
 /// one (`feature_disabled`, `workspace_local`, `limit_reached`, …), else ours.
 #[derive(Debug, Serialize)]
@@ -280,6 +288,37 @@ pub async fn shared_thread_share(
     };
 
     let token = token(&app).await?;
+    // Over the plan's touched-files limit the share would be refused partway,
+    // some files uploaded and the rest not: say so before anything goes.
+    let include_now = include.clone().unwrap_or_default();
+    let uploading = {
+        let path = PathBuf::from(&project_path);
+        tauri::async_runtime::spawn_blocking(move || {
+            atlas_thread_sync::share::preview(&path)
+                .map(|p| p.uploads(&include_now).count())
+        })
+        .await
+        .map_err(|e| SharedThreadError::new("internal", e.to_string()))?
+        .map_err(|e| SharedThreadError::new("preview_failed", e.to_string()))?
+    };
+    let features: ServerFeatures = get_json(
+        &format!(
+            "{}/threads/features?org={org_id}",
+            atlas_artifacts::ingest_base()
+        ),
+        &token,
+    )
+    .await?;
+    if let Some(limit) = features.limits.and_then(|l| l.touched_files) {
+        if uploading as u64 > limit {
+            return Err(SharedThreadError::new(
+                "limit_reached",
+                format!(
+                    "This share would touch {uploading} files, more than your organisation's plan allows (touched files per thread: {limit}). Commit or set some aside, or add them to .atlas/shareignore."
+                ),
+            ));
+        }
+    }
     let created: ServerThread = post_json(
         &format!("{}/threads", atlas_artifacts::ingest_base()),
         &token,
@@ -836,10 +875,10 @@ async fn start(
                     ThreadEvent::JoinRequested { user_id } => {
                         let _ = forward.emit(
                             SHARED_JOIN_REQUEST_EVENT,
-                            serde_json::json!({
-                                "sharedThreadId": shared_thread_id,
-                                "userId": user_id,
-                            }),
+                            JoinRequestEvent {
+                                shared_thread_id: shared_thread_id.clone(),
+                                user_id,
+                            },
                         );
                     }
                 }
@@ -1449,6 +1488,16 @@ struct ServerThreadSummary {
     id: String,
     title: String,
     base_commit: String,
+}
+
+#[derive(Deserialize)]
+struct ServerFeatures {
+    limits: Option<ServerLimits>,
+}
+
+#[derive(Deserialize)]
+struct ServerLimits {
+    touched_files: Option<u64>,
 }
 
 #[derive(Deserialize)]

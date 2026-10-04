@@ -128,6 +128,9 @@ pub struct SyncStatus {
     pub unsent: Vec<String>,
     /// The thread is closed.
     pub closed: bool,
+    /// Text files that stopped syncing because they grew past 1 MiB or
+    /// turned binary: their kind was fixed when they entered the thread.
+    pub outgrown: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -148,6 +151,7 @@ fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) ->
         notices: session.notices().to_vec(),
         unsent: session.unsent(),
         closed: session.is_closed(),
+        outgrown: replica.outgrown_files(),
         error,
     }
 }
@@ -176,17 +180,6 @@ const RECONNECT_BACKOFF: &[std::time::Duration] = &[
 
 /// How often a connected replica checks itself against the thread.
 const VERIFY_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Why the server closed the socket for good, for the person.
-fn closed_because(code: u16) -> String {
-    match code {
-        1008 => "Your access to this thread ended — you were removed from the organization or the project. Your replica is kept, but it no longer syncs.".into(),
-        4410 => "This thread was closed. Your replica is kept, but it no longer syncs.".into(),
-        4403 => "You can no longer open this thread. Your replica is kept, but it no longer syncs.".into(),
-        4400 => "This version of Atlas cannot talk to the thread. Update Atlas to keep syncing.".into(),
-        other => format!("The thread closed the connection ({other})."),
-    }
-}
 
 /// How long saves must be quiet before a missing file counts as deleted — a
 /// move arrives as a removal and a creation, a moment apart (ATL-403).
@@ -273,8 +266,8 @@ pub async fn run_with<C: Connector>(
         let outcome = match event {
             Event::Socket(None) => {
                 let code = session.close_code();
-                if let Some(code) = code.filter(|c| transport::FINAL_CLOSE_CODES.contains(c)) {
-                    final_error = Some(closed_because(code));
+                if let Some(why) = code.and_then(transport::final_close) {
+                    final_error = Some(why.to_string());
                     break;
                 }
                 if !connector.reconnects() {
@@ -365,14 +358,13 @@ pub async fn run_with<C: Connector>(
             Event::Command(Some(Command::FinishRun { run_id, reply })) => {
                 match active.remove(&run_id) {
                     Some((run, worktree)) => {
-                        let mut result = session.finish_run(&run, &worktree).await;
+                        let result = session.finish_run(&run, &worktree).await;
                         // Each Run's end is a moment to check the replica.
                         if result.is_ok() {
                             if let Err(e) = session.verify().await {
                                 tracing::warn!(target: "atlas_thread_sync", "verify after a Run: {e}");
                             }
                         }
-                        let result = std::mem::replace(&mut result, Ok(RunReport::default()));
                         let text = result
                             .as_ref()
                             .map(Clone::clone)

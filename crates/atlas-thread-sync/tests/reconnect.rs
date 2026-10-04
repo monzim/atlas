@@ -424,3 +424,26 @@ async fn a_kept_copy_is_as_private_as_the_file_it_came_from() {
     let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+#[tokio::test]
+async fn a_large_offline_edit_and_a_large_new_file_go_in_frame_sized_pieces() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim) = pair(&w, &server).await;
+    let monzim_root = monzim.replica().root().to_path_buf();
+    // Under the 1 MiB text limit, over the 256 KiB a frame carries.
+    let big = "a line of generated text that keeps going\n".repeat(15_000);
+    assert!(big.len() > 512 * 1024 && big.len() < 1024 * 1024);
+
+    server.cut("monzim");
+    monzim.mark_disconnected();
+    write(&monzim_root, "notes.md", &big);
+    monzim.file_saved("notes.md").await.unwrap();
+    write(&monzim_root, "src/generated.ts", &big);
+    monzim.file_saved("src/generated.ts").await.unwrap();
+    monzim.reconnect(server.connect("monzim")).await.unwrap();
+
+    joy.pump(QUIET).await.unwrap();
+    assert_eq!(joy.replica().text("notes.md").unwrap(), big);
+    assert_eq!(joy.replica().text("src/generated.ts").unwrap(), big);
+}

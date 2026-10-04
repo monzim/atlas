@@ -123,6 +123,10 @@ struct TrackedFile {
     /// Held because this replica may not change the thread (a viewer, a
     /// closed thread) rather than because of a secret (ATL-406).
     held_read_only: bool,
+    /// A text file whose bytes on disk are no longer text — past 1 MiB, or
+    /// binary — so its saves do not sync (a file's kind is fixed when it
+    /// enters the thread). Said in the status rather than dropped quietly.
+    outgrown: bool,
     /// A binary file's canonical content: the hex SHA-256 of its blob.
     blob: Option<String>,
     /// Deleted in the thread. The entry and document stay, so a revival
@@ -138,8 +142,9 @@ struct TrackedFile {
 pub enum LocalChange {
     /// The bytes are what this replica wrote: our own echo. Nothing to send.
     Echo,
-    /// An edit to a file the thread already holds: send this update.
-    Update { file_id: u64, update: Vec<u8> },
+    /// An edit to a file the thread already holds: send these updates, in
+    /// order (more than one only for an edit too large for one frame).
+    Update { file_id: u64, updates: Vec<Vec<u8>> },
     /// A file the thread does not hold yet: it needs a tree entry first.
     NewFile { path: String },
     /// A binary file's bytes changed: upload them, then set the blob.
@@ -256,6 +261,16 @@ impl Replica {
     /// meanwhile.
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    /// Text files whose saves stopped syncing because they are no longer text
+    /// (past 1 MiB, or binary).
+    pub fn outgrown_files(&self) -> Vec<String> {
+        self.files
+            .values()
+            .filter(|f| f.outgrown && !f.deleted)
+            .map(|f| f.path.clone())
+            .collect()
     }
 
     /// Files with saves held because this replica may not change the thread.
@@ -617,6 +632,7 @@ impl Replica {
                 disk,
                 held: None,
                 held_read_only: false,
+                outgrown: false,
                 blob: None,
                 deleted: false,
                 origin: rel.to_string(),
@@ -873,16 +889,16 @@ impl Replica {
         &mut self,
         file_id: u64,
         content: &str,
-    ) -> Result<Option<Vec<u8>>, ReplicaError> {
+    ) -> Result<Vec<Vec<u8>>, ReplicaError> {
         let file = self
             .files
             .get(&file_id)
             .ok_or(ReplicaError::UnknownFile(file_id))?;
-        let update = file.doc.set_content(content);
-        if self.materialized && update.is_some() {
+        let updates = file.doc.set_content(content);
+        if self.materialized && !updates.is_empty() {
             self.sync_disk(file_id)?;
         }
-        Ok(update)
+        Ok(updates)
     }
 
     /// Apply an update from the thread. When the worktree exists the file is
@@ -892,7 +908,7 @@ impl Replica {
         &mut self,
         file_id: u64,
         update: &[u8],
-    ) -> Result<Option<Vec<u8>>, ReplicaError> {
+    ) -> Result<Vec<Vec<u8>>, ReplicaError> {
         let file = self
             .files
             .get(&file_id)
@@ -901,7 +917,7 @@ impl Replica {
         // but nothing is written where it used to be.
         if !self.materialized || file.deleted || self.rebuilding {
             file.doc.apply(update)?;
-            return Ok(None);
+            return Ok(Vec::new());
         }
         // A save we have not seen yet goes into the document before the
         // remote change, or writing the merge back would erase it.
@@ -932,10 +948,14 @@ impl Replica {
         match (self.by_path.get(rel).copied(), bytes) {
             (Some(file_id), None) => Ok(LocalChange::Missing { file_id }),
             (Some(file_id), Some(bytes)) => match self.files[&file_id].kind {
-                FileKind::Text => Ok(match self.ingest_disk(file_id)? {
-                    Some(update) => LocalChange::Update { file_id, update },
-                    None => LocalChange::Echo,
-                }),
+                FileKind::Text => {
+                    let updates = self.ingest_disk(file_id)?;
+                    Ok(if updates.is_empty() {
+                        LocalChange::Echo
+                    } else {
+                        LocalChange::Update { file_id, updates }
+                    })
+                }
                 FileKind::Binary => {
                     let seen = hash(&bytes);
                     let file = self.files.get_mut(&file_id).expect("known");
@@ -1003,7 +1023,7 @@ impl Replica {
 
     /// Read the file's bytes off disk and, unless they are what this replica
     /// already knows, make the document match them. Answers the update.
-    fn ingest_disk(&mut self, file_id: u64) -> Result<Option<Vec<u8>>, ReplicaError> {
+    fn ingest_disk(&mut self, file_id: u64) -> Result<Vec<Vec<u8>>, ReplicaError> {
         let file = self
             .files
             .get_mut(&file_id)
@@ -1013,7 +1033,7 @@ impl Replica {
             Ok(bytes) => bytes,
             // Deletion is a tree change (ATL-403); until then a missing file
             // is left to the next remote write to restore.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
                 return Err(ReplicaError::Io {
                     path: target,
@@ -1022,10 +1042,15 @@ impl Replica {
             }
         };
         let seen = hash(&bytes);
+        if file.disk == Some(seen) {
+            return Ok(Vec::new());
+        }
         // A text file that turned binary, or grew past the text limit, stays
-        // as it was in the thread: a file's kind is fixed when it enters.
-        if file.disk == Some(seen) || !looks_textual(&bytes) {
-            return Ok(None);
+        // as it was in the thread — a file's kind is fixed when it enters —
+        // and the status says it stopped syncing.
+        file.outgrown = !looks_textual(&bytes);
+        if file.outgrown {
+            return Ok(Vec::new());
         }
         let content = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -1038,7 +1063,7 @@ impl Replica {
                 file.held = Some(file.doc.snapshot());
             }
             file.held_read_only = !secret;
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         file.disk = Some(seen);
@@ -1050,12 +1075,12 @@ impl Replica {
                 // was held, merged into whatever the thread did since. Then
                 // disk gets the merge.
                 let fork = FileDoc::from_snapshot(self.client_id, &snapshot)?;
-                let update = fork.set_content(&content);
-                if let Some(update) = &update {
+                let updates = fork.set_content(&content);
+                for update in &updates {
                     file.doc.apply(update)?;
                 }
                 self.sync_disk(file_id)?;
-                Ok(update)
+                Ok(updates)
             }
         }
     }

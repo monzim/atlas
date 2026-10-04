@@ -299,7 +299,7 @@ async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
     )
     .unwrap()
     .set_content(".hero {\n  color: green;\n}\n")
-    .unwrap();
+    .remove(0);
     server.merge_before_next_submit(banner, theirs);
 
     let report = monzim.finish_run(&run, &monzim_runs).await.unwrap();

@@ -39,6 +39,10 @@ import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
 import { OwnerPanel } from "./owner-panel";
 import { SharePreviewList, uploads } from "./share-preview";
 
+function shareLabel(count: number): string {
+  return `Share with ${count} ${count === 1 ? "file" : "files"}`;
+}
+
 /** What the chat pane knows about the thread it shows. */
 export interface ShareTarget {
   /** The ACP session id behind the chat. `null` before the first send. */
@@ -168,6 +172,7 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
               <SharePreviewList
                 files={preview}
                 include={include}
+                serveHistory={serveHistory}
                 onToggle={(path, on) =>
                   setInclude((now) => (on ? [...now, path] : now.filter((p) => p !== path)))
                 }
@@ -189,11 +194,7 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
               </label>
               <div className="flex gap-1.5">
                 <Button size="sm" className="flex-1" onClick={share} disabled={busy !== null}>
-                  {busy === "share"
-                    ? "Sharing…"
-                    : `Share with ${uploads(preview, include).length} ${
-                        uploads(preview, include).length === 1 ? "file" : "files"
-                      }`}
+                  {busy === "share" ? "Sharing…" : shareLabel(uploads(preview, include).length)}
                 </Button>
                 <Button
                   size="sm"
@@ -370,6 +371,20 @@ function ThreadCard({
             {status.readOnly}
           </span>
         </p>
+      )}
+      {status.outgrown.length > 0 && (
+        <div className="flex flex-col gap-1 rounded bg-warning-muted p-2 text-warning">
+          <span className="font-medium">Not syncing — no longer text</span>
+          {status.outgrown.map((path) => (
+            <span key={path} className="font-mono">
+              {path}
+            </span>
+          ))}
+          <span className="text-[var(--secondary-foreground)]">
+            These grew past 1 MB or turned binary after they joined the thread, which syncs them as
+            text. Smaller text syncs again.
+          </span>
+        </div>
       )}
       {status.unsent.length > 0 && (
         <div className="flex flex-col gap-1 rounded bg-[var(--atlas-element-hover)] p-2 text-[var(--secondary-foreground)]">
