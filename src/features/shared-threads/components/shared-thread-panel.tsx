@@ -26,6 +26,7 @@ import {
   openThread,
   previewShare,
   runWorktree,
+  setServeHistory,
   shareThread,
   sharedThreadError,
   type ShareFile,
@@ -79,6 +80,8 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
   const [preview, setPreview] = useState<ShareFile[] | null>(null);
   /** Blocked files the person chose to include anyway. */
   const [include, setInclude] = useState<string[]>([]);
+  /** Let teammates without the starting commit fetch the history from here. */
+  const [serveHistory, setServeHistoryChoice] = useState(false);
 
   async function review() {
     if (!target.projectPath) return;
@@ -104,6 +107,7 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
         projectPath: target.projectPath,
         title: target.title,
         include,
+        serveHistory,
       });
       shared(target.sessionId, view);
       setPreview(null);
@@ -166,6 +170,21 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
                   setInclude((now) => (on ? [...now, path] : now.filter((p) => p !== path)))
                 }
               />
+              <label className="flex cursor-pointer items-start gap-2">
+                <input
+                  type="checkbox"
+                  checked={serveHistory}
+                  onChange={(e) => setServeHistoryChoice(e.target.checked)}
+                  className="mt-0.5 size-3 shrink-0 cursor-pointer accent-[var(--primary)]"
+                />
+                <span className="leading-relaxed text-[var(--secondary-foreground)]">
+                  Send this repository&apos;s history to teammates who don&apos;t have your commit
+                  <span className="block text-[var(--muted-foreground)]">
+                    Only when one joins without it — say it was never pushed. That uploads every
+                    commit behind it, so it is off unless you turn it on.
+                  </span>
+                </span>
+              </label>
               <div className="flex gap-1.5">
                 <Button size="sm" className="flex-1" onClick={share} disabled={busy !== null}>
                   {busy === "share"
@@ -343,6 +362,29 @@ function ThreadCard({
             {status.readOnly}
           </span>
         </p>
+      )}
+      {status.historyWanted > 0 && !status.servesHistory && (
+        <div className="flex flex-col gap-1.5 rounded bg-warning-muted p-2">
+          <span className="text-[var(--foreground)]">
+            {status.historyWanted === 1 ? "A teammate needs" : "Teammates need"} this
+            repository&apos;s history to edit — they don&apos;t have its starting commit.
+          </span>
+          <span className="text-[var(--muted-foreground)]">
+            Sending it uploads every commit behind that commit to the thread.
+          </span>
+          <Button
+            size="xs"
+            variant="outline"
+            className="self-start"
+            onClick={() =>
+              void setServeHistory(thread.sharedThreadId, true).catch((e) =>
+                setError(sharedThreadError(e)),
+              )
+            }
+          >
+            Send history
+          </Button>
+        </div>
       )}
       {status.error && <p className="text-warning">{status.error}</p>}
       {status.held.length > 0 && (

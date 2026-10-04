@@ -260,6 +260,18 @@ impl FakeThreadServer {
         self.hub.lock().expect("hub").store.clone()
     }
 
+    /// Every canonical update payload journaled, in `seq` order — to check
+    /// what reached the thread.
+    pub fn journaled_payloads(&self) -> Vec<Vec<u8>> {
+        self.hub
+            .lock()
+            .expect("hub")
+            .journal
+            .iter()
+            .filter_map(|j| j.frame.as_ref().map(|f| f.payload.clone()))
+            .collect()
+    }
+
     /// The tree as the server holds it.
     pub fn tree(&self) -> Vec<TreeEntry> {
         self.hub.lock().expect("hub").tree.clone()

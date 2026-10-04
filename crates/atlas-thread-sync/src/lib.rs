@@ -83,6 +83,9 @@ pub enum Command {
     },
     /// The Run will not finish: mark it interrupted.
     InterruptRun { run_id: String },
+    /// Whether to send this repository's history to teammates who lack the
+    /// Base (ATL-402). Off until the person agrees.
+    ServeHistory(bool),
     /// Close the connection and end the loop.
     Stop,
 }
@@ -114,6 +117,10 @@ pub struct SyncStatus {
     /// Why this replica can only watch — no Base on this machine, a viewer's
     /// role, a closed thread — or `None` when it can edit.
     pub read_only: Option<String>,
+    /// Whether this machine sends the repository's history to teammates who
+    /// lack the Base, and how many are waiting for it while it does not.
+    pub serves_history: bool,
+    pub history_wanted: usize,
     pub error: Option<String>,
 }
 
@@ -133,6 +140,8 @@ fn status_of<T: Transport>(
         held: replica.held_files(),
         runs: session.runs(),
         read_only: session.read_only(),
+        serves_history: session.serves_bundles(),
+        history_wanted: session.bundles_wanted(),
         error,
     }
 }
@@ -252,6 +261,10 @@ pub async fn run<T: Transport>(
                     }
                     None => Ok(()),
                 }
+            }
+            Event::Command(Some(Command::ServeHistory(on))) => {
+                session.set_serve_bundles(on);
+                Ok(())
             }
             Event::Command(Some(Command::InterruptRun { run_id })) => {
                 match active.remove(&run_id) {

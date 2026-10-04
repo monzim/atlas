@@ -76,6 +76,11 @@ pub struct SharedThreadEntry {
     /// This replica's stable id on the wire, kept across reconnects so the
     /// server can say which of its frames it already stored.
     pub client_id: String,
+    /// Whether this machine sends the repository's history — everything
+    /// behind the Base — to teammates who lack it (ATL-402). Off until the
+    /// person agrees, in the share dialog or on the thread's card.
+    #[serde(default)]
+    pub serve_history: bool,
     /// The link to send a teammate.
     pub link: String,
 }
@@ -250,6 +255,7 @@ pub async fn shared_thread_share(
     project_path: String,
     title: String,
     include: Option<Vec<String>>,
+    serve_history: Option<bool>,
 ) -> Result<SharedThreadView> {
     let org_id = active_org(&app)?;
     let workspace_id = cloud_workspace(&project_path, &org_id).await?;
@@ -289,6 +295,7 @@ pub async fn shared_thread_share(
         role: created.role.clone().unwrap_or_else(|| "owner".into()),
         project_path: Some(project_path.clone()),
         client_id: new_client_id(),
+        serve_history: serve_history.unwrap_or(false),
     };
 
     // Link the local thread before anything can fail on the network, so a
@@ -364,6 +371,7 @@ pub async fn shared_thread_join(
         role: thread.role.unwrap_or_else(|| "participant".into()),
         project_path,
         client_id: new_client_id(),
+        serve_history: false,
     };
     let view = start(&app, entry, None).await?;
     remember(&app, &view.entry)?;
@@ -405,6 +413,34 @@ pub async fn shared_thread_run_worktree(
         .map_err(|_| disconnected())?
         .map_err(|e| SharedThreadError::new("checkout_failed", e))?;
     Ok(root.to_string_lossy().into_owned())
+}
+
+/// Send (or stop sending) this repository's history to teammates who lack the
+/// thread's Base (ATL-402). A bundle is the whole history behind the Base, so
+/// it is never sent without the person saying so; requests heard meanwhile
+/// wait for it.
+#[tauri::command]
+pub async fn shared_thread_serve_history(
+    app: AppHandle,
+    shared_thread_id: String,
+    on: bool,
+) -> Result<()> {
+    let commands = commands_for(&app, &shared_thread_id)?;
+    commands
+        .send(SyncCommand::ServeHistory(on))
+        .map_err(|_| disconnected())?;
+    let entry = {
+        let state = app.state::<SharedThreadsState>();
+        let mut running = state.running.lock().map_err(|_| poisoned())?;
+        running.get_mut(&shared_thread_id).map(|r| {
+            r.entry.serve_history = on;
+            r.entry.clone()
+        })
+    };
+    if let Some(entry) = entry {
+        remember(&app, &entry)?;
+    }
+    Ok(())
 }
 
 /// Every Shared Thread this machine has joined, with its live status.
@@ -530,6 +566,7 @@ async fn start(
         app: app.clone(),
     }));
     session.set_thread_repo(thread_repo);
+    session.set_serve_bundles(entry.serve_history);
     // Without the Base the replica can only watch; a bundle fixes that. Not
     // getting one is not a failure — the status says why it is read-only.
     if !session.replica().has_base() {

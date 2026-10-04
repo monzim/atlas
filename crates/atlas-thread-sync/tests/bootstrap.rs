@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_thread_sync::{
-    git, run, share, Bootstrapped, FakeStore, FakeThreadServer, FakeTransport, LocalChange,
+    git, run, share, Bootstrapped, Command as SyncCommand, FakeStore, FakeThreadServer, FakeTransport, LocalChange,
     Replica, SecretReason, ShareKind, SyncStatus, ThreadRepo, ThreadSession,
 };
 use tokio::sync::{mpsc, watch};
@@ -71,12 +71,13 @@ async fn joy_shares(w: &Unpushed, server: &FakeThreadServer) -> watch::Receiver<
         .unwrap();
     joy.set_store(Arc::new(server.store()));
     joy.set_thread_repo(ThreadRepo::at(&w.root.join("threads/joy")));
+    joy.set_serve_bundles(true);
     joy.share_working_changes(&w.joy, &[]).await.unwrap();
-    let (_commands, rx) = mpsc::unbounded_channel();
+    let (commands, rx) = mpsc::unbounded_channel();
     let (status_tx, status) = watch::channel(SyncStatus::default());
-    // The sender is leaked into the task's lifetime by moving it along.
     tokio::spawn(async move {
-        let _keep = _commands;
+        // Kept alive for the loop's lifetime.
+        let _commands: mpsc::UnboundedSender<SyncCommand> = commands;
         run(joy, rx, status_tx).await;
     });
     status
@@ -334,4 +335,79 @@ async fn a_files_base_content_is_uploaded_when_it_enters_the_thread() {
     );
     // `notes.md` is new since the Base: nothing to upload for it.
     assert_eq!(store.blobs(), 1);
+}
+
+#[tokio::test]
+async fn history_is_sent_only_once_the_sharer_agrees() {
+    let w = unpushed();
+    let server = FakeThreadServer::new();
+    let replica = Replica::new(&w.joy, &w.base, &w.root.join("replicas/joy")).unwrap();
+    let mut joy = ThreadSession::open(server.connect("joy"), replica, "joy-replica-1")
+        .await
+        .unwrap();
+    joy.set_store(Arc::new(server.store()));
+    joy.set_thread_repo(ThreadRepo::at(&w.root.join("threads/joy")));
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
+    let (commands, rx) = mpsc::unbounded_channel();
+    let (status_tx, mut status) = watch::channel(SyncStatus::default());
+    tokio::spawn(run(joy, rx, status_tx));
+
+    let joining = {
+        let server = server.clone();
+        let root = w.root.clone();
+        let base = w.base.clone();
+        tokio::spawn(async move {
+            let replica = Replica::without_base(&base, &root.join("replicas/alice")).unwrap();
+            let mut alice = ThreadSession::open(server.connect("alice"), replica, "alice-replica-1")
+                .await
+                .unwrap();
+            alice.set_store(Arc::new(server.store()));
+            alice.set_thread_repo(ThreadRepo::at(&root.join("threads/alice")));
+            alice.bootstrap(None).await.unwrap()
+        })
+    };
+
+    // Joy is asked, and nothing leaves her machine until she says yes.
+    status
+        .wait_for(|s| s.history_wanted == 1 && !s.serves_history)
+        .await
+        .unwrap();
+    assert!(server.store().bundles().is_empty());
+
+    commands.send(SyncCommand::ServeHistory(true)).unwrap();
+    assert_eq!(joining.await.unwrap(), Bootstrapped::Ready);
+    assert_eq!(server.store().bundles().len(), 1);
+}
+
+#[tokio::test]
+async fn a_secret_in_a_files_base_content_never_leaves_with_it() {
+    let w = world();
+    let key = "AKIAIOSFODNN7EXAMPLE";
+    let secret = format!("aws_access_key_id = {key}\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n");
+    write(&w.joy, "config/aws.ini", &secret);
+    git(&w.joy, &["add", "config/aws.ini"]);
+    git(&w.joy, &["commit", "--quiet", "-m", "oops"]);
+    let base = git(&w.joy, &["rev-parse", "HEAD"]);
+    // The working copy no longer holds the key, so the file itself shares.
+    write(&w.joy, "config/aws.ini", "aws_profile = default\n");
+
+    let server = FakeThreadServer::new();
+    let replica = Replica::new(&w.joy, &base, &w.replicas.join("joy")).unwrap();
+    let mut joy = ThreadSession::open(server.connect("joy"), replica, "joy-replica-1")
+        .await
+        .unwrap();
+    joy.set_store(Arc::new(server.store()));
+    let report = joy.share_working_changes(&w.joy, &[]).await.unwrap();
+    assert!(report.shared.contains(&"config/aws.ini".to_string()));
+
+    // Neither as a Base blob, nor inside a seed on the wire.
+    assert!(server
+        .store()
+        .blob(&atlas_thread_sync::bootstrap::sha256_hex(secret.as_bytes()))
+        .is_none());
+    assert!(!server
+        .journaled_payloads()
+        .iter()
+        .any(|p| p.windows(key.len()).any(|w| w == key.as_bytes())));
+    assert_eq!(joy.replica().text("config/aws.ini").unwrap(), "aws_profile = default\n");
 }

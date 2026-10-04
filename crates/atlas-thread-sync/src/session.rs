@@ -102,6 +102,9 @@ pub struct RunView {
     pub files: Vec<String>,
 }
 
+/// Bundle requests kept while the person has not agreed to send history.
+const MAX_WANTED: usize = 16;
+
 /// How many times a rejected merge is recomputed before giving up.
 const MERGE_ATTEMPTS: u32 = 8;
 
@@ -170,6 +173,13 @@ pub struct ThreadSession<T: Transport> {
     bundle_answer: Option<BundleAnswer>,
     /// Requests from others this replica has not served yet.
     wanted: Vec<BundleWant>,
+    /// Has the person agreed to send this repository's history to teammates
+    /// who lack the Base? A bundle is the whole history behind the Base, so
+    /// nothing is built until they say yes (ATL-402).
+    serve_bundles: bool,
+    /// Blocked paths the person included anyway in this share: their Base
+    /// content may be published too.
+    included: HashSet<String>,
     /// Why this replica can only watch, when it can.
     watch_only: Option<String>,
 }
@@ -214,6 +224,8 @@ impl<T: Transport> ThreadSession<T> {
             bundle_request: None,
             bundle_answer: None,
             wanted: Vec::new(),
+            serve_bundles: false,
+            included: HashSet::new(),
             watch_only: None,
         };
         loop {
@@ -386,8 +398,32 @@ impl<T: Transport> ThreadSession<T> {
         }
     }
 
-    /// Bundle requests from others this replica has heard and not served.
+    /// Let this replica send the repository's history — everything behind the
+    /// Base — to teammates who lack it. Off until the person turns it on;
+    /// requests heard meanwhile wait, and are served once it is.
+    pub fn set_serve_bundles(&mut self, on: bool) {
+        self.serve_bundles = on;
+    }
+
+    pub fn serves_bundles(&self) -> bool {
+        self.serve_bundles
+    }
+
+    /// Bundle requests waiting for the person to agree to send history.
+    pub fn bundles_wanted(&self) -> usize {
+        if self.serve_bundles {
+            0
+        } else {
+            self.wanted.len()
+        }
+    }
+
+    /// Bundle requests from others to serve now: none until the person has
+    /// agreed to send history ([`ThreadSession::set_serve_bundles`]).
     pub fn take_bundle_wants(&mut self) -> Vec<BundleWant> {
+        if !self.serve_bundles {
+            return Vec::new();
+        }
         std::mem::take(&mut self.wanted)
     }
 
@@ -865,6 +901,7 @@ impl<T: Transport> ThreadSession<T> {
         include: &[String],
     ) -> Result<ShareReport, SessionError> {
         let preview = share::preview(checkout)?;
+        self.included = include.iter().cloned().collect();
         let mut report = ShareReport::default();
         for held in preview.held(include) {
             if let Some(reason) = &held.blocked {
@@ -935,7 +972,11 @@ impl<T: Transport> ThreadSession<T> {
         if let Some(id) = self.replica.file_id(path) {
             return Ok(id);
         }
-        let base_blob = if introduced {
+        // A file whose Base content looks like a secret — a key the person
+        // has since removed, say — keeps that content home: no Base blob, no
+        // seed on the wire. Unless they included the file anyway.
+        let publish_base = introduced && !self.base_is_secret(path);
+        let base_blob = if publish_base {
             self.upload_base(path).await
         } else {
             None
@@ -963,12 +1004,26 @@ impl<T: Transport> ThreadSession<T> {
                 .ok_or(SessionError::ClosedEarly)?;
             self.handle(message).await?;
         };
-        if introduced {
+        if publish_base {
             for seed in self.replica.seed_for(path)? {
                 self.send_update(file_id, seed).await?;
             }
         }
         Ok(file_id)
+    }
+
+    /// Does `path`'s Base content look like a secret the person has not
+    /// chosen to share?
+    fn base_is_secret(&self, path: &str) -> bool {
+        if self.included.contains(path) {
+            return false;
+        }
+        match self.replica.base_bytes(path) {
+            Ok(Some(bytes)) => secret_reason(path, &String::from_utf8_lossy(&bytes)).is_some(),
+            Ok(None) => false,
+            // Unreadable: say nothing rather than guess.
+            Err(_) => true,
+        }
     }
 
     async fn send_update(&mut self, file_id: u64, update: Vec<u8>) -> Result<(), SessionError> {
@@ -1100,6 +1155,11 @@ impl<T: Transport> ThreadSession<T> {
                         }
                     }
                     ServerControl::BundleWanted { request_id, have } => {
+                        // Waiting on the person's say-so, requests pile up;
+                        // keep the newest few (the server forgets old ones).
+                        if self.wanted.len() >= MAX_WANTED {
+                            self.wanted.remove(0);
+                        }
                         self.wanted.push(BundleWant { request_id, have });
                     }
                     ServerControl::BundlePending {

@@ -60,6 +60,10 @@ export interface SharedThreadStatus {
    * a viewer's role, a closed thread — or `null` when it can edit.
    */
   readOnly: string | null;
+  /** Whether this machine sends the repository's history to teammates who lack the Base. */
+  servesHistory: boolean;
+  /** Teammates waiting for that history while it is not being sent. */
+  historyWanted: number;
   error: string | null;
 }
 
@@ -95,6 +99,8 @@ export interface SharedThreadView {
    */
   projectPath: string | null;
   clientId: string;
+  /** Whether this machine sends the repository's history to teammates who need it. */
+  serveHistory: boolean;
   /** What to send a teammate. */
   link: string;
   status: SharedThreadStatus;
@@ -139,8 +145,18 @@ export function shareThread(args: {
   projectPath: string;
   title: string;
   include: string[];
+  /** Let teammates without the starting commit fetch the history from here. */
+  serveHistory: boolean;
 }) {
   return invoke<SharedThreadView>("shared_thread_share", args);
+}
+
+/**
+ * Send (or stop sending) this repository's history to teammates who lack the
+ * thread's starting commit. Never sent without the person's say-so.
+ */
+export function setServeHistory(sharedThreadId: string, on: boolean) {
+  return invoke<void>("shared_thread_serve_history", { sharedThreadId, on });
 }
 
 /**
