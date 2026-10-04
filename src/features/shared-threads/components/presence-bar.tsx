@@ -26,8 +26,8 @@ export function SyncBadge({ sync, connected }: { sync: SyncState | null; connect
 }
 
 /** Two letters for an avatar. */
-export function initials(userId: string): string {
-  const words = userId.replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/);
+export function initials(name: string): string {
+  const words = name.replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/);
   const letters = words.length > 1 ? words[0]![0]! + words[1]![0]! : (words[0] ?? "?").slice(0, 2);
   return letters.toUpperCase();
 }
@@ -45,7 +45,14 @@ export function activity(peer: SharedPeer): string | null {
  * Who else is on the thread (ATL-407): an avatar per person — on a desktop or
  * the web — and what each is doing.
  */
-export function PresenceBar({ peers }: { peers: SharedPeer[] }) {
+export function PresenceBar({
+  peers,
+  nameOf = (userId) => userId,
+}: {
+  peers: SharedPeer[];
+  /** A person's name for their user id. */
+  nameOf?: (userId: string) => string;
+}) {
   if (peers.length === 0) return null;
   // One avatar per person, however many windows they have open — doing
   // whatever any of them is doing.
@@ -72,12 +79,12 @@ export function PresenceBar({ peers }: { peers: SharedPeer[] }) {
           return (
             <span
               key={p.userId}
-              title={`${p.userId} · ${p.surface === "web" ? "web" : "desktop"}${what ? ` · ${what}` : ""}`}
+              title={`${nameOf(p.userId)} · ${p.surface === "web" ? "web" : "desktop"}${what ? ` · ${what}` : ""}`}
               className="relative inline-flex size-6 items-center justify-center rounded-full text-[10px] font-medium text-white"
               // ratchet-allow: a collaborator's own hue, the same one their caret uses.
               style={{ background: `hsl(${avatarHue(p.userId)} 55% 45%)` }}
             >
-              {initials(p.userId)}
+              {initials(nameOf(p.userId))}
               <Surface
                 size={9}
                 className="absolute -bottom-0.5 -right-0.5 rounded-full bg-[var(--background)] p-px text-[var(--muted-foreground)]"
@@ -91,7 +98,7 @@ export function PresenceBar({ peers }: { peers: SharedPeer[] }) {
       </div>
       {doing.map(({ p, what }) => (
         <span key={p.userId} className="truncate text-[var(--muted-foreground)]">
-          <span className="text-[var(--secondary-foreground)]">{p.userId}</span> is {what}
+          <span className="text-[var(--secondary-foreground)]">{nameOf(p.userId)}</span> is {what}
         </span>
       ))}
     </div>

@@ -40,6 +40,7 @@ import {
 } from "../lib/shared-threads-api";
 import { runKey, usePeers, useSharedThreadsStore } from "../stores/shared-threads-store";
 import { ApplyPanel } from "./apply-panel";
+import { usePersonName } from "../lib/use-person-name";
 import { PresenceBar, SyncBadge } from "./presence-bar";
 import { ConflictList, conflictPlace, type ConflictAction } from "./conflict-view";
 import { OwnerPanel } from "./owner-panel";
@@ -338,6 +339,7 @@ function ThreadCard({
 
   const mayRun = thread.role !== "viewer" && status.readOnly === null;
   const peers = usePeers(thread.sharedThreadId);
+  const nameOf = usePersonName();
 
   /**
    * Resolve a Conflict (ATL-410). Asking an agent is itself a Run: an agent
@@ -383,7 +385,7 @@ function ThreadCard({
           {thread.role}
         </Badge>
       </div>
-      <PresenceBar peers={peers} />
+      <PresenceBar peers={peers} nameOf={nameOf} />
       <div className="flex flex-wrap gap-x-3 gap-y-1 text-[var(--muted-foreground)]">
         <span className="font-mono">base {thread.base.slice(0, 8)}</span>
         <span className="tabular-nums">

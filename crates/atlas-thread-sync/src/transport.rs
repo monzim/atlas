@@ -1373,7 +1373,7 @@ impl Hub {
                 entry.merge_version = Some(version);
                 let file_version = FileVersion { file_id, version };
                 let conflict = &mut self.conflicts[index].0;
-                conflict.status = "resolved".into();
+                conflict.status = wire::ConflictStatus::Resolved;
                 conflict.resolution = Some(ConflictResolution {
                     text: resolution,
                     side,
@@ -1528,7 +1528,7 @@ impl Hub {
                             file_id: hunk.file_id,
                             path,
                             run_id: run_id.clone(),
-                            status: "open".into(),
+                            status: wire::ConflictStatus::Open,
                             lines: hunk.lines,
                             binary: hunk.binary,
                             base: hunk.base.clone(),

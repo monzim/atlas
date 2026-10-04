@@ -54,9 +54,18 @@ describe("presence (ATL-407)", () => {
     expect(container.textContent).toContain("joy is running an agent in README.md");
   });
 
+  it("uses people's names where it knows them", () => {
+    const { container } = render(
+      <PresenceBar peers={[peer({ typing: "a.ts" })]} nameOf={(id) => (id === "monzim" ? "Azraf Monzim" : id)} />,
+    );
+    expect(screen.getByText("AM")).toBeTruthy();
+    expect(container.textContent).toContain("Azraf Monzim is typing in a.ts");
+  });
+
   it("names avatars and activity plainly", () => {
     expect(initials("monzim")).toBe("MO");
     expect(initials("joy.lee")).toBe("JL");
+    expect(initials("Joy Lee")).toBe("JL");
     expect(activity(peer({}))).toBeNull();
     expect(activity(peer({ runs: [{ runId: "r", path: null }] }))).toBe("running an agent");
   });

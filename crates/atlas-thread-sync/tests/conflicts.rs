@@ -156,7 +156,7 @@ async fn typing_on_a_runs_line_raises_a_conflict_and_the_rest_of_the_run_lands()
         let views = session.conflicts();
         assert_eq!(views.len(), 1);
         let v = &views[0];
-        assert_eq!(v.conflict.status, "open");
+        assert!(v.conflict.is_open());
         assert_eq!(v.run_by.as_deref(), Some("monzim"));
         assert_eq!(v.run_agent.as_deref(), Some("codex"));
         assert_eq!(v.canonical_by, vec!["joy".to_string()]);
@@ -281,7 +281,7 @@ async fn every_resolution_produces_the_same_file_on_every_replica() {
         expected = expected.replace("line 19\n", hunk);
         assert_eq!(app(&t.joy), expected, "{choice:?}");
         assert_eq!(app(&t.monzim), expected, "{choice:?}");
-        assert_eq!(t.server.conflicts()[0].status, "resolved");
+        assert!(!t.server.conflicts()[0].is_open());
         assert_eq!(t.monzim.open_conflicts(), 0);
         // Resolved is resolved: a second answer is refused.
         let again = t.monzim.resolve_conflict(conflict_id, Resolve::Run).await;

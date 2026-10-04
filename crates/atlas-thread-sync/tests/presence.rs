@@ -166,9 +166,15 @@ async fn a_save_not_yet_read_is_judged_with_the_keystrokes_that_follow_it() {
     );
     let (_, update) = edit(&opened.state, ".banner {\n  color: green;\n}\n/* ok */\n");
     let refused = joy.editor_update(opened.file_id, update).await;
-    assert!(matches!(refused, Err(SessionError::ReadOnly(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(SessionError::ReadOnly(_))),
+        "{refused:?}"
+    );
     assert_eq!(joy.updates_sent(), sent);
-    assert!(joy.replica().held_files().contains(&"src/banner.css".to_string()));
+    assert!(joy
+        .replica()
+        .held_files()
+        .contains(&"src/banner.css".to_string()));
 }
 
 #[tokio::test]

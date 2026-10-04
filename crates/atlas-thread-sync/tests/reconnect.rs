@@ -411,7 +411,11 @@ async fn a_kept_copy_is_as_private_as_the_file_it_came_from() {
     let monzim_root = monzim.replica().root().to_path_buf();
     let kept = server.head();
     let file = monzim_root.join("src/banner.css");
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: private;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: private;\n}\n",
+    );
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
     monzim.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();

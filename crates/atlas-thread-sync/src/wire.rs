@@ -375,8 +375,7 @@ pub struct ThreadConflict {
     pub file_id: u64,
     pub path: String,
     pub run_id: String,
-    /// `open` or `resolved`.
-    pub status: String,
+    pub status: ConflictStatus,
     #[serde(default)]
     pub lines: Option<LineRange>,
     pub binary: bool,
@@ -391,6 +390,20 @@ pub struct ThreadConflict {
     pub raised_at: u64,
     #[serde(default)]
     pub resolution: Option<ConflictResolution>,
+}
+
+/// Whether a Conflict still waits for somebody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictStatus {
+    Open,
+    Resolved,
+}
+
+impl ThreadConflict {
+    pub fn is_open(&self) -> bool {
+        self.status == ConflictStatus::Open
+    }
 }
 
 /// The Runs and people whose changes meet in a Conflict.

@@ -49,7 +49,11 @@ async fn a_viewers_edits_are_not_sent_and_the_status_says_why() {
     assert!(why.contains("viewer"), "{why}");
 
     // His edit and his new file stay on his machine, and he is told which.
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: teal;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: teal;\n}\n",
+    );
     write(&monzim_root, "src/idea.ts", "export const idea = 1;\n");
     assert_eq!(
         monzim.file_saved("src/banner.css").await.unwrap(),
@@ -71,13 +75,19 @@ async fn a_viewers_edits_are_not_sent_and_the_status_says_why() {
     );
     joy.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
-    assert_eq!(read(&monzim_root, "src/banner.css"), ".banner {\n  color: teal;\n}\n");
+    assert_eq!(
+        read(&monzim_root, "src/banner.css"),
+        ".banner {\n  color: teal;\n}\n"
+    );
     assert!(!server.tree().iter().any(|e| e.path == "src/idea.ts"));
     // A file he deletes stays in the thread too, until he may change it.
     std::fs::remove_file(monzim_root.join("notes.md")).unwrap();
     monzim.file_saved("notes.md").await.unwrap();
     assert!(monzim.settle_removals().await.unwrap().is_empty());
-    assert!(!server.tree().iter().any(|e| e.path == "notes.md" && e.deleted));
+    assert!(!server
+        .tree()
+        .iter()
+        .any(|e| e.path == "notes.md" && e.deleted));
 
     // Promoted: what he held goes, merged with what Joy did meanwhile.
     server.set_role("monzim", Role::Participant);
@@ -91,7 +101,10 @@ async fn a_viewers_edits_are_not_sent_and_the_status_says_why() {
     joy.pump(QUIET).await.unwrap();
     assert_eq!(read(&joy_root, "src/banner.css"), merged);
     assert_eq!(read(&joy_root, "src/idea.ts"), "export const idea = 1;\n");
-    assert!(server.tree().iter().any(|e| e.path == "notes.md" && e.deleted));
+    assert!(server
+        .tree()
+        .iter()
+        .any(|e| e.path == "notes.md" && e.deleted));
 }
 
 #[tokio::test]
@@ -110,7 +123,10 @@ async fn close_turns_every_replica_read_only_and_reopen_lets_edits_through() {
         assert!(replica.read_only().unwrap().contains("closed"));
     }
     write(&joy_root, "notes.md", "todo: after close\n");
-    assert_eq!(joy.file_saved("notes.md").await.unwrap(), LocalChange::Ignored);
+    assert_eq!(
+        joy.file_saved("notes.md").await.unwrap(),
+        LocalChange::Ignored
+    );
     assert_eq!(joy.unsent(), vec!["notes.md".to_string()]);
     monzim.pump(QUIET).await.unwrap();
     assert_eq!(read(&monzim_root, "notes.md"), "todo: red?\n");
@@ -131,7 +147,10 @@ async fn approving_a_join_request_lets_the_joiner_in_and_declining_does_not() {
     let (events, mut heard) = mpsc::unbounded_channel();
     joy.set_events(events);
     monzim.set_awaiting_approval(true);
-    assert!(monzim.read_only().unwrap().contains("Waiting for the owner"));
+    assert!(monzim
+        .read_only()
+        .unwrap()
+        .contains("Waiting for the owner"));
 
     // The owner hears the request.
     server.request_join("monzim");

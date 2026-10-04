@@ -35,6 +35,7 @@ import {
   useSharedDoc,
 } from "@/features/shared-threads/lib/use-shared-doc";
 import { usePeers } from "@/features/shared-threads/stores/shared-threads-store";
+import { usePersonName } from "@/features/shared-threads/lib/use-person-name";
 
 const TOOLBAR_HEIGHT = 32;
 const DIRTY_CHECK_DEBOUNCE = 300; // ms — only check dirty state, not sync content
@@ -73,11 +74,20 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
   // the replica writes the file. If they may not sync, the text is saved to
   // disk instead and the view goes back to the usual open-edit-save.
   const shared = useSharedDoc(isUntitled ? "" : path, (text) => {
-    void invoke("write_file_content", { path, content: text }).catch(() => {});
+    void invoke("write_file_content", { path, content: text }).catch((e: unknown) =>
+      logEvent({
+        source: "editor",
+        kind: "save",
+        status: "failure",
+        summary: path.split("/").pop() ?? path,
+        payload: { path, error: String(e), sharedThread: true },
+      }),
+    );
   });
   const sharedRef = useRef(shared.binding);
   sharedRef.current = shared.binding;
   const peers = usePeers(shared.binding?.doc.sharedThreadId);
+  const nameOf = usePersonName();
 
   const [renderMode, setRenderMode] = useState<"editor" | "preview">("editor");
   // Bumped when a view is built, so a reveal that arrived before the view
@@ -443,10 +453,10 @@ export function EditorPanel({ tabId, filePath, containerHeight }: EditorPanelPro
     const carets = peers.flatMap((p) =>
       p.cursors
         .filter((c) => c.fileId === binding.doc.fileId)
-        .map((c) => ({ userId: p.userId, cursor: c.head, name: p.userId })),
+        .map((c) => ({ userId: p.userId, cursor: c.head, name: nameOf(p.userId) })),
     );
     view.dispatch({ effects: setRemoteCarets.of(carets) });
-  }, [peers, shared.binding, viewGen]);
+  }, [peers, shared.binding, viewGen, nameOf]);
 
   // Apply a pending reveal ("open at line") once the view exists. Editor tabs
   // stay mounted while hidden, so a reveal on an open tab lands at once; one

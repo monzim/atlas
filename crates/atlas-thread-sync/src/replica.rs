@@ -950,7 +950,11 @@ impl Replica {
     /// replica that may only watch, a file held or outgrown, or an edit that
     /// would make the file look like it holds a secret or grow past 1 MiB.
     /// The editor then writes to disk instead, and the usual rules take over.
-    pub fn apply_editor(&mut self, file_id: u64, update: &[u8]) -> Result<EditorEdit, ReplicaError> {
+    pub fn apply_editor(
+        &mut self,
+        file_id: u64,
+        update: &[u8],
+    ) -> Result<EditorEdit, ReplicaError> {
         let refuse = |why: String, pending: Vec<Vec<u8>>| Ok(EditorEdit::Refused { why, pending });
         {
             let file = self
@@ -961,7 +965,10 @@ impl Replica {
                 return refuse("this replica may only watch".into(), Vec::new());
             }
             if file.kind != FileKind::Text || file.deleted || !self.materialized {
-                return refuse(format!("{} is not syncing keystrokes", file.path), Vec::new());
+                return refuse(
+                    format!("{} is not syncing keystrokes", file.path),
+                    Vec::new(),
+                );
             }
         }
         // A save from another editor goes in first, through the checks every
@@ -978,7 +985,10 @@ impl Replica {
             return refuse(format!("{} is past 1 MB", file.path), pending);
         }
         if secret_reason(&file.path, &content).is_some() {
-            return refuse(format!("{} now looks like it holds a secret", file.path), pending);
+            return refuse(
+                format!("{} now looks like it holds a secret", file.path),
+                pending,
+            );
         }
         file.doc.apply(update)?;
         self.sync_disk(file_id)?;

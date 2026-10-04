@@ -403,21 +403,25 @@ export function sendCursors(
   return invoke<void>("shared_thread_cursors", { sharedThreadId, fileId, cursors, typing });
 }
 
-export function onSharedPresence(
-  apply: (event: { sharedThreadId: string; peers: SharedPeer[] }) => void,
-): Promise<UnlistenFn> {
-  return listen<{ sharedThreadId: string; peers: SharedPeer[] }>(SHARED_PRESENCE_EVENT, (e) =>
-    apply(e.payload),
-  );
+/** `atlas:shared-thread-presence`: who is on one thread now. */
+export interface SharedPresenceEvent {
+  sharedThreadId: string;
+  peers: SharedPeer[];
 }
 
-export function onSharedDocUpdate(
-  apply: (event: { sharedThreadId: string; fileId: number; update: string }) => void,
-): Promise<UnlistenFn> {
-  return listen<{ sharedThreadId: string; fileId: number; update: string }>(
-    SHARED_DOC_UPDATE_EVENT,
-    (e) => apply(e.payload),
-  );
+/** `atlas:shared-doc-update`: a change to a file bound to the editor, base64 Yjs. */
+export interface SharedDocUpdateEvent {
+  sharedThreadId: string;
+  fileId: number;
+  update: string;
+}
+
+export function onSharedPresence(apply: (event: SharedPresenceEvent) => void): Promise<UnlistenFn> {
+  return listen<SharedPresenceEvent>(SHARED_PRESENCE_EVENT, (e) => apply(e.payload));
+}
+
+export function onSharedDocUpdate(apply: (event: SharedDocUpdateEvent) => void): Promise<UnlistenFn> {
+  return listen<SharedDocUpdateEvent>(SHARED_DOC_UPDATE_EVENT, (e) => apply(e.payload));
 }
 
 export function onJoinRequested(

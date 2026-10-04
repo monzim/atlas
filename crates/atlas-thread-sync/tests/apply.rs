@@ -162,6 +162,25 @@ fn uncommitted_edits_refuse_it_and_stash_and_apply_keeps_them() {
         Err(ApplyError::Dirty(files)) => assert_eq!(files, vec!["app.ts".to_string()]),
         other => panic!("expected a refusal, got {other:?}"),
     }
+    // A file the thread holds but left as the Base had it is not in the way.
+    let mut with_unchanged = thread_changes();
+    with_unchanged.retain(|c| c.path != "app.ts");
+    with_unchanged.push(ThreadChange {
+        path: "app.ts".into(),
+        origin: None,
+        content: Some(ten(&[]).into_bytes()),
+    });
+    let applied = apply(&dir, &base, &with_unchanged, None).unwrap();
+    assert!(!applied.files.contains(&"app.ts".to_string()));
+    assert_eq!(read(&dir, "app.ts"), ten(&[(8, "my unsaved 8")]));
+    // Back to before, for the stash below.
+    git(
+        &dir,
+        &["checkout", "--", "util.ts", "logo.png", "gone.ts", "old.ts"],
+    );
+    for extra in ["src/new.ts", "lib/moved.ts"] {
+        fs::remove_file(dir.join(extra)).unwrap();
+    }
     // Nothing was written.
     assert_eq!(read(&dir, "app.ts"), ten(&[(8, "my unsaved 8")]));
     assert!(!dir.join("src/new.ts").exists());
@@ -284,7 +303,7 @@ async fn a_participant_applies_the_thread_and_open_conflicts_block_it() {
         file_id: 1,
         path: "src/banner.css".into(),
         run_id: "run-00000001".into(),
-        status: "open".into(),
+        status: atlas_thread_sync::wire::ConflictStatus::Open,
         lines: None,
         binary: false,
         base: None,

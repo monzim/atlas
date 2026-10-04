@@ -111,10 +111,21 @@ pub fn apply(
         return Err(ApplyError::BaseMissing(base.to_string()));
     }
     let head = git::head_commit(checkout)?;
-    let changes: Vec<&ThreadChange> = changes
-        .iter()
-        .filter(|c| path::is_valid(&c.path) && c.origin.as_deref().is_none_or(path::is_valid))
-        .collect();
+    // Only what the thread changed since the Base: a file it holds unchanged
+    // (touched, then put back) is nothing to apply — and an edit of the
+    // person's to it is nothing in the way.
+    let mut kept = Vec::new();
+    for c in changes {
+        if !path::is_valid(&c.path) || !c.origin.as_deref().is_none_or(path::is_valid) {
+            continue;
+        }
+        let moved = c.origin.as_deref().is_some_and(|o| o != c.path);
+        if !moved && c.content == git::blob_at(checkout, base, &c.path)? {
+            continue;
+        }
+        kept.push(c);
+    }
+    let changes = kept;
 
     // Every path Apply may write: where files are now, and where moved ones were.
     let mut touched: Vec<String> = changes

@@ -1154,7 +1154,7 @@ impl<T: Transport> ThreadSession<T> {
         let mut report = RunReport::default();
         // Binary results the merge carries: (file id, path, blob, bytes) to
         // land whole, and whole-file Conflicts.
-        let mut landing: Vec<(Option<u64>, String, String, Vec<u8>)> = Vec::new();
+        let mut landing: Vec<Landing> = Vec::new();
         for _ in 0..MERGE_ATTEMPTS {
             // Plan on the newest state the socket has delivered: what already
             // arrived is handled first, so an overlap with it is found before
@@ -1221,7 +1221,14 @@ impl<T: Transport> ThreadSession<T> {
                     Some(_) => change.file_id.is_some() && canonical_now == forked,
                 };
                 if unchanged {
-                    landing.push((file_id, change.path.clone(), sha, bytes));
+                    landing.push(Landing {
+                        file_id,
+                        path: change.path.clone(),
+                        sha,
+                        bytes,
+                        seen: now,
+                        forked,
+                    });
                 } else {
                     let id = file_id.expect("a changed binary is in the thread");
                     held_binaries.push((
@@ -1267,8 +1274,10 @@ impl<T: Transport> ThreadSession<T> {
                         .is_some_and(|u| u.len() > wire::MAX_PAYLOAD_BYTES)
                 })
             {
-                // Splitting a merge across submits is not this slice's.
-                self.end_run(&run.run_id, RunOutcome::Completed).await?;
+                // Splitting a merge across submits is not this slice's. Nothing
+                // merged, so the Run did not complete: it was interrupted, and
+                // its result stays in the worktree.
+                self.end_run(&run.run_id, RunOutcome::Interrupted).await?;
                 return Err(SessionError::Refused {
                     code: "payload_too_large".into(),
                     message: format!(
@@ -1401,17 +1410,43 @@ impl<T: Transport> ThreadSession<T> {
                     report.unuploaded.push(path.clone());
                 }
             }
-            // Binary results nobody else touched land whole, last writer wins.
-            for (file_id, path, sha, bytes) in std::mem::take(&mut landing) {
-                let file_id = match file_id {
-                    Some(id) => id,
-                    None => self.ensure_file(&path, true, FileKind::Binary).await?,
+            // Binary results nobody else touched land whole. `blob.set` has
+            // no compare-and-set, so each is checked again against what has
+            // arrived since the plan: a file another Run or person changed
+            // meanwhile becomes a whole-file Conflict instead of being
+            // overwritten.
+            for l in std::mem::take(&mut landing) {
+                self.drain_ready().await?;
+                let current = l.file_id.or_else(|| self.replica.file_id(&l.path));
+                let moved = match (l.file_id, current) {
+                    (None, Some(_)) => true,
+                    (Some(id), _) => self.replica.blob(id).map(str::to_string) != l.seen,
+                    (None, None) => false,
                 };
-                self.set_blob(file_id, &sha, bytes.clone()).await?;
-                if self.replica.is_materialized() {
-                    self.replica.write_blob(file_id, &bytes)?;
+                if moved {
+                    let id = current.expect("moved means it is in the thread");
+                    let canonical = self
+                        .replica
+                        .blob(id)
+                        .map(str::to_string)
+                        .or(l.forked.clone());
+                    if canonical.as_deref() != Some(l.sha.as_str()) {
+                        let raised = self
+                            .hold_binary(run, id, l.forked, canonical, l.sha, l.bytes)
+                            .await?;
+                        report.conflicts.extend(raised);
+                    }
+                    continue;
                 }
-                report.files.push(path);
+                let file_id = match current {
+                    Some(id) => id,
+                    None => self.ensure_file(&l.path, true, FileKind::Binary).await?,
+                };
+                self.set_blob(file_id, &l.sha, l.bytes.clone()).await?;
+                if self.replica.is_materialized() {
+                    self.replica.write_blob(file_id, &l.bytes)?;
+                }
+                report.files.push(l.path);
             }
             if let Some(view) = self.runs.get_mut(&run.run_id) {
                 view.files.clone_from(&report.files);
@@ -1419,7 +1454,53 @@ impl<T: Transport> ThreadSession<T> {
             self.end_run(&run.run_id, RunOutcome::Completed).await?;
             return Ok(report);
         }
-        self.end_run(&run.run_id, RunOutcome::Completed).await?;
+        // Starved: nothing merged; not a completed Run.
+        self.end_run(&run.run_id, RunOutcome::Interrupted).await?;
+        Err(SessionError::MergeStarved(MERGE_ATTEMPTS))
+    }
+
+    /// Raise a whole-file Conflict for a Run's binary result on its own:
+    /// the Run's blob uploaded so anyone can take it, then a merge carrying
+    /// only that held hunk, through the usual compare-and-set.
+    async fn hold_binary(
+        &mut self,
+        run: &ActiveRun,
+        file_id: u64,
+        base: Option<String>,
+        canonical: Option<String>,
+        sha: String,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u64>, SessionError> {
+        self.store.put_blob(sha.clone(), bytes).await?;
+        for _ in 0..MERGE_ATTEMPTS {
+            let client_seq = self.take_client_seq();
+            let submit = ClientControl::MergeSubmit {
+                client_seq,
+                run_id: run.run_id.clone(),
+                files: Vec::new(),
+                conflicts: vec![ConflictHunk {
+                    file_id,
+                    base_version: self.merge_version(file_id),
+                    binary: true,
+                    lines: None,
+                    base: base.clone(),
+                    canonical: canonical.clone(),
+                    run: Some(sha.clone()),
+                }],
+            };
+            match self.ask(client_seq, &submit).await? {
+                Answer::Accepted { conflicts, .. } => return Ok(conflicts),
+                Answer::Rejected { versions } => {
+                    for v in versions {
+                        self.versions.insert(v.file_id, v.version);
+                    }
+                }
+                Answer::Nack { code, message } => {
+                    return Err(SessionError::Refused { code, message })
+                }
+                other => return Err(unexpected(&other)),
+            }
+        }
         Err(SessionError::MergeStarved(MERGE_ATTEMPTS))
     }
 
@@ -1436,7 +1517,7 @@ impl<T: Transport> ThreadSession<T> {
             .collect();
         views.sort_by_key(|v| {
             (
-                v.conflict.status != "open",
+                !v.conflict.is_open(),
                 std::cmp::Reverse(v.conflict.conflict_id),
             )
         });
@@ -1445,10 +1526,7 @@ impl<T: Transport> ThreadSession<T> {
 
     /// Open Conflicts: what blocks Apply (ATL-408).
     pub fn open_conflicts(&self) -> usize {
-        self.conflicts
-            .values()
-            .filter(|c| c.status == "open")
-            .count()
+        self.conflicts.values().filter(|c| c.is_open()).count()
     }
 
     /// Conflicts read over REST (`GET …/conflicts?status=open`) when the app
@@ -1505,7 +1583,7 @@ impl<T: Transport> ThreadSession<T> {
             let conflict = self
                 .conflicts
                 .get(&conflict_id)
-                .filter(|c| c.status == "open")
+                .filter(|c| c.is_open())
                 .cloned()
                 .ok_or_else(|| SessionError::Refused {
                     code: "conflict_unknown".into(),
@@ -1553,7 +1631,7 @@ impl<T: Transport> ThreadSession<T> {
                         .insert(file_version.file_id, file_version.version);
                     self.head = self.head.max(version);
                     if let Some(c) = self.conflicts.get_mut(&conflict_id) {
-                        c.status = "resolved".into();
+                        c.status = wire::ConflictStatus::Resolved;
                     }
                     return Ok(version);
                 }
@@ -1894,7 +1972,17 @@ impl<T: Transport> ThreadSession<T> {
             });
         }
         let message = "atlas: your edits, set aside to apply a Shared Thread";
-        match applying::apply(checkout, &base, &changes, stash.then_some(message)) {
+        // git and the file system: off the async runtime (ARCHITECTURE.md).
+        let target = checkout.to_path_buf();
+        let applied = tokio::task::spawn_blocking(move || {
+            applying::apply(&target, &base, &changes, stash.then_some(message))
+        })
+        .await
+        .map_err(|e| SessionError::Refused {
+            code: "apply_failed".into(),
+            message: e.to_string(),
+        })?;
+        match applied {
             Ok(applied) => Ok(ApplyOutcome::Applied(applied)),
             Err(ApplyError::Dirty(files)) => Ok(ApplyOutcome::Dirty { files }),
             Err(e) => Err(e.into()),
@@ -2643,7 +2731,7 @@ impl<T: Transport> ThreadSession<T> {
                             let drop = self
                                 .conflicts
                                 .iter()
-                                .find(|(_, c)| c.status != "open")
+                                .find(|(_, c)| !c.is_open())
                                 .or_else(|| self.conflicts.iter().next())
                                 .map(|(id, _)| *id);
                             match drop {
@@ -2822,6 +2910,19 @@ const MAX_CONFLICTS_PER_MERGE: usize = 100;
 
 /// Conflicts a session remembers.
 const CONFLICTS_KEPT: usize = 500;
+
+/// A Run's binary result planned to land whole (ATL-410), and what the
+/// thread held for it when the plan was made — checked again before it lands.
+struct Landing {
+    file_id: Option<u64>,
+    path: String,
+    sha: String,
+    bytes: Vec<u8>,
+    /// The file's canonical blob at the plan.
+    seen: Option<String>,
+    /// Its content at the Run's fork.
+    forked: Option<String>,
+}
 
 /// How somebody resolves a Conflict (ATL-410).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -63,6 +63,9 @@ pub const SHARED_RUN_FRAME_EVENT: &str = "atlas:shared-run-frame";
 /// The window event channel for join requests, heard by the owner (ATL-406).
 pub const SHARED_JOIN_REQUEST_EVENT: &str = "atlas:shared-thread-join-requested";
 
+/// How Yjs updates travel to and from the renderer.
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
 /// Pushed whenever who is here, or what they are doing, changes (ATL-407).
 pub const SHARED_PRESENCE_EVENT: &str = "atlas:shared-thread-presence";
 
@@ -945,7 +948,7 @@ async fn start(
                             DocUpdateEvent {
                                 shared_thread_id: shared_thread_id.clone(),
                                 file_id,
-                                update: base64::engine::general_purpose::STANDARD.encode(update),
+                                update: B64.encode(update),
                             },
                         );
                     }
@@ -1019,34 +1022,54 @@ pub async fn shared_thread_resolve_conflict(
     app: AppHandle,
     shared_thread_id: String,
     conflict_id: u64,
-    side: String,
+    side: ResolveSide,
     text: Option<String>,
 ) -> Result<u64> {
-    let choice = match (side.as_str(), text) {
-        ("canonical", _) => Resolve::Canonical,
-        ("run", _) => Resolve::Run,
-        ("both", _) => Resolve::Both,
-        ("edited", Some(text)) => Resolve::Edited(text),
-        _ => {
+    let choice = match (side, text) {
+        (ResolveSide::Canonical, _) => Resolve::Canonical,
+        (ResolveSide::Run, _) => Resolve::Run,
+        (ResolveSide::Both, _) => Resolve::Both,
+        (ResolveSide::Edited, Some(text)) => Resolve::Edited(text),
+        (ResolveSide::Edited, None) => {
             return Err(SharedThreadError::new(
                 "bad_request",
-                "Resolve with canonical, run, both, or edited text.",
+                "An edited resolution needs its text.",
             ))
         }
     };
-    let commands = commands_for(&app, &shared_thread_id)?;
-    let (reply, answer) = oneshot::channel();
-    commands
-        .send(SyncCommand::ResolveConflict {
+    ask_thread(&app, &shared_thread_id, |reply| {
+        SyncCommand::ResolveConflict {
             conflict_id,
             choice,
             reply,
-        })
-        .map_err(|_| disconnected())?;
-    answer
-        .await
-        .map_err(|_| disconnected())?
-        .map_err(|e| SharedThreadError::new("resolve_failed", e))
+        }
+    })
+    .await?
+    .map_err(|e| SharedThreadError::new("resolve_failed", e))
+}
+
+/// The ways a person resolves a Conflict from the panel; an agent's goes
+/// through a Run (`shared_thread_ask_agent_to_resolve`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolveSide {
+    Canonical,
+    Run,
+    Both,
+    Edited,
+}
+
+/// Ask a joined thread's loop something and wait for the answer: the reply
+/// channel, the send and the "connection closed" refusal in one place.
+async fn ask_thread<T>(
+    app: &AppHandle,
+    shared_thread_id: &str,
+    command: impl FnOnce(oneshot::Sender<T>) -> SyncCommand,
+) -> Result<T> {
+    let commands = commands_for(app, shared_thread_id)?;
+    let (reply, answer) = oneshot::channel();
+    commands.send(command(reply)).map_err(|_| disconnected())?;
+    answer.await.map_err(|_| disconnected())
 }
 
 /// Apply the thread's changes since the Base to the person's own checkout as
@@ -1067,19 +1090,13 @@ pub async fn shared_thread_apply(
             "Apply writes into your own checkout of the project, and this machine joined without one. Open the project, then join from it.",
         ));
     };
-    let commands = commands_for(&app, &shared_thread_id)?;
-    let (reply, answer) = oneshot::channel();
-    commands
-        .send(SyncCommand::Apply {
-            checkout: PathBuf::from(checkout),
-            stash,
-            reply,
-        })
-        .map_err(|_| disconnected())?;
-    answer
-        .await
-        .map_err(|_| disconnected())?
-        .map_err(|e| SharedThreadError::new("apply_failed", e))
+    ask_thread(&app, &shared_thread_id, |reply| SyncCommand::Apply {
+        checkout: PathBuf::from(checkout),
+        stash,
+        reply,
+    })
+    .await?
+    .map_err(|e| SharedThreadError::new("apply_failed", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,7 +1145,7 @@ pub async fn shared_thread_doc_open(app: AppHandle, path: String) -> Result<Opti
         .map(|doc| SharedDoc {
             shared_thread_id,
             file_id: doc.file_id,
-            state: base64::engine::general_purpose::STANDARD.encode(doc.state),
+            state: B64.encode(doc.state),
         }))
 }
 
@@ -1155,22 +1172,16 @@ pub async fn shared_thread_doc_update(
     file_id: u64,
     update: String,
 ) -> Result<()> {
-    let update = base64::engine::general_purpose::STANDARD
+    let update = B64
         .decode(update)
         .map_err(|_| SharedThreadError::new("bad_request", "the update is not base64"))?;
-    let commands = commands_for(&app, &shared_thread_id)?;
-    let (reply, answer) = oneshot::channel();
-    commands
-        .send(SyncCommand::EditorUpdate {
-            file_id,
-            update,
-            reply,
-        })
-        .map_err(|_| disconnected())?;
-    answer
-        .await
-        .map_err(|_| disconnected())?
-        .map_err(|e| SharedThreadError::new("not_syncing", e))
+    ask_thread(&app, &shared_thread_id, |reply| SyncCommand::EditorUpdate {
+        file_id,
+        update,
+        reply,
+    })
+    .await?
+    .map_err(|e| SharedThreadError::new("not_syncing", e))
 }
 
 /// The person's selections in a file of the Atlas editor, as `[anchor, head]`
@@ -1222,7 +1233,7 @@ pub async fn shared_thread_ask_agent_to_resolve(
                     .borrow()
                     .conflicts
                     .iter()
-                    .find(|c| c.conflict.conflict_id == conflict_id && c.conflict.status == "open")
+                    .find(|c| c.conflict.conflict_id == conflict_id && c.conflict.is_open())
                     .cloned()
             })
             .ok_or_else(|| {
