@@ -43,8 +43,9 @@ use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
-    Command as SyncCommand, Connector, ObjectStore, Replica, Resolve, RunReport, RunSpec,
-    SharePreview, SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
+    ApplyOutcome, Command as SyncCommand, Connector, ObjectStore, Replica, Resolve, RunReport,
+    RunSpec, SharePreview, SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError,
+    WsTransport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1005,6 +1006,39 @@ pub async fn shared_thread_resolve_conflict(
         .map_err(|e| SharedThreadError::new("resolve_failed", e))
 }
 
+/// Apply the thread's changes since the Base to the person's own checkout as
+/// uncommitted changes (ATL-408). `stash` sets aside their uncommitted edits
+/// to the same files first; without it those edits refuse the Apply, with
+/// the files named. Open Conflicts refuse it too. Atlas commits nothing and
+/// never touches a remote; the thread stays open.
+#[tauri::command]
+pub async fn shared_thread_apply(
+    app: AppHandle,
+    shared_thread_id: String,
+    stash: bool,
+) -> Result<ApplyOutcome> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let Some(checkout) = entry.project_path.clone() else {
+        return Err(SharedThreadError::new(
+            "no_checkout",
+            "Apply writes into your own checkout of the project, and this machine joined without one. Open the project, then join from it.",
+        ));
+    };
+    let commands = commands_for(&app, &shared_thread_id)?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::Apply {
+            checkout: PathBuf::from(checkout),
+            stash,
+            reply,
+        })
+        .map_err(|_| disconnected())?;
+    answer
+        .await
+        .map_err(|_| disconnected())?
+        .map_err(|e| SharedThreadError::new("apply_failed", e))
+}
+
 /// Where and what to ask an agent so it resolves a Conflict.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1072,7 +1106,10 @@ fn resolve_prompt(view: &atlas_thread_sync::ConflictView) -> String {
     let c = &view.conflict;
     let line = c.lines.map_or(1, |l| l.start + 1);
     let path = plain(&c.path);
-    let who = view.run_by.as_deref().map_or_else(|| "a teammate".to_string(), plain);
+    let who = view
+        .run_by
+        .as_deref()
+        .map_or_else(|| "a teammate".to_string(), plain);
     let agent = view
         .run_agent
         .as_deref()
@@ -1096,11 +1133,7 @@ fn resolve_prompt(view: &atlas_thread_sync::ConflictView) -> String {
 
 /// `text` in a fence no backtick run inside it can close.
 fn quoted(text: &str) -> String {
-    let longest = text
-        .split(|ch| ch != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     let body = if text.ends_with('\n') || text.is_empty() {
         text.to_string()

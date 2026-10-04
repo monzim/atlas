@@ -351,3 +351,112 @@ pub fn ignored(
     }
     Ok(out)
 }
+
+/// `rel` as a pathspec git takes literally: no globbing, no magic.
+fn literal(rel: &str) -> String {
+    format!(":(literal){rel}")
+}
+
+/// Which of `paths` differ from `HEAD` in the working tree or the index —
+/// modified, staged, deleted or untracked (ignored ones excluded).
+pub fn dirty_among(repo: &Path, paths: &[String]) -> Result<Vec<String>, GitError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let specs: Vec<String> = paths.iter().map(|p| literal(p)).collect();
+    let mut args = vec![
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+    ];
+    args.extend(specs.iter().map(String::as_str));
+    let out = run(repo, &args)?;
+    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut dirty = Vec::new();
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        if field[0] == b'R' || field[0] == b'C' {
+            fields.next();
+        }
+        dirty.push(String::from_utf8_lossy(&field[3..]).into_owned());
+    }
+    dirty.sort();
+    dirty.dedup();
+    Ok(dirty)
+}
+
+/// Stash the person's uncommitted work on `paths` — and only there — under
+/// `message`, untracked files included. `git stash pop` brings it back.
+pub fn stash_paths(repo: &Path, paths: &[String], message: &str) -> Result<(), GitError> {
+    let specs: Vec<String> = paths.iter().map(|p| literal(p)).collect();
+    let mut args = vec![
+        "stash",
+        "push",
+        "--include-untracked",
+        "--message",
+        message,
+        "--",
+    ];
+    args.extend(specs.iter().map(String::as_str));
+    run(repo, &args).map(|_| ())
+}
+
+/// A three-way merge of one file's contents, as `git merge-file` does it:
+/// the result, and whether it holds conflict markers (labelled with
+/// `labels` — ours, base, theirs).
+pub fn merge_file(
+    repo: &Path,
+    ours: &[u8],
+    base: &[u8],
+    theirs: &[u8],
+    labels: [&str; 3],
+) -> Result<(Vec<u8>, bool), GitError> {
+    // Three scratch files, removed however this returns.
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Scratch(
+        std::env::temp_dir().join(format!("atlas-merge-{}", uuid::Uuid::new_v4().simple())),
+    );
+    std::fs::create_dir_all(&dir.0)?;
+    let files = [("ours", ours), ("base", base), ("theirs", theirs)];
+    let mut paths = Vec::with_capacity(3);
+    for (name, bytes) in files {
+        let path = dir.0.join(name);
+        std::fs::write(&path, bytes)?;
+        paths.push(path.to_string_lossy().into_owned());
+    }
+    let output = atlas_process::command("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "merge-file",
+            "-p",
+            "-L",
+            labels[0],
+            "-L",
+            labels[1],
+            "-L",
+            labels[2],
+            "--",
+        ])
+        .args(&paths)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    // The exit status is the number of conflicts; negative is an error.
+    match output.status.code() {
+        Some(0) => Ok((output.stdout, false)),
+        Some(n) if (1..=127).contains(&n) => Ok((output.stdout, true)),
+        _ => Err(GitError::Failed {
+            args: "merge-file".into(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        }),
+    }
+}

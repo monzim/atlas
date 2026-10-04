@@ -310,6 +310,33 @@ export function askAgentToResolve(sharedThreadId: string, conflictId: number) {
   });
 }
 
+/** What Apply did to the person's checkout (ATL-408). */
+export interface Applied {
+  /** Written, created or deleted cleanly. */
+  files: string[];
+  /** Left with conflict markers, or kept as the checkout had them. */
+  conflicted: string[];
+  /** For a binary conflict: where the thread's version was put beside yours. */
+  beside: string[];
+  /** The stash the person's own edits went into, when they asked for it. */
+  stashed: string | null;
+}
+
+/** Apply's answer: done, or refused with what to do about it. */
+export type ApplyOutcome =
+  | ({ outcome: "applied" } & Applied)
+  | { outcome: "dirty"; files: string[] }
+  | { outcome: "conflictsOpen"; count: number };
+
+/**
+ * Write the thread's changes since its Base into this person's checkout as
+ * uncommitted changes. `stash` sets aside their own uncommitted edits to the
+ * same files first. Never commits, pushes or closes the thread.
+ */
+export function applyThread(sharedThreadId: string, stash = false) {
+  return invoke<ApplyOutcome>("shared_thread_apply", { sharedThreadId, stash });
+}
+
 export function onJoinRequested(
   apply: (request: { sharedThreadId: string; userId: string }) => void,
 ): Promise<UnlistenFn> {

@@ -169,6 +169,20 @@ pub enum LocalChange {
     Buffered,
 }
 
+/// One file of the thread, for Apply.
+#[derive(Debug, Clone)]
+pub struct ThreadFile {
+    pub path: String,
+    /// The path it entered the thread under.
+    pub origin: String,
+    pub deleted: bool,
+    pub kind: FileKind,
+    /// A live text file's content.
+    pub text: Option<String>,
+    /// A binary file's blob; `None` while it holds its Base content.
+    pub blob: Option<String>,
+}
+
 /// One tracked file as a Run forked it.
 #[derive(Debug, Clone)]
 pub struct ForkFile {
@@ -566,6 +580,26 @@ impl Replica {
         out
     }
 
+    /// Every file the thread holds — deleted ones too — as Apply needs it
+    /// (ATL-408). A deleted file whose path a live one holds again is left
+    /// out: the live one speaks for that path.
+    pub fn thread_files(&self) -> Vec<ThreadFile> {
+        self.files
+            .iter()
+            .filter(|(id, f)| {
+                !f.deleted || self.by_path.get(&f.path).is_none_or(|live| live == *id)
+            })
+            .map(|(_, f)| ThreadFile {
+                path: f.path.clone(),
+                origin: f.origin.clone(),
+                deleted: f.deleted,
+                kind: f.kind,
+                text: (f.kind == FileKind::Text && !f.deleted).then(|| f.doc.content()),
+                blob: f.blob.clone(),
+            })
+            .collect()
+    }
+
     /// A file's canonical text as this replica holds it.
     pub fn text(&self, path: &str) -> Option<String> {
         let id = self.by_path.get(path)?;
@@ -885,11 +919,7 @@ impl Replica {
     /// Make a file's document hold `content` (the sharer's working copy, read
     /// from their own checkout) and answer the update. The replica's disk is
     /// brought along when it exists.
-    pub fn set_text(
-        &mut self,
-        file_id: u64,
-        content: &str,
-    ) -> Result<Vec<Vec<u8>>, ReplicaError> {
+    pub fn set_text(&mut self, file_id: u64, content: &str) -> Result<Vec<Vec<u8>>, ReplicaError> {
         let file = self
             .files
             .get(&file_id)

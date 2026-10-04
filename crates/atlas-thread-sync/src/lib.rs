@@ -22,6 +22,7 @@
 //! * [`store`] — the thread's blob, bundle and snapshot doors;
 //! * [`run`] — the loop an app spawns per joined thread.
 
+pub mod apply;
 pub mod bootstrap;
 pub mod doc;
 pub mod git;
@@ -43,6 +44,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
+pub use apply::{Applied, ApplyOutcome};
 pub use bootstrap::ThreadRepo;
 pub use replica::{LocalChange, Replica, ReplicaError};
 pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
@@ -95,6 +97,12 @@ pub enum Command {
     },
     /// Conflicts read over REST when the thread was opened.
     SeedConflicts(Vec<wire::ThreadConflict>),
+    /// Write the thread's changes into the person's checkout (ATL-408).
+    Apply {
+        checkout: PathBuf,
+        stash: bool,
+        reply: oneshot::Sender<Result<ApplyOutcome, String>>,
+    },
     /// The Run will not finish: mark it interrupted.
     InterruptRun { run_id: String },
     /// Whether to send this repository's history to teammates who lack the
@@ -403,6 +411,20 @@ pub async fn run_with<C: Connector>(
             })) => {
                 let result = session.resolve_conflict(conflict_id, choice).await;
                 let _ = reply.send(result.as_ref().map(|v| *v).map_err(ToString::to_string));
+                result.map(|_| ())
+            }
+            Event::Command(Some(Command::Apply {
+                checkout,
+                stash,
+                reply,
+            })) => {
+                let result = session.apply_to(&checkout, stash).await;
+                let _ = reply.send(
+                    result
+                        .as_ref()
+                        .map(Clone::clone)
+                        .map_err(ToString::to_string),
+                );
                 result.map(|_| ())
             }
             Event::Command(Some(Command::SeedConflicts(conflicts))) => {

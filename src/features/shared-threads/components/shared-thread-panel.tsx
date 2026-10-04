@@ -39,6 +39,7 @@ import {
   type SharedThreadView,
 } from "../lib/shared-threads-api";
 import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
+import { ApplyPanel } from "./apply-panel";
 import { ConflictList, conflictPlace, type ConflictAction } from "./conflict-view";
 import { OwnerPanel } from "./owner-panel";
 import { SharePreviewList, uploads } from "./share-preview";
@@ -499,6 +500,13 @@ function ThreadCard({
       )}
 
       <ConflictList conflicts={status.conflicts ?? []} mayEdit={mayRun} onResolve={resolve} />
+      {!compact && (
+        <ApplyPanel
+          sharedThreadId={thread.sharedThreadId}
+          hasCheckout={thread.projectPath !== null}
+          openConflicts={(status.conflicts ?? []).filter((c) => c.status === "open").length}
+        />
+      )}
 
       {status.runs.length > 0 && <RunList threadId={thread.sharedThreadId} runs={status.runs} />}
 

@@ -13,6 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::sync::mpsc;
 
+use crate::apply::{self as applying, ApplyError, ApplyOutcome, ThreadChange};
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::git;
 use crate::merge::{self, MergeError};
@@ -53,6 +54,8 @@ pub enum SessionError {
     /// This replica may only watch, and why — said to the person as is.
     #[error("{0}")]
     ReadOnly(String),
+    #[error(transparent)]
+    Apply(#[from] ApplyError),
 }
 
 /// How joining went for a machine without the Base (ATL-402).
@@ -1565,6 +1568,56 @@ impl<T: Transport> ThreadSession<T> {
         }
         // The content hash is the blob's own.
         Ok((crate::doc::FileDoc::empty_update(), Vec::new(), sha))
+    }
+
+    // -----------------------------------------------------------------------
+    // Apply (ATL-408)
+    // -----------------------------------------------------------------------
+
+    /// Write the thread's changes since the Base into `checkout` — the
+    /// person's own repository — as uncommitted changes, three-way onto
+    /// whatever commit it is at. Refused while Conflicts are open, and when
+    /// uncommitted edits touch the same files unless `stash` says to stash
+    /// those first. Never commits, never touches a remote, never closes the
+    /// thread; any participant may Apply any number of times.
+    pub async fn apply_to(
+        &mut self,
+        checkout: &Path,
+        stash: bool,
+    ) -> Result<ApplyOutcome, SessionError> {
+        self.drain_ready().await?;
+        let open = self.open_conflicts();
+        if open > 0 {
+            return Ok(ApplyOutcome::ConflictsOpen { count: open });
+        }
+        let base = self.replica.base().to_string();
+        let mut changes = Vec::new();
+        for f in self.replica.thread_files() {
+            let origin = (f.origin != f.path).then(|| f.origin.clone());
+            let content = if f.deleted {
+                None
+            } else if let Some(text) = f.text {
+                Some(text.into_bytes())
+            } else {
+                match f.blob {
+                    Some(sha) => Some(self.store.get_blob(sha).await?),
+                    // Still its Base content: only a move changes anything.
+                    None if origin.is_none() => continue,
+                    None => git::blob_at(checkout, &base, &f.origin).map_err(ApplyError::from)?,
+                }
+            };
+            changes.push(ThreadChange {
+                path: f.path,
+                origin,
+                content,
+            });
+        }
+        let message = "atlas: your edits, set aside to apply a Shared Thread";
+        match applying::apply(checkout, &base, &changes, stash.then_some(message)) {
+            Ok(applied) => Ok(ApplyOutcome::Applied(applied)),
+            Err(ApplyError::Dirty(files)) => Ok(ApplyOutcome::Dirty { files }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Resolve a Conflict with what an agent wrote in a Run of its own: the
