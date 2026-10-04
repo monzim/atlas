@@ -3,6 +3,7 @@ import {
   Bot,
   Check,
   Copy,
+  CornerDownRight,
   Eye,
   FolderOpen,
   Info,
@@ -23,6 +24,7 @@ import { pluginIdForAgent, type AgentType } from "@/types/agent";
 
 import {
   askAgentToResolve,
+  continueFrom,
   joinThread,
   leaveThread,
   openThread,
@@ -342,6 +344,31 @@ function ThreadCard({
   const nameOf = usePersonName();
 
   /**
+   * Continue from here (ATL-411): an agent chat in the thread's Run worktree
+   * whose next prompt starts with the thread's context up to `run` — its
+   * files still as canonical state has them now.
+   */
+  async function continueFromRun(run: SharedThreadRun) {
+    setStarting(true);
+    setError(null);
+    try {
+      const cwd = await continueFrom(thread.sharedThreadId, run.runNo);
+      const agent = await ensureAgent(pluginIdForAgent(agentType));
+      const { key } = await agents.newSession(agent.agent_id, cwd);
+      await openAgentSession({
+        acpSessionId: key.session_id,
+        title: `${thread.title} · From Run #${run.runNo}`,
+        cwd,
+        agentType,
+      });
+    } catch (e) {
+      setError(sharedThreadError(e));
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  /**
    * Resolve a Conflict (ATL-410). Asking an agent is itself a Run: an agent
    * chat opens in the thread's Run worktree with the hunk's three versions,
    * and what it leaves in those lines becomes the resolution.
@@ -511,7 +538,13 @@ function ThreadCard({
         />
       )}
 
-      {status.runs.length > 0 && <RunList threadId={thread.sharedThreadId} runs={status.runs} />}
+      {status.runs.length > 0 && (
+        <RunList
+          threadId={thread.sharedThreadId}
+          runs={status.runs}
+          onContinue={mayRun && !starting ? (run) => void continueFromRun(run) : undefined}
+        />
+      )}
 
       <div className="flex flex-wrap gap-1.5">
         {mayRun && (
@@ -573,8 +606,19 @@ const RUN_STATUS: Record<
   declined: { label: "Declined", variant: "outline" },
 };
 
-/** The thread's recent Runs as chips: who prompted, who ran, agent, model and files changed. */
-function RunList({ threadId, runs }: { threadId: string; runs: SharedThreadRun[] }) {
+/**
+ * The thread's recent Runs as chips: who prompted, who ran, agent, model and
+ * files changed — and, for a participant, "Continue from here" on a finished one.
+ */
+function RunList({
+  threadId,
+  runs,
+  onContinue,
+}: {
+  threadId: string;
+  runs: SharedThreadRun[];
+  onContinue?: (run: SharedThreadRun) => void;
+}) {
   const live = useSharedThreadsStore.use.live();
   return (
     <section className="flex flex-col gap-1.5">
@@ -621,6 +665,18 @@ function RunList({ threadId, runs }: { threadId: string; runs: SharedThreadRun[]
               <p className="line-clamp-3 whitespace-pre-wrap text-[var(--secondary-foreground)]">
                 {tail}
               </p>
+            )}
+            {onContinue && run.status !== "running" && run.status !== "declined" && (
+              <Button
+                size="xs"
+                variant="ghost"
+                className="self-start"
+                title="Start an agent with this thread's context up to this Run; files stay as they are now"
+                onClick={() => onContinue(run)}
+              >
+                <CornerDownRight size={11} />
+                Continue from here
+              </Button>
             )}
           </div>
         );

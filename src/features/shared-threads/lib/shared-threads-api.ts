@@ -347,6 +347,16 @@ export function askAgentToResolve(sharedThreadId: string, conflictId: number) {
   });
 }
 
+/**
+ * "Continue from here" (ATL-411): the thread's next Run starts with its
+ * context up to Run `runNo` — that Run's prompt, answer and files and
+ * everything before — while its files still fork from canonical state now.
+ * Answers the Run worktree to prompt in.
+ */
+export function continueFrom(sharedThreadId: string, runNo: number) {
+  return invoke<string>("shared_thread_continue_from", { sharedThreadId, runNo });
+}
+
 /** What Apply did to the person's checkout (ATL-408). */
 export interface Applied {
   /** Written, created or deleted cleanly. */

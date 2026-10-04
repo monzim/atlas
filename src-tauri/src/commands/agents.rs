@@ -1631,15 +1631,22 @@ pub async fn agents_send(
 
     // A session working in a Shared Thread's Run worktree: this prompt is a
     // Run (ATL-405). Forked and announced before the agent sees it.
-    super::shared_threads::begin_run(
+    let digest = super::shared_threads::begin_run(
         &app,
         &key.agent_id,
         &key.session_id,
         &cwd,
         &plugin_id,
         current_model.as_deref(),
+        &text,
     )
     .await?;
+    // The thread's context digest goes in front of the prompt (ATL-411);
+    // capture and the transcript above recorded the person's own words.
+    let text = match digest {
+        Some(digest) => format!("{digest}{text}"),
+        None => text,
+    };
     host.send(
         &key,
         prompt::with_resource_links(prompt::compose(text, images), links),

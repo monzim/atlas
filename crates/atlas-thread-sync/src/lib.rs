@@ -24,6 +24,7 @@
 
 pub mod apply;
 pub mod bootstrap;
+pub mod digest;
 pub mod doc;
 pub mod git;
 pub mod merge;
@@ -46,6 +47,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use apply::{Applied, ApplyOutcome};
 pub use bootstrap::ThreadRepo;
+pub use digest::{DigestComment, DigestInput, DigestScope};
 pub use replica::{LocalChange, Replica, ReplicaError};
 pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
@@ -64,6 +66,14 @@ pub use wire::SyncState;
 
 /// What the app can ask a running thread to do.
 pub enum Command {
+    /// What a Run's context digest is built from (ATL-411): the Runs in
+    /// `scope` with what this replica heard them say, the changed files and
+    /// the open Conflicts, under the thread's `goal`.
+    Digest {
+        goal: String,
+        scope: DigestScope,
+        reply: oneshot::Sender<DigestInput>,
+    },
     /// Check the replica out (first file open or prompt) and start watching it.
     Materialize(oneshot::Sender<Result<PathBuf, String>>),
     /// Make sure the Run worktree at `worktree` exists and holds canonical
@@ -494,6 +504,10 @@ pub async fn run_with<C: Connector>(
             })) => {
                 session.set_cursors(file_id, cursors);
                 session.set_typing(typing.then_some(file_id));
+                Ok(())
+            }
+            Event::Command(Some(Command::Digest { goal, scope, reply })) => {
+                let _ = reply.send(session.digest_input(&goal, scope));
                 Ok(())
             }
             Event::Command(Some(Command::RunFile { run_id, path })) => {

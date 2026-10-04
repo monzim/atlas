@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 
 use crate::apply::{self as applying, ApplyError, ApplyOutcome, ThreadChange};
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
+use crate::digest::{
+    line_stats, DigestConflict, DigestFile, DigestInput, DigestRun, DigestScope, RunTranscript,
+};
 use crate::git;
 use crate::merge::{self, MergeError};
 use crate::replica::{kind_of, EditorEdit, LocalChange, Replica, ReplicaError};
@@ -273,6 +276,9 @@ pub struct ThreadSession<T: Transport> {
     /// Each file's merge version, as last heard (ADR-0022).
     versions: HashMap<u64, u64>,
     runs: BTreeMap<String, RunView>,
+    /// What each Run said, by `run_no`, as this replica heard it live or
+    /// streamed it (ATL-411): the context digest's source.
+    transcripts: BTreeMap<u64, RunTranscript>,
     /// Conflicts heard of (ATL-410), by id: raised live, or seeded from the
     /// thread's REST read when the app opens it.
     conflicts: BTreeMap<u64, ThreadConflict>,
@@ -364,6 +370,7 @@ impl<T: Transport> ThreadSession<T> {
             last_nack: None,
             versions: HashMap::new(),
             runs: BTreeMap::new(),
+            transcripts: BTreeMap::new(),
             conflicts: BTreeMap::new(),
             peers: BTreeMap::new(),
             awareness: AwarenessState::default(),
@@ -1126,6 +1133,9 @@ impl<T: Transport> ThreadSession<T> {
         if payload.len() > wire::MAX_PAYLOAD_BYTES {
             tracing::debug!(target: "atlas_thread_sync", bytes = payload.len(), "live Run frame too large; skipped");
             return Ok(());
+        }
+        if kind == FrameKind::RunStream {
+            self.note_transcript(run_no, &payload);
         }
         let client_seq = self.take_client_seq();
         let bytes =
@@ -2093,6 +2103,111 @@ impl<T: Transport> ThreadSession<T> {
         }
     }
 
+    fn note_transcript(&mut self, run_no: u64, payload: &[u8]) {
+        self.transcripts.entry(run_no).or_default().fold(payload);
+        while self.transcripts.len() > RUNS_KEPT {
+            self.transcripts.pop_first();
+        }
+    }
+
+    /// What a Run's context digest is built from (ATL-411): the Runs in
+    /// `scope`, oldest first, with whatever this replica heard them say; the
+    /// files the thread changed against its Base; and the open Conflicts. The
+    /// caller adds the thread's goal and its unresolved comments, which this
+    /// session does not hold.
+    pub fn digest_input(&self, goal: &str, scope: DigestScope) -> DigestInput {
+        let mut runs: Vec<&RunView> = self
+            .runs
+            .values()
+            .filter(|v| match scope {
+                DigestScope::Since(None) => true,
+                DigestScope::Since(Some(last)) => v.run.run_no > last,
+                DigestScope::UpTo(anchor) => v.run.run_no <= anchor,
+            })
+            .filter(|v| v.run.status != "declined")
+            .collect();
+        runs.sort_by_key(|v| v.run.run_no);
+        let runs = runs
+            .into_iter()
+            .map(|v| DigestRun {
+                run_no: v.run.run_no,
+                runner_id: v.run.runner_id.clone(),
+                prompted_by: v.run.prompted_by.clone(),
+                agent: v.run.agent.clone(),
+                model: v.run.model.clone(),
+                status: v.run.status.clone(),
+                transcript: self.transcripts.get(&v.run.run_no).cloned(),
+                files: v.files.clone(),
+            })
+            .collect();
+
+        let mut files = Vec::new();
+        for f in self.replica.thread_files() {
+            let base = self.replica.base_bytes(&f.origin).ok().flatten();
+            if f.deleted {
+                if base.is_some() {
+                    files.push(DigestFile {
+                        path: f.path,
+                        added: 0,
+                        removed: 0,
+                        binary: false,
+                        deleted: true,
+                    });
+                }
+                continue;
+            }
+            match f.kind {
+                FileKind::Binary => {
+                    if f.blob.is_some() || base.is_none() {
+                        files.push(DigestFile {
+                            path: f.path,
+                            added: 0,
+                            removed: 0,
+                            binary: true,
+                            deleted: false,
+                        });
+                    }
+                }
+                FileKind::Text => {
+                    let before = base
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    let after = f.text.unwrap_or_default();
+                    if before != after || f.path != f.origin {
+                        let (added, removed) = line_stats(&before, &after);
+                        files.push(DigestFile {
+                            path: f.path,
+                            added,
+                            removed,
+                            binary: false,
+                            deleted: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        let conflicts = self
+            .conflicts
+            .values()
+            .filter(|c| c.is_open())
+            .map(|c| DigestConflict {
+                path: c.path.clone(),
+                lines: c.lines.map(|l| (l.start + 1, l.end.max(l.start + 1))),
+                people: c.involved.people.clone(),
+            })
+            .collect();
+
+        DigestInput {
+            goal: goal.to_string(),
+            scope,
+            runs,
+            files,
+            conflicts,
+            comments: Vec::new(),
+        }
+    }
+
     fn note_run(&mut self, run: ThreadRun) {
         match self.runs.get_mut(&run.run_id) {
             Some(view) => view.run = run,
@@ -2870,6 +2985,9 @@ impl<T: Transport> ThreadSession<T> {
                 if frame.kind == FrameKind::RunStream as u8
                     || frame.kind == FrameKind::RunFile as u8
                 {
+                    if frame.kind == FrameKind::RunStream as u8 {
+                        self.note_transcript(frame.file_id, &frame.payload);
+                    }
                     if let Some(events) = &self.events {
                         let _ = events.send(ThreadEvent::RunFrame {
                             run_no: frame.file_id,

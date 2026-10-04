@@ -32,6 +32,13 @@
 //! session's deltas to the thread as live Run frames, and the turn's end
 //! merges the result back. Any ACP agent and the native one alike — they all
 //! reach here through the same delta pipeline.
+//!
+//! Each Run's prompt goes out as its first live frame, and reaches the agent
+//! behind a context digest (ATL-411): what others did since this session's
+//! last Run — prompts, final answers, changed files, open Conflicts and
+//! unresolved comments, quoted as data — or, after "continue from here", the
+//! thread's work up to the chosen Run. Over budget, the oldest Runs are
+//! summarized by the `atlas-ai` gateway on the Runner's own entitlement.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,9 +50,9 @@ use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
-    ApplyOutcome, Command as SyncCommand, Connector, ObjectStore, Replica, Resolve, RunReport,
-    RunSpec, SharePreview, SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError,
-    WsTransport,
+    ApplyOutcome, Command as SyncCommand, Connector, DigestComment, DigestScope, ObjectStore,
+    Replica, Resolve, RunReport, RunSpec, SharePreview, SyncStatus, ThreadEvent, ThreadRepo,
+    ThreadSession, TransportError, WsTransport,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -211,6 +218,12 @@ pub struct SharedThreadsState {
     runs: Mutex<HashMap<String, LiveRun>>,
     /// A Conflict the next Run in each thread is to resolve, by thread.
     resolving: Mutex<HashMap<String, u64>>,
+    /// Each agent session's last Run, by session id: where its next context
+    /// digest starts (ATL-411).
+    last_run: Mutex<HashMap<String, u64>>,
+    /// "Continue from here": the Run the next Run in each thread anchors its
+    /// context on, by thread (ATL-411).
+    continue_from: Mutex<HashMap<String, u64>>,
 }
 
 /// The delta sink, so a Run's start and end can be announced on the session
@@ -1351,16 +1364,17 @@ pub async fn begin_run(
     cwd: &str,
     agent: &str,
     model: Option<&str>,
-) -> std::result::Result<(), String> {
+    prompt: &str,
+) -> std::result::Result<Option<String>, String> {
     let Some(shared_thread_id) = thread_for_run_worktree(app, cwd) else {
-        return Ok(());
+        return Ok(None);
     };
     {
         let state = app.state::<SharedThreadsState>();
         let runs = state.runs.lock().map_err(|_| poisoned().message)?;
         if runs.contains_key(session_id) {
             // A follow-up sent mid-turn joins the Run already in flight.
-            return Ok(());
+            return Ok(None);
         }
         // The Run worktree is one per thread on this machine: a second agent
         // session starting a Run would reset it under the first one's agent.
@@ -1372,6 +1386,15 @@ pub async fn begin_run(
         }
     }
     let commands = commands_for(app, &shared_thread_id).map_err(|e| e.message)?;
+    // What others did, read before this Run exists so it is not its own
+    // context (ATL-411). A slash command must stay at byte 0, so it goes
+    // to its agent as typed, with no digest in front.
+    let (scope, anchor) = digest_scope(app, &shared_thread_id, session_id)?;
+    let digest = if prompt.trim_start().starts_with('/') {
+        None
+    } else {
+        context_digest(app, &commands, &shared_thread_id, scope).await
+    };
     let (reply, answer) = oneshot::channel();
     commands
         .send(SyncCommand::StartRun {
@@ -1380,7 +1403,7 @@ pub async fn begin_run(
                 run_id: RunSpec::new_id(),
                 agent: agent.to_string(),
                 model: model.unwrap_or("default").to_string(),
-                context_anchor: None,
+                context_anchor: anchor.map(|run_no| format!("run:{run_no}")),
             },
             reply,
         })
@@ -1390,8 +1413,19 @@ pub async fn begin_run(
         .map_err(|_| disconnected().message)?
         .map_err(|e| format!("This Shared Thread refused the Run: {e}"))?;
     tag_session(app, session_id, &shared_thread_id);
+    // The prompt, as the Run's first live frame: no `SessionDelta` carries
+    // it, and every other replica's digest needs it.
+    let _ = commands.send(SyncCommand::RunFrame {
+        run_id: started.run_id.clone(),
+        payload: atlas_thread_sync::digest::prompt_frame(prompt),
+    });
     {
         let state = app.state::<SharedThreadsState>();
+        state
+            .last_run
+            .lock()
+            .map_err(|_| poisoned().message)?
+            .insert(session_id.to_string(), started.run_no);
         let resolves = state
             .resolving
             .lock()
@@ -1418,7 +1452,175 @@ pub async fn begin_run(
             run_no: started.run_no,
         },
     );
-    Ok(())
+    Ok(digest)
+}
+
+/// Which Runs the next Run's digest covers: the thread's "continue from
+/// here", taken once, or everything since this agent session's last Run.
+fn digest_scope(
+    app: &AppHandle,
+    shared_thread_id: &str,
+    session_id: &str,
+) -> std::result::Result<(DigestScope, Option<u64>), String> {
+    let state = app.state::<SharedThreadsState>();
+    let anchor = state
+        .continue_from
+        .lock()
+        .map_err(|_| poisoned().message)?
+        .remove(shared_thread_id);
+    if let Some(run_no) = anchor {
+        return Ok((DigestScope::UpTo(run_no), Some(run_no)));
+    }
+    let last = state
+        .last_run
+        .lock()
+        .map_err(|_| poisoned().message)?
+        .get(session_id)
+        .copied();
+    Ok((DigestScope::Since(last), None))
+}
+
+/// How long gathering a digest's extras — names and comments — may take
+/// before the Run starts without them.
+const DIGEST_EXTRAS_SECS: u64 = 5;
+/// How long a summary of the oldest Runs may take before they are left out.
+const DIGEST_SUMMARY_SECS: u64 = 25;
+
+/// The context digest to put in front of a Run's prompt (ATL-411), or `None`
+/// when nobody else did anything. Never fails the Run: whatever cannot be
+/// read is left out, and an unreachable broker leaves the oldest Runs out
+/// rather than summarized.
+async fn context_digest(
+    app: &AppHandle,
+    commands: &mpsc::UnboundedSender<SyncCommand>,
+    shared_thread_id: &str,
+    scope: DigestScope,
+) -> Option<String> {
+    let entry = entry_of(app, shared_thread_id).ok()?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::Digest {
+            goal: entry.title.clone(),
+            scope,
+            reply,
+        })
+        .ok()?;
+    let mut input = answer.await.ok()?;
+    let extras = tokio::time::timeout(
+        std::time::Duration::from_secs(DIGEST_EXTRAS_SECS),
+        futures::future::join(open_comments(app, &entry), member_names(app, &entry.org_id)),
+    )
+    .await;
+    let names = match extras {
+        Ok((comments, names)) => {
+            input.comments = comments;
+            names
+        }
+        Err(_) => HashMap::new(),
+    };
+    atlas_thread_sync::digest::build(
+        &input,
+        atlas_thread_sync::digest::DIGEST_BUDGET_CHARS,
+        |user_id| {
+            names
+                .get(user_id)
+                .cloned()
+                .unwrap_or_else(|| "a teammate".into())
+        },
+        |record| async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(DIGEST_SUMMARY_SECS),
+                super::memory_extract::gateway_completion(app, record),
+            )
+            .await
+            .map_err(|_| "the summary timed out".to_string())?
+        },
+    )
+    .await
+}
+
+/// The thread's unresolved line comments (ATL-413), as the digest lists them.
+async fn open_comments(app: &AppHandle, entry: &SharedThreadEntry) -> Vec<DigestComment> {
+    #[derive(Deserialize)]
+    struct List {
+        comments: Vec<Comment>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Comment {
+        parent_id: Option<String>,
+        author_id: String,
+        body: Option<String>,
+        resolved_at: Option<String>,
+        #[serde(default)]
+        thread_range: Option<Range>,
+    }
+    #[derive(Deserialize)]
+    struct Range {
+        path: String,
+        quote: String,
+    }
+    let Ok(token) = token(app).await else {
+        return Vec::new();
+    };
+    let Ok(res) = reqwest::Client::new()
+        .get(thread_url(entry, "/comments"))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(list) = res.json::<List>().await else {
+        return Vec::new();
+    };
+    list.comments
+        .into_iter()
+        .filter(|c| c.parent_id.is_none() && c.resolved_at.is_none())
+        .filter_map(|c| {
+            let range = c.thread_range?;
+            Some(DigestComment {
+                author_id: c.author_id,
+                path: range.path,
+                quote: range.quote,
+                body: c.body?,
+            })
+        })
+        .collect()
+}
+
+/// The Organisation's members by user id, for the digest's names.
+async fn member_names(app: &AppHandle, org_id: &str) -> HashMap<String, String> {
+    let Some(state) = app.try_state::<crate::commands::auth::AuthState>() else {
+        return HashMap::new();
+    };
+    match state.core().list_members(org_id).await {
+        Ok(members) => members
+            .into_iter()
+            .filter(|m| !m.name.trim().is_empty())
+            .map(|m| (m.user_id, m.name))
+            .collect(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// "Continue from here" (ATL-411): the next Run in this thread starts with
+/// the thread's context up to Run `run_no` — its prompt, answer and files and
+/// everything before — while its files still fork from canonical state now.
+/// Answers the Run worktree to prompt in.
+#[tauri::command]
+pub async fn shared_thread_continue_from(
+    app: AppHandle,
+    shared_thread_id: String,
+    run_no: u64,
+) -> Result<String> {
+    let cwd = shared_thread_run_worktree(app.clone(), shared_thread_id.clone()).await?;
+    app.state::<SharedThreadsState>()
+        .continue_from
+        .lock()
+        .map_err(|_| poisoned())?
+        .insert(shared_thread_id, run_no);
+    Ok(cwd)
 }
 
 /// The joined thread whose Run worktree is `cwd`, if any.

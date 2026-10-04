@@ -594,6 +594,7 @@ pub fn run() {
             commands::shared_threads::shared_thread_set_open,
             commands::shared_threads::shared_thread_resolve_conflict,
             commands::shared_threads::shared_thread_ask_agent_to_resolve,
+            commands::shared_threads::shared_thread_continue_from,
             commands::shared_threads::shared_thread_apply,
             commands::shared_threads::shared_thread_doc_open,
             commands::shared_threads::shared_thread_doc_close,
