@@ -113,7 +113,10 @@ pub struct ForkFile {
 }
 
 pub struct Replica {
-    repo: PathBuf,
+    /// The repository the worktree comes from: the person's own, or the
+    /// thread repository a bundle was fetched into (ATL-402). `None` while
+    /// this machine lacks the Base — the replica can then only watch.
+    repo: Option<PathBuf>,
     base: String,
     root: PathBuf,
     client_id: u64,
@@ -126,33 +129,68 @@ impl Replica {
     /// A replica of a thread whose Base is `base`, backed by the person's own
     /// repository at `repo`, to be checked out at `root` when first needed.
     ///
-    /// Refuses when the repository lacks the Base: bringing it over is a
-    /// separate negotiation (ATL-402).
+    /// Refuses when the repository lacks the Base: see
+    /// [`Replica::without_base`] and [`crate::bootstrap`].
     pub fn new(repo: &Path, base: &str, root: &Path) -> Result<Self, ReplicaError> {
+        let mut replica = Self::without_base(base, root)?;
+        replica.attach_repo(repo)?;
+        Ok(replica)
+    }
+
+    /// A replica on a machine that does not have the Base yet. It follows the
+    /// thread — every file rebuilt from the journal alone, since the replica
+    /// that introduces a file also publishes its Base seed — but cannot be
+    /// checked out, and so cannot edit, until [`Replica::attach_repo`].
+    pub fn without_base(base: &str, root: &Path) -> Result<Self, ReplicaError> {
         if !git::is_commit_sha(base) {
             return Err(ReplicaError::BadBase(base.to_string()));
         }
-        if !git::has_commit(repo, base) {
-            return Err(ReplicaError::BaseMissing(base.to_string()));
-        }
         Ok(Self {
-            repo: repo.to_path_buf(),
+            repo: None,
             base: base.to_string(),
             root: root.to_path_buf(),
             client_id: random_client_id(),
-            materialized: root.join(".git").exists(),
+            materialized: false,
             files: BTreeMap::new(),
             by_path: HashMap::new(),
         })
+    }
+
+    /// The Base arrived (or was always in `repo`): worktrees come from `repo`
+    /// from now on. Every file already followed is seeded from its Base
+    /// content too — harmless, since seeds are identical everywhere.
+    pub fn attach_repo(&mut self, repo: &Path) -> Result<(), ReplicaError> {
+        if !git::has_commit(repo, &self.base) {
+            return Err(ReplicaError::BaseMissing(self.base.clone()));
+        }
+        self.repo = Some(repo.to_path_buf());
+        self.materialized = self.root.join(".git").exists();
+        let files: Vec<(u64, String)> = self
+            .files
+            .iter()
+            .map(|(id, f)| (*id, f.path.clone()))
+            .collect();
+        for (id, path) in files {
+            for update in self.seed_for(&path)? {
+                self.files[&id].doc.apply(&update)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn base(&self) -> &str {
         &self.base
     }
 
-    /// The person's own repository the replica's worktrees come from.
-    pub fn repo(&self) -> &Path {
-        &self.repo
+    /// The repository the replica's worktrees come from, once it has the Base.
+    pub fn repo(&self) -> Option<&Path> {
+        self.repo.as_deref()
+    }
+
+    /// Can this machine check the thread out and edit it? Not until it holds
+    /// the Base.
+    pub fn has_base(&self) -> bool {
+        self.repo.is_some()
     }
 
     /// Every tracked file as it is now, to fork a Run from (ATL-405).
@@ -213,11 +251,20 @@ impl Replica {
     /// The deterministic seed updates for `path` at the Base (see `doc.rs`):
     /// empty for a file the Base does not have.
     pub fn seed_for(&self, path: &str) -> Result<Vec<Vec<u8>>, ReplicaError> {
-        let base = git::blob_at(&self.repo, &self.base, path)?.unwrap_or_default();
+        let base = self.base_bytes(path)?.unwrap_or_default();
         if !looks_textual(&base) {
             return Ok(Vec::new());
         }
         Ok(FileDoc::seed_updates(&String::from_utf8_lossy(&base)))
+    }
+
+    /// A file's bytes at the Base, or `None` when the Base has no such file —
+    /// or this machine does not have the Base yet.
+    pub fn base_bytes(&self, path: &str) -> Result<Option<Vec<u8>>, ReplicaError> {
+        match &self.repo {
+            Some(repo) => Ok(git::blob_at(repo, &self.base, path)?),
+            None => Ok(None),
+        }
     }
 
     /// Learn a tree entry: create its document and seed it from the Base. A
@@ -419,10 +466,14 @@ impl Replica {
         if self.materialized {
             return Ok(&self.root);
         }
+        let repo = self
+            .repo
+            .clone()
+            .ok_or_else(|| ReplicaError::BaseMissing(self.base.clone()))?;
         if let Some(parent) = self.root.parent() {
             fs::create_dir_all(parent).map_err(io(parent))?;
         }
-        git::add_worktree(&self.repo, &self.root, &self.base)?;
+        git::add_worktree(&repo, &self.root, &self.base)?;
         self.materialized = true;
         let ids: Vec<u64> = self.files.keys().copied().collect();
         for id in ids {

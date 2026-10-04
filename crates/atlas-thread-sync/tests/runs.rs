@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use atlas_thread_sync::doc::{random_client_id, FileDoc};
-use atlas_thread_sync::transport::FakeBlobs;
+use atlas_thread_sync::FakeStore;
+use std::sync::Arc;
 use atlas_thread_sync::wire::FrameKind;
 use atlas_thread_sync::{
     run, ActiveRun, Command as SyncCommand, FakeThreadServer, FakeTransport, RunSpec, RunWorktree,
@@ -79,7 +80,7 @@ async fn pair() -> Pair {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut monzim = open(
         &server,
         &w.monzim,
@@ -113,7 +114,9 @@ async fn two_runners_on_different_files_both_merge_and_the_next_fork_sees_it() {
         joy_runs,
         monzim_runs,
     } = pair().await;
-    let blobs = FakeBlobs::default();
+    let blobs = FakeStore::default();
+    joy.set_store(Arc::new(blobs.clone()));
+    monzim.set_store(Arc::new(blobs.clone()));
 
     let joy_run = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
     let monzim_run = monzim.start_run(&monzim_runs, spec("codex")).await.unwrap();
@@ -138,10 +141,10 @@ async fn two_runners_on_different_files_both_merge_and_the_next_fork_sees_it() {
     )
     .await;
 
-    let joy_report = joy.finish_run(&joy_run, &joy_runs, &blobs).await.unwrap();
+    let joy_report = joy.finish_run(&joy_run, &joy_runs).await.unwrap();
     assert_eq!(joy_report.files, vec!["README.md".to_string()]);
     let monzim_report = monzim
-        .finish_run(&monzim_run, &monzim_runs, &blobs)
+        .finish_run(&monzim_run, &monzim_runs)
         .await
         .unwrap();
     let mut files = monzim_report.files.clone();
@@ -177,11 +180,14 @@ async fn two_runners_on_different_files_both_merge_and_the_next_fork_sees_it() {
         .all(|r| r.status == "merged" && r.merged_version.is_some()));
     assert_eq!(
         blobs
-            .get(&sha256_hex(".banner {\n  color: red;\n}\n"))
+            .blob(&sha256_hex(".banner {\n  color: red;\n}\n"))
             .unwrap(),
         b".banner {\n  color: red;\n}\n"
     );
-    assert_eq!(blobs.len(), 3);
+    // Three Version copies, and README's Base content: the Run brought that
+    // file into the thread, so its Base was uploaded with it (ATL-402).
+    assert!(blobs.blob(&sha256_hex("# Site\n")).is_some());
+    assert_eq!(blobs.blobs(), 4);
     // Joy sees Monzim's Run and what it changed.
     let seen = joy.runs();
     let theirs = seen
@@ -222,7 +228,9 @@ async fn a_merge_that_already_arrived_is_merged_onto() {
         joy_runs,
         monzim_runs,
     } = pair().await;
-    let blobs = FakeBlobs::default();
+    let blobs = FakeStore::default();
+    joy.set_store(Arc::new(blobs.clone()));
+    monzim.set_store(Arc::new(blobs.clone()));
     let banner = monzim.replica().file_id("src/banner.css").unwrap();
 
     let joy_run = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
@@ -246,12 +254,12 @@ async fn a_merge_that_already_arrived_is_merged_onto() {
     )
     .await;
 
-    joy.finish_run(&joy_run, &joy_runs, &blobs).await.unwrap();
+    joy.finish_run(&joy_run, &joy_runs).await.unwrap();
     assert_eq!(server.merge_version(banner), Some(1));
     // Joy's merge had reached Monzim's socket before his turn ended, so his
     // merge is planned onto it from the start and lands first time.
     let report = monzim
-        .finish_run(&monzim_run, &monzim_runs, &blobs)
+        .finish_run(&monzim_run, &monzim_runs)
         .await
         .unwrap();
     assert_eq!(report.retries, 0);
@@ -262,7 +270,7 @@ async fn a_merge_that_already_arrived_is_merged_onto() {
     assert_eq!(joy.replica().text("src/banner.css").unwrap(), merged);
     assert_eq!(monzim.replica().text("src/banner.css").unwrap(), merged);
     assert_eq!(monzim.merge_version(banner), 2);
-    assert!(blobs.get(&sha256_hex(merged)).is_some());
+    assert!(blobs.blob(&sha256_hex(merged)).is_some());
 }
 
 #[tokio::test]
@@ -275,7 +283,8 @@ async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
         joy_runs: _,
         monzim_runs,
     } = pair().await;
-    let blobs = FakeBlobs::default();
+    let blobs = FakeStore::default();
+    monzim.set_store(Arc::new(blobs.clone()));
     let banner = monzim.replica().file_id("src/banner.css").unwrap();
     let run = monzim.start_run(&monzim_runs, spec("codex")).await.unwrap();
     play(
@@ -299,13 +308,13 @@ async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
     .unwrap();
     server.merge_before_next_submit(banner, theirs);
 
-    let report = monzim.finish_run(&run, &monzim_runs, &blobs).await.unwrap();
+    let report = monzim.finish_run(&run, &monzim_runs).await.unwrap();
     assert_eq!(report.retries, 1);
     assert_eq!(server.merge_version(banner), Some(2));
     let merged = ".hero {\n  color: green;\n}\n/* end */\n";
     assert_eq!(monzim.replica().text("src/banner.css").unwrap(), merged);
     assert_eq!(monzim.merge_version(banner), 2);
-    assert!(blobs.get(&sha256_hex(merged)).is_some());
+    assert!(blobs.blob(&sha256_hex(merged)).is_some());
 }
 
 #[tokio::test]
@@ -318,7 +327,9 @@ async fn typing_during_a_run_never_touches_its_worktree_and_both_survive() {
         joy_runs,
         monzim_runs: _,
     } = pair().await;
-    let blobs = FakeBlobs::default();
+    let blobs = FakeStore::default();
+    joy.set_store(Arc::new(blobs.clone()));
+    monzim.set_store(Arc::new(blobs.clone()));
     let readme_before = "# Site\n";
 
     let joy_run = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
@@ -342,7 +353,7 @@ async fn typing_during_a_run_never_touches_its_worktree_and_both_survive() {
         )],
     )
     .await;
-    joy.finish_run(&joy_run, &joy_runs, &blobs).await.unwrap();
+    joy.finish_run(&joy_run, &joy_runs).await.unwrap();
     monzim.pump(QUIET).await.unwrap();
     assert_eq!(
         monzim.replica().text("README.md").unwrap(),
@@ -414,7 +425,9 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
         joy_runs,
         monzim_runs,
     } = pair().await;
-    let blobs = FakeBlobs::default();
+    let blobs = FakeStore::default();
+    joy.set_store(Arc::new(blobs.clone()));
+    monzim.set_store(Arc::new(blobs.clone()));
     let joy_run = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
     let monzim_run = monzim.start_run(&monzim_runs, spec("codex")).await.unwrap();
     play(
@@ -436,9 +449,9 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
     )
     .await;
 
-    joy.finish_run(&joy_run, &joy_runs, &blobs).await.unwrap();
+    joy.finish_run(&joy_run, &joy_runs).await.unwrap();
     let err = monzim
-        .finish_run(&monzim_run, &monzim_runs, &blobs)
+        .finish_run(&monzim_run, &monzim_runs)
         .await
         .unwrap_err();
     match err {
@@ -509,8 +522,11 @@ async fn the_run_loop_runs_streams_and_merges_on_command() {
 
     let (commands, rx) = mpsc::unbounded_channel();
     let (status_tx, mut status) = watch::channel(SyncStatus::default());
-    let blobs = FakeBlobs::default();
-    tokio::spawn(run(joy, rx, status_tx, blobs.clone()));
+    let blobs = FakeStore::default();
+    monzim.set_store(Arc::new(blobs.clone()));
+    let mut joy = joy;
+    joy.set_store(Arc::new(blobs.clone()));
+    tokio::spawn(run(joy, rx, status_tx));
 
     let worktree: PathBuf = w.replicas.join("joy-run");
     let (reply, started) = oneshot::channel();
@@ -539,7 +555,8 @@ async fn the_run_loop_runs_streams_and_merges_on_command() {
         .unwrap();
     let report = finished.await.unwrap().unwrap();
     assert_eq!(report.files, vec!["README.md".to_string()]);
-    assert_eq!(blobs.len(), 1);
+    // The Version copy, and README's Base content.
+    assert_eq!(blobs.blobs(), 2);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

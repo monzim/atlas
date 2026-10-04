@@ -19,6 +19,10 @@
 //! * Each joined thread's Run worktree (ATL-405) is
 //!   `<app data>/shared-threads/<id>/run`: one per participant on this
 //!   machine, reused Run after Run so the agent session's `cwd` never changes.
+//! * Each joined thread's bare **thread repository** (ATL-402) is
+//!   `<app data>/shared-threads/<id>/repo`: where a Base bundle is fetched when
+//!   this machine lacks the Base, and built when somebody else does. It
+//!   borrows the person's objects and never writes to their repository.
 //!
 //! # Runs (ATL-405)
 //!
@@ -37,9 +41,10 @@ use agent_client_protocol::schema::v1 as acp;
 use atlas_agent_wire::{AgentId, DeltaSink, SessionDelta, SessionDeltaEnvelope};
 use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
+use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
-    BlobSink, Command as SyncCommand, Replica, RunReport, RunSpec, SyncStatus, ThreadEvent,
-    ThreadSession, WsTransport,
+    Command as SyncCommand, ObjectStore, Replica, RunReport, RunSpec, SharePreview, SyncStatus,
+    ThreadEvent, ThreadRepo, ThreadSession, WsTransport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -63,8 +68,11 @@ pub struct SharedThreadEntry {
     pub title: String,
     pub base: String,
     pub role: String,
-    /// The person's own checkout of the project. Only ever read.
-    pub project_path: String,
+    /// The person's own checkout of the project, when they have one. Only
+    /// ever read. `None` for somebody who joined with no copy of the
+    /// repository (ATL-402).
+    #[serde(default)]
+    pub project_path: Option<String>,
     /// This replica's stable id on the wire, kept across reconnects so the
     /// server can say which of its frames it already stored.
     pub client_id: String,
@@ -94,6 +102,40 @@ pub struct BlockedFile {
     pub path: String,
     /// `name`, or the secret categories its content matched.
     pub reason: String,
+}
+
+/// One row of the share dialog (ATL-402).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareFileView {
+    pub path: String,
+    pub kind: atlas_thread_sync::ShareKind,
+    pub bytes: u64,
+    pub deleted: bool,
+    /// Why it is held back unless included anyway: `name`, or the secret
+    /// categories its content matched. `None` when it uploads.
+    pub blocked: Option<String>,
+}
+
+fn reason_text(reason: &atlas_thread_sync::SecretReason) -> String {
+    match reason {
+        atlas_thread_sync::SecretReason::Name => "name".into(),
+        atlas_thread_sync::SecretReason::Content(kinds) => kinds.join(", "),
+    }
+}
+
+fn preview_view(preview: &SharePreview) -> Vec<ShareFileView> {
+    preview
+        .files
+        .iter()
+        .map(|f| ShareFileView {
+            path: f.path.clone(),
+            kind: f.kind,
+            bytes: f.bytes,
+            deleted: f.deleted,
+            blocked: f.blocked.as_ref().map(reason_text),
+        })
+        .collect()
 }
 
 struct Running {
@@ -181,11 +223,25 @@ type Result<T> = std::result::Result<T, SharedThreadError>;
 // Commands
 // ---------------------------------------------------------------------------
 
+/// What sharing `project_path` would upload — exactly the files the dialog
+/// lists — and what it would hold back as secret-shaped (ATL-402). Only reads.
+#[tauri::command]
+pub async fn shared_thread_share_preview(project_path: String) -> Result<Vec<ShareFileView>> {
+    let path = PathBuf::from(project_path);
+    tauri::async_runtime::spawn_blocking(move || atlas_thread_sync::share::preview(&path))
+        .await
+        .map_err(|e| SharedThreadError::new("internal", e.to_string()))?
+        .map(|preview| preview_view(&preview))
+        .map_err(|e| SharedThreadError::new("preview_failed", e.to_string()))
+}
+
 /// Share the thread behind `session_id` (an ACP session id) as a Shared
 /// Thread. The project's checked-out commit becomes the Base and its
 /// uncommitted work the first canonical changes; the repository itself is
-/// never uploaded. Refused for a Local-mode project with `workspace_local`, so
-/// the renderer can offer promotion.
+/// never uploaded. Files that look like secrets stay home unless named in
+/// `include` — the dialog's per-file "include anyway". Refused for a
+/// Local-mode project with `workspace_local`, so the renderer can offer
+/// promotion.
 #[tauri::command]
 pub async fn shared_thread_share(
     app: AppHandle,
@@ -193,6 +249,7 @@ pub async fn shared_thread_share(
     session_id: String,
     project_path: String,
     title: String,
+    include: Option<Vec<String>>,
 ) -> Result<SharedThreadView> {
     let org_id = active_org(&app)?;
     let workspace_id = cloud_workspace(&project_path, &org_id).await?;
@@ -230,7 +287,7 @@ pub async fn shared_thread_share(
         title: created.thread.title.clone(),
         base: created.thread.base_commit.clone(),
         role: created.role.clone().unwrap_or_else(|| "owner".into()),
-        project_path: project_path.clone(),
+        project_path: Some(project_path.clone()),
         client_id: new_client_id(),
     };
 
@@ -250,14 +307,20 @@ pub async fn shared_thread_share(
         }
     }
 
-    let view = start(&app, entry, Some(PathBuf::from(project_path))).await?;
+    let share = Share {
+        checkout: PathBuf::from(project_path),
+        include: include.unwrap_or_default(),
+    };
+    let view = start(&app, entry, Some(share)).await?;
     remember(&app, &view.entry)?;
     Ok(view)
 }
 
 /// Join a Shared Thread from the link a teammate sent. The thread's Workspace
-/// must be a project this machine has bound to Cloud, and its Base commit must
-/// already be in that repository; nothing is checked out until
+/// should be a project this machine has bound to Cloud; without one — or when
+/// that repository lacks the Base, because it was never pushed — the Base is
+/// brought over as a bundle from a replica that has it (ATL-402), and the
+/// person watches read-only if none can come. Nothing is checked out until
 /// [`shared_thread_open`].
 #[tauri::command]
 pub async fn shared_thread_join(
@@ -275,14 +338,8 @@ pub async fn shared_thread_join(
         Some(path) => vec![path],
         None => known_projects(&host),
     };
-    let project_path = find_project(candidates, &parsed.org, &parsed.workspace)
-        .await
-        .ok_or_else(|| {
-            SharedThreadError::new(
-                "project_not_found",
-                "Open the project this thread belongs to (connected to Atlas Cloud) and try again.",
-            )
-        })?;
+    // No local copy is fine: the Base comes as a bundle (ATL-402).
+    let project_path = find_project(candidates, &parsed.org, &parsed.workspace).await;
 
     let token = token(&app).await?;
     let thread: ServerThread = get_json(
@@ -422,12 +479,19 @@ pub fn install(app: &AppHandle) {
     });
 }
 
-/// Connect, catch up, optionally share the sharer's working changes, and spawn
-/// the loop that keeps the replica in step.
+/// A share's working tree, and the blocked files included anyway.
+struct Share {
+    checkout: PathBuf,
+    include: Vec<String>,
+}
+
+/// Connect, catch up, bring the Base over if this machine lacks it, optionally
+/// share the sharer's working changes, and spawn the loop that keeps the
+/// replica in step.
 async fn start(
     app: &AppHandle,
     entry: SharedThreadEntry,
-    share_from: Option<PathBuf>,
+    share: Option<Share>,
 ) -> Result<SharedThreadView> {
     let token = token(app).await?;
     let url = atlas_thread_sync::transport::thread_socket_url(
@@ -441,21 +505,41 @@ async fn start(
     })?;
 
     let root = replica_root(app, &entry.shared_thread_id)?;
-    let replica = Replica::new(Path::new(&entry.project_path), &entry.base, &root).map_err(|e| match e {
-        atlas_thread_sync::ReplicaError::BaseMissing(_) => SharedThreadError::new(
-            "base_missing",
-            "This project does not have the commit the thread starts from yet. Pull or fetch it, then join again.",
-        ),
-        other => SharedThreadError::new("replica_failed", other.to_string()),
-    })?;
+    let thread_repo = ThreadRepo::at(&thread_dir(app, &entry.shared_thread_id)?.join("repo"));
+    let own = entry.project_path.as_deref().map(PathBuf::from);
+    // The person's repository when it has the Base; else the thread
+    // repository a bundle was fetched into before; else nothing yet.
+    let replica = match own
+        .as_deref()
+        .filter(|repo| atlas_thread_sync::git::has_commit(repo, &entry.base))
+    {
+        Some(repo) => Replica::new(repo, &entry.base, &root),
+        None if thread_repo.has(&entry.base) => {
+            Replica::new(thread_repo.path(), &entry.base, &root)
+        }
+        None => Replica::without_base(&entry.base, &root),
+    }
+    .map_err(|e| SharedThreadError::new("replica_failed", e.to_string()))?;
     let mut session = ThreadSession::open(transport, replica, &entry.client_id)
         .await
         .map_err(session_error)?;
+    session.set_store(Arc::new(HttpStore {
+        org_id: entry.org_id.clone(),
+        workspace_id: entry.workspace_id.clone(),
+        shared_thread_id: entry.shared_thread_id.clone(),
+        app: app.clone(),
+    }));
+    session.set_thread_repo(thread_repo);
+    // Without the Base the replica can only watch; a bundle fixes that. Not
+    // getting one is not a failure — the status says why it is read-only.
+    if !session.replica().has_base() {
+        session.bootstrap(own.as_deref()).await.map_err(session_error)?;
+    }
     let mut shared_files = Vec::new();
     let mut blocked_files = Vec::new();
-    if let Some(checkout) = share_from {
+    if let Some(share) = share {
         let report = session
-            .share_working_changes(&checkout)
+            .share_working_changes(&share.checkout, &share.include)
             .await
             .map_err(session_error)?;
         shared_files = report.shared;
@@ -463,11 +547,8 @@ async fn start(
             .blocked
             .into_iter()
             .map(|(path, reason)| BlockedFile {
+                reason: reason_text(&reason),
                 path,
-                reason: match reason {
-                    atlas_thread_sync::SecretReason::Name => "name".into(),
-                    atlas_thread_sync::SecretReason::Content(kinds) => kinds.join(", "),
-                },
             })
             .collect();
     }
@@ -477,13 +558,7 @@ async fn start(
     let mut updates = status.clone();
     let (events, mut heard) = mpsc::unbounded_channel();
     session.set_events(events);
-    let blobs = HttpBlobs {
-        org_id: entry.org_id.clone(),
-        workspace_id: entry.workspace_id.clone(),
-        shared_thread_id: entry.shared_thread_id.clone(),
-        app: app.clone(),
-    };
-    tauri::async_runtime::spawn(atlas_thread_sync::run(session, rx, status_tx, blobs));
+    tauri::async_runtime::spawn(atlas_thread_sync::run(session, rx, status_tx));
     {
         let forward = app.clone();
         let shared_thread_id = entry.shared_thread_id.clone();
@@ -771,38 +846,116 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
     }
 }
 
-/// The thread's blob door, for a Run's Thread Version content.
-struct HttpBlobs {
+/// The thread's object doors over HTTPS: blobs (Base content, binary files,
+/// Thread Version copies), Base bundles and compaction snapshots.
+struct HttpStore {
     app: AppHandle,
     org_id: String,
     workspace_id: String,
     shared_thread_id: String,
 }
 
-impl BlobSink for HttpBlobs {
-    async fn put(&self, sha256: &str, bytes: Vec<u8>) -> std::result::Result<(), String> {
-        let token = token(&self.app).await.map_err(|e| e.message)?;
-        let url = format!(
-            "{}/threads/{}/blobs/{sha256}?org={}&workspace={}",
+/// Bundles are larger than anything else this module sends.
+const OBJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl HttpStore {
+    fn url(&self, rest: &str, query: &str) -> String {
+        format!(
+            "{}/threads/{}/{rest}?org={}&workspace={}{query}",
             atlas_artifacts::ingest_base(),
             self.shared_thread_id,
             self.org_id,
             self.workspace_id,
-        );
-        let res = client()
-            .map_err(|e| e.message)?
+        )
+    }
+
+    async fn put(&self, url: String, bytes: Vec<u8>) -> std::result::Result<(), StoreError> {
+        let token = token(&self.app)
+            .await
+            .map_err(|e| StoreError::Failed(e.message))?;
+        let res = object_client()?
             .put(url)
             .bearer_auth(token)
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        if res.status().is_success() {
-            Ok(())
+            .map_err(|e| StoreError::Failed(e.to_string()))?;
+        store_answer(res).await.map(|_| ())
+    }
+
+    async fn get(&self, url: String) -> std::result::Result<Vec<u8>, StoreError> {
+        let token = token(&self.app)
+            .await
+            .map_err(|e| StoreError::Failed(e.message))?;
+        let res = object_client()?
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| StoreError::Failed(e.to_string()))?;
+        store_answer(res).await
+    }
+}
+
+fn object_client() -> std::result::Result<reqwest::Client, StoreError> {
+    reqwest::Client::builder()
+        .timeout(OBJECT_TIMEOUT)
+        .build()
+        .map_err(|e| StoreError::Failed(e.to_string()))
+}
+
+/// A door's answer: the body, or the refusal it gave.
+async fn store_answer(res: reqwest::Response) -> std::result::Result<Vec<u8>, StoreError> {
+    let status = res.status();
+    let body = res
+        .bytes()
+        .await
+        .map_err(|e| StoreError::Failed(e.to_string()))?;
+    if status.is_success() {
+        return Ok(body.to_vec());
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(StoreError::NotFound);
+    }
+    Err(match serde_json::from_slice::<ServerError>(&body) {
+        Ok(e) => StoreError::Refused {
+            code: e.error.code,
+            message: e.error.message,
+        },
+        Err(_) => StoreError::Failed(format!("the server answered {status}")),
+    })
+}
+
+impl ObjectStore for HttpStore {
+    fn put_blob(&self, sha256: String, bytes: Vec<u8>) -> StoreFuture<'_, ()> {
+        Box::pin(self.put(self.url(&format!("blobs/{sha256}"), ""), bytes))
+    }
+
+    fn get_blob(&self, sha256: String) -> StoreFuture<'_, Vec<u8>> {
+        Box::pin(self.get(self.url(&format!("blobs/{sha256}"), "")))
+    }
+
+    fn put_bundle(
+        &self,
+        sha256: String,
+        bytes: Vec<u8>,
+        prerequisites: Vec<String>,
+    ) -> StoreFuture<'_, ()> {
+        let query = if prerequisites.is_empty() {
+            String::new()
         } else {
-            Err(format!("blob upload answered {}", res.status()))
-        }
+            format!("&prerequisites={}", prerequisites.join(","))
+        };
+        Box::pin(self.put(self.url(&format!("bundles/{sha256}"), &query), bytes))
+    }
+
+    fn get_bundle(&self, sha256: String) -> StoreFuture<'_, Vec<u8>> {
+        Box::pin(self.get(self.url(&format!("bundles/{sha256}"), "")))
+    }
+
+    fn get_snapshot(&self, file_id: u64) -> StoreFuture<'_, Vec<u8>> {
+        Box::pin(self.get(self.url(&format!("snapshots/{file_id}"), "")))
     }
 }
 

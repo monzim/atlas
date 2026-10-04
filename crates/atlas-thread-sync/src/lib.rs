@@ -17,8 +17,12 @@
 //! * [`watch`] — saves in the worktree as thread paths;
 //! * [`runs`] / [`merge`] — Runs: the Run worktree, and merging a Run's
 //!   result back into canonical state (ATL-405);
+//! * [`share`] — what a share uploads, and what it holds back (ATL-402);
+//! * [`bootstrap`] — bringing the Base to a machine without it (ATL-402);
+//! * [`store`] — the thread's blob, bundle and snapshot doors;
 //! * [`run`] — the loop an app spawns per joined thread.
 
+pub mod bootstrap;
 pub mod doc;
 pub mod git;
 pub mod merge;
@@ -27,6 +31,8 @@ pub mod replica;
 pub mod runs;
 pub mod secrets;
 pub mod session;
+pub mod share;
+pub mod store;
 pub mod transport;
 pub mod watch;
 pub mod wire;
@@ -37,10 +43,15 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
+pub use bootstrap::ThreadRepo;
 pub use replica::{LocalChange, Replica, ReplicaError};
 pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
-pub use session::{BlobSink, RunView, SessionError, ShareReport, ThreadEvent, ThreadSession};
+pub use session::{
+    Bootstrapped, RunView, SessionError, ShareReport, ThreadEvent, ThreadSession,
+};
+pub use share::{SharePreview, ShareFile, ShareKind};
+pub use store::{FakeStore, ObjectStore, StoreError};
 pub use transport::{
     FakeThreadServer, FakeTransport, Message, Transport, TransportError, WsTransport,
 };
@@ -100,6 +111,9 @@ pub struct SyncStatus {
     pub held: Vec<String>,
     /// The thread's Runs this replica has heard of, newest first.
     pub runs: Vec<RunView>,
+    /// Why this replica can only watch — no Base on this machine, a viewer's
+    /// role, a closed thread — or `None` when it can edit.
+    pub read_only: Option<String>,
     pub error: Option<String>,
 }
 
@@ -118,6 +132,7 @@ fn status_of<T: Transport>(
         files: replica.files().count(),
         held: replica.held_files(),
         runs: session.runs(),
+        read_only: session.read_only(),
         error,
     }
 }
@@ -136,11 +151,10 @@ enum Event {
 ///
 /// The command channel is unbounded because live Run frames arrive on it from
 /// the agent's emit path, which must never wait.
-pub async fn run<T: Transport, B: BlobSink>(
+pub async fn run<T: Transport>(
     mut session: ThreadSession<T>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     status: tokio::sync::watch::Sender<SyncStatus>,
-    blobs: B,
 ) {
     let mut active: HashMap<String, (ActiveRun, RunWorktree)> = HashMap::new();
     let mut watcher = None;
@@ -180,30 +194,36 @@ pub async fn run<T: Transport, B: BlobSink>(
                 Ok(())
             }
             Event::Command(Some(Command::PrepareRun { worktree, reply })) => {
-                let worktree = session.run_worktree(&worktree);
-                let result = session.prepare_run(&worktree);
+                let result = session
+                    .run_worktree(&worktree)
+                    .and_then(|worktree| session.prepare_run(&worktree).map(|()| worktree));
                 let _ = reply.send(
                     result
                         .as_ref()
-                        .map(|()| worktree.root().to_path_buf())
+                        .map(|worktree| worktree.root().to_path_buf())
                         .map_err(ToString::to_string),
                 );
-                result
+                result.map(|_| ())
             }
             Event::Command(Some(Command::StartRun {
                 worktree,
                 spec,
                 reply,
             })) => {
-                let worktree = session.run_worktree(&worktree);
-                let result = session.start_run(&worktree, spec).await;
-                let answer = result.as_ref().map(|run| RunStarted {
+                let result = match session.run_worktree(&worktree) {
+                    Ok(worktree) => session
+                        .start_run(&worktree, spec)
+                        .await
+                        .map(|run| (run, worktree)),
+                    Err(e) => Err(e),
+                };
+                let answer = result.as_ref().map(|(run, _)| RunStarted {
                     run_id: run.run_id.clone(),
                     run_no: run.run_no,
                     worktree: run.worktree.clone(),
                 });
                 let _ = reply.send(answer.map_err(std::string::ToString::to_string));
-                result.map(|run| {
+                result.map(|(run, worktree)| {
                     active.insert(run.run_id.clone(), (run, worktree));
                 })
             }
@@ -220,7 +240,7 @@ pub async fn run<T: Transport, B: BlobSink>(
             Event::Command(Some(Command::FinishRun { run_id, reply })) => {
                 match active.remove(&run_id) {
                     Some((run, worktree)) => {
-                        let result = session.finish_run(&run, &worktree, &blobs).await;
+                        let result = session.finish_run(&run, &worktree).await;
                         let text = result
                             .as_ref()
                             .map(Clone::clone)
@@ -265,7 +285,13 @@ pub async fn run<T: Transport, B: BlobSink>(
                 result.map(|_| ())
             }
         };
-        let error = outcome.err().map(|e| e.to_string());
+        let mut error = outcome.err().map(|e| e.to_string());
+        // Somebody lacks the Base and this replica may hold it (ATL-402).
+        for want in session.take_bundle_wants() {
+            if let Err(e) = session.serve_bundle(want).await {
+                error.get_or_insert_with(|| format!("could not send the Base: {e}"));
+            }
+        }
         if let Some(e) = &error {
             tracing::warn!(target: "atlas_thread_sync", "thread sync: {e}");
         }

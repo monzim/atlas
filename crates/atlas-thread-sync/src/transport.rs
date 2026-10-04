@@ -17,10 +17,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use base64::Engine as _;
 
-use crate::session::BlobSink;
+use crate::store::FakeStore;
 use crate::wire::{
-    self, ClientControl, FileVersion, Frame, FrameKind, MergedFile, Role, RunOutcome,
-    ServerControl, ThreadRun, TreeEntry,
+    self, BundleFailure, ClientControl, FileVersion, Frame, FrameKind, MergedFile, Role,
+    RunOutcome, ServerControl, ThreadRun, TreeEntry,
 };
 
 /// One message on the socket.
@@ -153,6 +153,11 @@ struct Hub {
     run_frames_relayed: u64,
     /// Another Runner's merge to land just before the next submit is read.
     racing_merge: Option<(u64, Vec<u8>)>,
+    /// The thread's object doors, shared with the tests.
+    store: FakeStore,
+    /// Open bundle requests: the id, and the connection that asked.
+    bundle_requests: HashMap<String, u64>,
+    next_request: u64,
 }
 
 struct FakeRun {
@@ -249,35 +254,15 @@ impl FakeThreadServer {
     pub fn run_frames_relayed(&self) -> u64 {
         self.hub.lock().expect("hub").run_frames_relayed
     }
-}
 
-/// An in-memory stand-in for the thread's blob door.
-#[derive(Clone, Default)]
-pub struct FakeBlobs {
-    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-}
-
-impl FakeBlobs {
-    pub fn get(&self, sha256: &str) -> Option<Vec<u8>> {
-        self.blobs.lock().expect("blobs").get(sha256).cloned()
+    /// The thread's object doors: what replicas upload, and download.
+    pub fn store(&self) -> FakeStore {
+        self.hub.lock().expect("hub").store.clone()
     }
 
-    pub fn len(&self) -> usize {
-        self.blobs.lock().expect("blobs").len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl BlobSink for FakeBlobs {
-    async fn put(&self, sha256: &str, bytes: Vec<u8>) -> Result<(), String> {
-        self.blobs
-            .lock()
-            .map_err(|_| "poisoned".to_string())?
-            .insert(sha256.to_string(), bytes);
-        Ok(())
+    /// The tree as the server holds it.
+    pub fn tree(&self) -> Vec<TreeEntry> {
+        self.hub.lock().expect("hub").tree.clone()
     }
 }
 
@@ -451,10 +436,117 @@ impl Hub {
                         c.client = Some(client_id);
                     }
                 }
+                Ok(ClientControl::BundleRequest { client_seq, have }) => {
+                    if client.is_none() {
+                        return;
+                    }
+                    self.next_request += 1;
+                    let request_id = format!("request-{}", self.next_request);
+                    self.reply(
+                        conn,
+                        &ServerControl::BundlePending {
+                            client_seq,
+                            request_id: request_id.clone(),
+                        },
+                    );
+                    let held: std::collections::HashSet<&String> = have.iter().collect();
+                    let cached = self
+                        .store
+                        .bundles()
+                        .into_iter()
+                        .find(|(_, b)| b.prerequisites.iter().all(|p| held.contains(p)));
+                    if let Some((sha, bundle)) = cached {
+                        return self.reply(
+                            conn,
+                            &ServerControl::BundleAvailable {
+                                request_id,
+                                sha,
+                                bytes: bundle.bytes.len() as u64,
+                            },
+                        );
+                    }
+                    let wanted = ServerControl::BundleWanted {
+                        request_id: request_id.clone(),
+                        have,
+                    };
+                    let builders: Vec<u64> = self
+                        .conns
+                        .iter()
+                        .filter(|(id, c)| **id != conn && c.client.is_some())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if builders.is_empty() {
+                        return self.reply(
+                            conn,
+                            &ServerControl::BundleUnavailable {
+                                request_id,
+                                reason: BundleFailure::NoReplicaOnline,
+                                bytes: None,
+                            },
+                        );
+                    }
+                    self.bundle_requests.insert(request_id, conn);
+                    for b in builders {
+                        self.reply(b, &wanted);
+                    }
+                }
+                Ok(ClientControl::BundleReady {
+                    client_seq,
+                    request_id,
+                    sha,
+                }) => {
+                    let Some(bundle) = self.store.bundle(&sha) else {
+                        return self.nack(conn, client_seq, "blob_missing");
+                    };
+                    self.reply(
+                        conn,
+                        &ServerControl::Ack {
+                            client_seq,
+                            seq: self.head(),
+                            file_id: None,
+                        },
+                    );
+                    if let Some(asker) = self.bundle_requests.remove(&request_id) {
+                        self.reply(
+                            asker,
+                            &ServerControl::BundleAvailable {
+                                request_id,
+                                sha,
+                                bytes: bundle.bytes.len() as u64,
+                            },
+                        );
+                    }
+                }
+                Ok(ClientControl::BundleFailed {
+                    client_seq,
+                    request_id,
+                    reason,
+                    bytes,
+                }) => {
+                    self.reply(
+                        conn,
+                        &ServerControl::Ack {
+                            client_seq,
+                            seq: self.head(),
+                            file_id: None,
+                        },
+                    );
+                    if let Some(asker) = self.bundle_requests.remove(&request_id) {
+                        self.reply(
+                            asker,
+                            &ServerControl::BundleUnavailable {
+                                request_id,
+                                reason,
+                                bytes: Some(bytes),
+                            },
+                        );
+                    }
+                }
                 Ok(ClientControl::TreeEnsure {
                     client_seq,
                     path,
                     kind,
+                    ..
                 }) => {
                     let Some(client) = client else { return };
                     if let Some(existing) = self.tree.iter().find(|e| e.path == path) {

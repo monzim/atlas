@@ -131,3 +131,209 @@ pub fn reset_worktree(root: &Path, sha: &str) -> Result<(), GitError> {
     run(root, &["reset", "--hard", "--quiet", sha])?;
     run(root, &["clean", "-d", "--force", "--quiet"]).map(|_| ())
 }
+
+// ---------------------------------------------------------------------------
+// Bundles and the thread's own repository (ATL-402)
+// ---------------------------------------------------------------------------
+
+/// `run` with `stdin`, answering the exit code too: some commands
+/// (`check-ignore`) report "nothing matched" as a failure status.
+fn run_with_input(
+    repo: &Path,
+    config: &[String],
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<(Option<i32>, Vec<u8>, String), GitError> {
+    use std::io::Write as _;
+    let mut command = atlas_process::command("git");
+    for c in config {
+        command.arg("-c").arg(c);
+    }
+    let mut child = command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut input) = child.stdin.take() {
+        input.write_all(stdin)?;
+    }
+    let output = child.wait_with_output()?;
+    Ok((
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
+/// The object directory of `repo` — the common one, for a worktree.
+pub fn objects_dir(repo: &Path) -> Result<std::path::PathBuf, GitError> {
+    let out = run(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+    )?;
+    Ok(std::path::PathBuf::from(
+        String::from_utf8_lossy(&out).trim().to_string(),
+    ))
+}
+
+/// Create a bare repository at `dir` if there is none.
+pub fn init_bare(dir: &Path) -> Result<(), GitError> {
+    std::fs::create_dir_all(dir)?;
+    if dir.join("HEAD").exists() {
+        return Ok(());
+    }
+    run(dir, &["init", "--bare", "--quiet", "."]).map(|_| ())
+}
+
+/// Point a ref at a commit.
+pub fn update_ref(repo: &Path, name: &str, sha: &str) -> Result<(), GitError> {
+    let sha = checked(sha)?;
+    run(repo, &["update-ref", name, sha]).map(|_| ())
+}
+
+/// The commit a ref names, if it exists.
+pub fn resolve_ref(repo: &Path, name: &str) -> Option<String> {
+    let out = run(repo, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]).ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// The commits a joiner already holds, to ask for a thin bundle against: its
+/// `HEAD` and the tips of its branches and remote-tracking branches, newest
+/// first, at most `limit`.
+pub fn have_commits(repo: &Path, limit: usize) -> Vec<String> {
+    let mut have = Vec::new();
+    if let Ok(head) = head_commit(repo) {
+        have.push(head);
+    }
+    if let Ok(out) = run(
+        repo,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(objectname) %(objecttype)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    ) {
+        for line in String::from_utf8_lossy(&out).lines() {
+            if let Some((sha, "commit")) = line.split_once(' ') {
+                have.push(sha.to_string());
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    have.retain(|sha| is_commit_sha(sha) && seen.insert(sha.clone()));
+    have.truncate(limit);
+    have
+}
+
+/// The commits a bundle of `tip` built against `have` will require: the
+/// boundary `rev-list` draws. `have` commits this repository does not hold are
+/// left out — git would refuse to name them.
+pub fn boundary(repo: &Path, tip: &str, have: &[String]) -> Result<Vec<String>, GitError> {
+    let tip = checked(tip)?;
+    let known: Vec<&str> = have
+        .iter()
+        .filter(|sha| has_commit(repo, sha))
+        .map(String::as_str)
+        .collect();
+    let mut args = vec!["rev-list", "--boundary", tip];
+    if !known.is_empty() {
+        args.push("--not");
+        args.extend(known.iter().copied());
+    }
+    let out = run(repo, &args)?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| line.strip_prefix('-'))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Write a bundle of `refname` to `file`, without the history `have` already
+/// covers (only commits this repository holds are used).
+pub fn bundle_create(
+    repo: &Path,
+    file: &Path,
+    refname: &str,
+    have: &[String],
+) -> Result<(), GitError> {
+    let file = file.to_string_lossy();
+    let known: Vec<&str> = have
+        .iter()
+        .filter(|sha| has_commit(repo, sha))
+        .map(String::as_str)
+        .collect();
+    let mut args = vec!["bundle", "create", "--quiet", file.as_ref(), refname];
+    if !known.is_empty() {
+        args.push("--not");
+        args.extend(known.iter().copied());
+    }
+    run(repo, &args).map(|_| ())
+}
+
+/// Fetch `refname` out of the bundle at `file` into the same ref here. Fails
+/// when the bundle needs history this repository (with its alternates) lacks.
+pub fn fetch_bundle(repo: &Path, file: &Path, refname: &str) -> Result<(), GitError> {
+    let file = file.to_string_lossy();
+    let spec = format!("+{refname}:{refname}");
+    run(
+        repo,
+        &["fetch", "--quiet", "--no-tags", "--", file.as_ref(), &spec],
+    )
+    .map(|_| ())
+}
+
+/// Which of `paths` git ignores in the working tree at `root` — `.gitignore`,
+/// `.git/info/exclude` and the person's global excludes — and, when `extra`
+/// is given, also the patterns in that file (`.atlas/shareignore`). Tracked
+/// files are checked too: a file ignored for sharing is ignored even if it is
+/// committed.
+pub fn ignored(
+    root: &Path,
+    paths: &[String],
+    extra: Option<&Path>,
+) -> Result<std::collections::HashSet<String>, GitError> {
+    let mut out = std::collections::HashSet::new();
+    if paths.is_empty() {
+        return Ok(out);
+    }
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p.as_bytes());
+        input.push(0);
+    }
+    // The person's own excludes, then the share-only file. `core.excludesFile`
+    // replaces the global file rather than adding to it, hence two passes.
+    let mut passes = vec![Vec::new()];
+    if let Some(extra) = extra.filter(|p| p.is_file()) {
+        passes.push(vec![format!("core.excludesFile={}", extra.display())]);
+    }
+    for config in passes {
+        let (code, stdout, stderr) = run_with_input(
+            root,
+            &config,
+            &["check-ignore", "--no-index", "-z", "--stdin"],
+            &input,
+        )?;
+        match code {
+            Some(0) => {}
+            // Nothing matched.
+            Some(1) => continue,
+            _ => {
+                return Err(GitError::Failed {
+                    args: "check-ignore".into(),
+                    stderr,
+                })
+            }
+        }
+        for name in stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+            out.insert(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    Ok(out)
+}

@@ -3,6 +3,7 @@ import {
   Bot,
   Check,
   Copy,
+  Eye,
   FolderOpen,
   Link2,
   LogOut,
@@ -23,14 +24,17 @@ import {
   joinThread,
   leaveThread,
   openThread,
+  previewShare,
   runWorktree,
   shareThread,
   sharedThreadError,
+  type ShareFile,
   type SharedThreadError,
   type SharedThreadRun,
   type SharedThreadView,
 } from "../lib/shared-threads-api";
 import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
+import { SharePreviewList, uploads } from "./share-preview";
 
 /** What the chat pane knows about the thread it shows. */
 export interface ShareTarget {
@@ -68,9 +72,27 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
   const shared = useSharedThreadsStore.use.shared();
   const current = useSharedThreadFor(target.sessionId);
 
-  const [busy, setBusy] = useState<"share" | "join" | null>(null);
+  const [busy, setBusy] = useState<"preview" | "share" | "join" | null>(null);
   const [error, setError] = useState<SharedThreadError | null>(null);
   const [link, setLink] = useState("");
+  /** The share dialog's file list, once asked for; `null` before. */
+  const [preview, setPreview] = useState<ShareFile[] | null>(null);
+  /** Blocked files the person chose to include anyway. */
+  const [include, setInclude] = useState<string[]>([]);
+
+  async function review() {
+    if (!target.projectPath) return;
+    setBusy("preview");
+    setError(null);
+    try {
+      setPreview(await previewShare(target.projectPath));
+      setInclude([]);
+    } catch (e) {
+      setError(sharedThreadError(e));
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function share() {
     if (!target.sessionId || !target.projectPath) return;
@@ -81,8 +103,10 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
         sessionId: target.sessionId,
         projectPath: target.projectPath,
         title: target.title,
+        include,
       });
       shared(target.sessionId, view);
+      setPreview(null);
     } catch (e) {
       setError(sharedThreadError(e));
     } finally {
@@ -123,19 +147,44 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
           </div>
           <p className="leading-relaxed text-[var(--muted-foreground)]">
             Teammates on this project can work in it with you, live. Your checked-out commit becomes
-            the starting point and your uncommitted changes are uploaded as its first changes.{" "}
-            <span className="text-[var(--secondary-foreground)]">
-              Your repository is not uploaded
-            </span>
-            , and files that look like secrets stay on this machine.
+            the starting point and your uncommitted changes are uploaded as its first changes.
           </p>
-          <Button
-            size="sm"
-            onClick={share}
-            disabled={busy !== null || !target.sessionId || !target.projectPath}
-          >
-            {busy === "share" ? "Sharing…" : "Share thread"}
-          </Button>
+          {preview === null ? (
+            <Button
+              size="sm"
+              onClick={review}
+              disabled={busy !== null || !target.sessionId || !target.projectPath}
+            >
+              {busy === "preview" ? "Reading changes…" : "Share thread…"}
+            </Button>
+          ) : (
+            <>
+              <SharePreviewList
+                files={preview}
+                include={include}
+                onToggle={(path, on) =>
+                  setInclude((now) => (on ? [...now, path] : now.filter((p) => p !== path)))
+                }
+              />
+              <div className="flex gap-1.5">
+                <Button size="sm" className="flex-1" onClick={share} disabled={busy !== null}>
+                  {busy === "share"
+                    ? "Sharing…"
+                    : `Share with ${uploads(preview, include).length} ${
+                        uploads(preview, include).length === 1 ? "file" : "files"
+                      }`}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setPreview(null)}
+                  disabled={busy !== null}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </>
+          )}
           {!target.sessionId && (
             <p className="text-[var(--muted-foreground)]">
               Send a message first — a draft has nothing to share yet.
@@ -259,7 +308,7 @@ function ThreadCard({
     }
   }
 
-  const mayRun = thread.role !== "viewer";
+  const mayRun = thread.role !== "viewer" && status.readOnly === null;
 
   return (
     <div
@@ -286,6 +335,15 @@ function ThreadCard({
         </span>
         <span>{status.materialized ? "Checked out" : "Not checked out yet"}</span>
       </div>
+      {status.readOnly && (
+        <p className="flex items-start gap-1.5 rounded bg-[var(--atlas-element-hover)] p-2 text-[var(--secondary-foreground)]">
+          <Eye size={12} className="mt-px shrink-0" />
+          <span>
+            <span className="font-medium text-[var(--foreground)]">Watching only.</span>{" "}
+            {status.readOnly}
+          </span>
+        </p>
+      )}
       {status.error && <p className="text-warning">{status.error}</p>}
       {status.held.length > 0 && (
         <div className="flex flex-col gap-1 rounded bg-warning-muted p-2 text-warning">
@@ -340,7 +398,12 @@ function ThreadCard({
           {copied ? <Check size={11} /> : <Copy size={11} />}
           {copied ? "Copied" : "Copy link"}
         </Button>
-        <Button size="xs" variant="outline" onClick={() => void open()} disabled={opening}>
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={() => void open()}
+          disabled={opening}
+        >
           <FolderOpen size={11} />
           {status.materialized ? "Show replica" : opening ? "Checking out…" : "Check out replica"}
         </Button>

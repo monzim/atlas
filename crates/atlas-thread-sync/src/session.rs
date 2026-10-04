@@ -6,23 +6,26 @@
 //! a lost ack is recognised by the server and stored once.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::git;
 use crate::merge::{self, MergeError};
-use crate::replica::{looks_textual, LocalChange, Replica, ReplicaError};
+use crate::replica::{LocalChange, Replica, ReplicaError};
 use crate::runs::{ActiveRun, Fork, RunReport, RunSpec, RunWorktree};
 use crate::secrets::{secret_reason, SecretReason};
+use crate::share::{self, ShareKind};
+use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{
-    self, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergeFile, Role, RunOutcome,
-    ServerControl, ThreadRun,
+    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergeFile, Role,
+    RunOutcome, ServerControl, ThreadRun,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,12 +47,37 @@ pub enum SessionError {
     Overlap(Vec<(String, Vec<std::ops::Range<usize>>)>),
     #[error("the merge was rejected {0} times in a row; try again")]
     MergeStarved(u32),
+    #[error(transparent)]
+    Bootstrap(#[from] BootstrapError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// This replica may only watch, and why — said to the person as is.
+    #[error("{0}")]
+    ReadOnly(String),
 }
 
-/// Where a Run's resulting blobs go for its Thread Version: the thread's blob
-/// door (`PUT /threads/{id}/blobs/{sha256}`) in the app, a map in tests.
-pub trait BlobSink: Send + Sync {
-    fn put(&self, sha256: &str, bytes: Vec<u8>) -> impl Future<Output = Result<(), String>> + Send;
+/// How joining went for a machine without the Base (ATL-402).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bootstrapped {
+    /// The Base is here: the replica can be checked out and edited.
+    Ready,
+    /// It is not, and will not be for now; the replica follows the thread
+    /// read-only. The reason is for the person.
+    WatchOnly(String),
+}
+
+/// Somebody else needs the Base; this replica may be able to build it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleWant {
+    pub request_id: String,
+    pub have: Vec<String>,
+}
+
+/// The answer a `bundle.request` is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BundleAnswer {
+    Available { sha: String },
+    Unavailable { reason: BundleFailure, bytes: Option<u64> },
 }
 
 /// What the app hears about besides status: other people's live Run frames.
@@ -100,6 +128,10 @@ enum Answer {
 /// How long to wait for the server's answer to something we asked.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a joiner waits for somebody to build and upload a bundle. Large
+/// histories take a while to pack.
+const BUNDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// What sharing the sharer's working changes did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ShareReport {
@@ -127,6 +159,19 @@ pub struct ThreadSession<T: Transport> {
     awaiting: HashSet<u64>,
     answers: HashMap<u64, Answer>,
     events: Option<mpsc::UnboundedSender<ThreadEvent>>,
+    /// The thread's object doors.
+    store: Arc<dyn ObjectStore>,
+    /// This machine's bare repository for the thread, where bundles are built
+    /// and fetched (ATL-402).
+    thread_repo: Option<ThreadRepo>,
+    /// Our own `bundle.request`: its `client_seq`, the id the server gave it,
+    /// and the answer once it came.
+    bundle_request: Option<(u64, Option<String>)>,
+    bundle_answer: Option<BundleAnswer>,
+    /// Requests from others this replica has not served yet.
+    wanted: Vec<BundleWant>,
+    /// Why this replica can only watch, when it can.
+    watch_only: Option<String>,
 }
 
 impl<T: Transport> ThreadSession<T> {
@@ -164,6 +209,12 @@ impl<T: Transport> ThreadSession<T> {
             awaiting: HashSet::new(),
             answers: HashMap::new(),
             events: None,
+            store: Arc::new(NoStore),
+            thread_repo: None,
+            bundle_request: None,
+            bundle_answer: None,
+            wanted: Vec::new(),
+            watch_only: None,
         };
         loop {
             let message = tokio::time::timeout(ANSWER_TIMEOUT, session.transport.recv())
@@ -209,6 +260,186 @@ impl<T: Transport> ThreadSession<T> {
         self.events = Some(events);
     }
 
+    /// The thread's object doors: blobs, bundles and snapshots.
+    pub fn set_store(&mut self, store: Arc<dyn ObjectStore>) {
+        self.store = store;
+    }
+
+    /// This machine's bare repository for the thread (ATL-402).
+    pub fn set_thread_repo(&mut self, repo: ThreadRepo) {
+        self.thread_repo = Some(repo);
+    }
+
+    /// Why this replica may not change the thread, or `None` when it may.
+    pub fn read_only(&self) -> Option<String> {
+        if let Some(why) = &self.watch_only {
+            return Some(why.clone());
+        }
+        if !self.replica.has_base() {
+            return Some("This machine does not have the thread's starting commit yet.".into());
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap without a shared Base (ATL-402)
+    // -----------------------------------------------------------------------
+
+    /// Bring the Base onto this machine if it lacks it: report the commits
+    /// `own_repo` (the person's repository, if they have one) holds, wait for
+    /// a replica that has the Base to build and upload a bundle of the rest,
+    /// fetch it into the thread repository, and attach that to the replica.
+    ///
+    /// Answers [`Bootstrapped::WatchOnly`] — never an error — when no bundle
+    /// can come: nobody holding the Base is online, or the history is over
+    /// the Organisation's bundle limit. The replica then follows the thread
+    /// read-only and says why.
+    pub async fn bootstrap(&mut self, own_repo: Option<&Path>) -> Result<Bootstrapped, SessionError> {
+        if self.replica.has_base() {
+            return Ok(Bootstrapped::Ready);
+        }
+        let repo = self
+            .thread_repo
+            .clone()
+            .ok_or_else(|| SessionError::ReadOnly("no thread repository to fetch into".into()))?;
+        repo.ensure(own_repo)?;
+        if repo.has(self.replica.base()) {
+            self.replica.attach_repo(repo.path())?;
+            self.watch_only = None;
+            return Ok(Bootstrapped::Ready);
+        }
+        if self.role == Some(Role::Viewer) {
+            return Ok(self.watch_only_because(
+                "Viewers follow the thread without its repository history.".into(),
+            ));
+        }
+        let have = own_repo.map_or_else(Vec::new, |r| git::have_commits(r, bootstrap::MAX_HAVE));
+        let client_seq = self.take_client_seq();
+        self.bundle_request = Some((client_seq, None));
+        self.bundle_answer = None;
+        self.awaiting.insert(client_seq);
+        let sent = self.send_control(&ClientControl::BundleRequest { client_seq, have }).await;
+        let answer = match sent {
+            Ok(()) => self.await_bundle(client_seq).await,
+            Err(e) => Err(e),
+        };
+        self.awaiting.remove(&client_seq);
+        self.bundle_request = None;
+        let answer = match answer? {
+            Some(answer) => answer,
+            None => {
+                return Ok(self.watch_only_because(
+                    "Nobody who has this thread's starting commit sent it in time. You can watch; join again to edit."
+                        .into(),
+                ))
+            }
+        };
+        let sha = match answer {
+            BundleAnswer::Available { sha } => sha,
+            BundleAnswer::Unavailable {
+                reason: BundleFailure::TooLarge,
+                bytes,
+            } => {
+                let size = bytes.map_or_else(String::new, |b| format!(" ({} MB)", b.div_ceil(1024 * 1024)));
+                return Ok(self.watch_only_because(format!(
+                    "The repository history this thread needs{size} is over your organisation's Base bundle limit, so you can watch but not edit. Fetch the commit yourself and join again to edit."
+                )));
+            }
+            BundleAnswer::Unavailable { .. } => {
+                return Ok(self.watch_only_because(
+                    "Nobody who has this thread's starting commit is online to send it. You can watch; join again later to edit."
+                        .into(),
+                ))
+            }
+        };
+        let bytes = self.store.get_bundle(sha.clone()).await?;
+        let base = self.replica.base().to_string();
+        repo.install(&base, &sha, &bytes)?;
+        self.replica.attach_repo(repo.path())?;
+        self.watch_only = None;
+        Ok(Bootstrapped::Ready)
+    }
+
+    fn watch_only_because(&mut self, why: String) -> Bootstrapped {
+        self.watch_only = Some(why.clone());
+        Bootstrapped::WatchOnly(why)
+    }
+
+    /// Handle messages until our bundle request is answered, or give up after
+    /// [`BUNDLE_TIMEOUT`] (`None`).
+    async fn await_bundle(&mut self, client_seq: u64) -> Result<Option<BundleAnswer>, SessionError> {
+        let deadline = tokio::time::Instant::now() + BUNDLE_TIMEOUT;
+        loop {
+            if let Some(answer) = self.bundle_answer.take() {
+                return Ok(Some(answer));
+            }
+            if let Some(Answer::Nack { code, message }) = self.answers.remove(&client_seq) {
+                return Err(SessionError::Refused { code, message });
+            }
+            match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+                Err(_) => return Ok(None),
+                Ok(None) => return Err(SessionError::ClosedEarly),
+                Ok(Some(message)) => {
+                    self.handle(message).await?;
+                }
+            }
+        }
+    }
+
+    /// Bundle requests from others this replica has heard and not served.
+    pub fn take_bundle_wants(&mut self) -> Vec<BundleWant> {
+        std::mem::take(&mut self.wanted)
+    }
+
+    /// Build the bundle somebody asked for, upload it and say so — or, when it
+    /// is over the Organisation's limit, say that instead so they stop
+    /// waiting. A replica without the Base, or without a thread repository,
+    /// leaves the request to somebody else.
+    pub async fn serve_bundle(&mut self, want: BundleWant) -> Result<(), SessionError> {
+        let (Some(own), Some(repo)) = (self.replica.repo().map(Path::to_path_buf), self.thread_repo.clone())
+        else {
+            return Ok(());
+        };
+        repo.ensure(Some(&own))?;
+        let bundle = repo.build(self.replica.base(), &want.have)?;
+        let size = bundle.bytes.len() as u64;
+        let put = self
+            .store
+            .put_bundle(bundle.sha256.clone(), bundle.bytes, bundle.prerequisites)
+            .await;
+        let client_seq = self.take_client_seq();
+        let frame = match put {
+            Ok(()) => ClientControl::BundleReady {
+                client_seq,
+                request_id: want.request_id,
+                sha: bundle.sha256,
+            },
+            Err(StoreError::Refused { code, .. }) if code == "limit_reached" => {
+                ClientControl::BundleFailed {
+                    client_seq,
+                    request_id: want.request_id,
+                    reason: BundleFailure::TooLarge,
+                    bytes: size,
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match self.ask(client_seq, &frame).await? {
+            Answer::Ack => Ok(()),
+            Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    async fn send_control(&mut self, frame: &ClientControl) -> Result<(), SessionError> {
+        self.transport
+            .send(Message::Text(
+                serde_json::to_string(frame).expect("control frames are JSON"),
+            ))
+            .await?;
+        Ok(())
+    }
+
     /// The Runs this session has heard of, newest first.
     pub fn runs(&self) -> Vec<RunView> {
         let mut runs: Vec<RunView> = self.runs.values().cloned().collect();
@@ -226,8 +457,13 @@ impl<T: Transport> ThreadSession<T> {
     // -----------------------------------------------------------------------
 
     /// The Run worktree at `root`, of this replica's repository and Base.
-    pub fn run_worktree(&self, root: &Path) -> RunWorktree {
-        RunWorktree::new(self.replica.repo(), self.replica.base(), root)
+    /// Refused while this machine lacks the Base.
+    pub fn run_worktree(&self, root: &Path) -> Result<RunWorktree, SessionError> {
+        let repo = self
+            .replica
+            .repo()
+            .ok_or_else(|| ReplicaError::BaseMissing(self.replica.base().to_string()))?;
+        Ok(RunWorktree::new(repo, self.replica.base(), root))
     }
 
     /// Reset the Run worktree to canonical state now, creating it if needed.
@@ -310,11 +546,10 @@ impl<T: Transport> ThreadSession<T> {
     ///
     /// Overlapping hunks fail the merge with [`SessionError::Overlap`]; the
     /// Run is ended unmerged and its result stays in the worktree.
-    pub async fn finish_run<B: BlobSink>(
+    pub async fn finish_run(
         &mut self,
         run: &ActiveRun,
         worktree: &RunWorktree,
-        blobs: &B,
     ) -> Result<RunReport, SessionError> {
         let changes = worktree.changes(&run.fork)?;
         let mut report = RunReport::default();
@@ -430,7 +665,11 @@ impl<T: Transport> ThreadSession<T> {
                         view.files.clone_from(&report.files);
                     }
                     for ((_, _, path, merged), file) in planned.into_iter().zip(&files) {
-                        if let Err(e) = blobs.put(&file.blob, merged.content.into_bytes()).await {
+                        let put = self
+                            .store
+                            .put_blob(file.blob.clone(), merged.content.into_bytes())
+                            .await;
+                        if let Err(e) = put {
                             tracing::warn!(target: "atlas_thread_sync", %path, "Thread Version blob upload failed: {e}");
                             report.unuploaded.push(path);
                         }
@@ -484,15 +723,9 @@ impl<T: Transport> ThreadSession<T> {
         frame: &ClientControl,
     ) -> Result<Answer, SessionError> {
         self.awaiting.insert(client_seq);
-        let sent = self
-            .transport
-            .send(Message::Text(
-                serde_json::to_string(frame).expect("control frames are JSON"),
-            ))
-            .await;
-        if let Err(e) = sent {
+        if let Err(e) = self.send_control(frame).await {
             self.awaiting.remove(&client_seq);
-            return Err(e.into());
+            return Err(e);
         }
         let answer = loop {
             if let Some(answer) = self.answers.remove(&client_seq) {
@@ -587,6 +820,9 @@ impl<T: Transport> ThreadSession<T> {
     /// The person saved `rel` in the replica worktree, from any editor.
     /// Answers what it amounted to; an [`LocalChange::Echo`] sent nothing.
     pub async fn file_saved(&mut self, rel: &str) -> Result<LocalChange, SessionError> {
+        if self.read_only().is_some() {
+            return Ok(LocalChange::Ignored);
+        }
         match self.replica.local_change(rel)? {
             LocalChange::Update { file_id, update } => {
                 self.send_update(file_id, update).await?;
@@ -596,6 +832,11 @@ impl<T: Transport> ThreadSession<T> {
                 })
             }
             LocalChange::NewFile { path } => {
+                // Build output, dependencies and whatever `.atlas/shareignore`
+                // names never sync, wherever they are written.
+                if self.ignores(&path)? {
+                    return Ok(LocalChange::Ignored);
+                }
                 // A credential created in the replica stays on this machine,
                 // for the same reason it is held back at share time.
                 let content = self.replica.read_disk(&path)?;
@@ -614,40 +855,75 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Make the sharer's uncommitted work the thread's first canonical changes:
-    /// every modified, added or untracked text file in `checkout` (ignored
-    /// files never appear; binary and deleted ones wait for ATL-403), except
-    /// files that look like secrets, which are held back and reported. The
-    /// person's checkout is only read.
+    /// exactly what [`share::preview`] lists for `checkout` — ignored and
+    /// `.atlas/shareignore`d files never appear — except files that look like
+    /// secrets, which are held back and reported unless named in `include`
+    /// ("include anyway"). The person's checkout is only read.
     pub async fn share_working_changes(
         &mut self,
         checkout: &Path,
+        include: &[String],
     ) -> Result<ShareReport, SessionError> {
+        let preview = share::preview(checkout)?;
         let mut report = ShareReport::default();
-        for dirty in git::dirty_paths(checkout).map_err(ReplicaError::from)? {
-            if dirty.deleted || !crate::path::is_valid(&dirty.path) {
+        for held in preview.held(include) {
+            if let Some(reason) = &held.blocked {
+                report.blocked.push((held.path.clone(), reason.clone()));
+            }
+        }
+        for file in preview.uploads(include) {
+            // Deleted and binary files are tree and blob changes (ATL-403).
+            if file.deleted || file.kind != ShareKind::Text {
                 continue;
             }
-            let Ok(target) = crate::path::resolve(checkout, &dirty.path) else {
-                continue;
-            };
+            let target = crate::path::resolve(checkout, &file.path).map_err(ReplicaError::from)?;
             let Ok(bytes) = std::fs::read(&target) else {
                 continue;
             };
-            if !looks_textual(&bytes) {
-                continue;
-            }
             let content = String::from_utf8_lossy(&bytes);
-            if let Some(reason) = secret_reason(&dirty.path, &content) {
-                report.blocked.push((dirty.path, reason));
-                continue;
-            }
-            let file_id = self.ensure_file(&dirty.path, true).await?;
+            let file_id = self.ensure_file(&file.path, true).await?;
             if let Some(update) = self.replica.set_text(file_id, &content)? {
                 self.send_update(file_id, update).await?;
             }
-            report.shared.push(dirty.path);
+            report.shared.push(file.path.clone());
         }
         Ok(report)
+    }
+
+    /// Does git, or the thread's `.atlas/shareignore`, ignore `path` in the
+    /// replica worktree?
+    fn ignores(&self, path: &str) -> Result<bool, SessionError> {
+        let root = self.replica.root();
+        let ignored = git::ignored(root, &[path.to_string()], Some(&root.join(share::SHAREIGNORE)))
+            .map_err(ReplicaError::from)?;
+        Ok(ignored.contains(path))
+    }
+
+    /// Upload a file's Base content under the thread before its tree entry
+    /// names it, so a reader without git can show the file's diff (ATL-402).
+    /// `Some(None)` for a file the Base does not have; `None` when it could
+    /// not be said — the upload failed, or this machine lacks the Base.
+    async fn upload_base(&self, path: &str) -> Option<Option<String>> {
+        if !self.replica.has_base() {
+            return None;
+        }
+        match self.replica.base_bytes(path) {
+            Ok(None) => Some(None),
+            Ok(Some(bytes)) => {
+                let sha = bootstrap::sha256_hex(&bytes);
+                match self.store.put_blob(sha.clone(), bytes).await {
+                    Ok(()) => Some(Some(sha)),
+                    Err(e) => {
+                        tracing::warn!(target: "atlas_thread_sync", %path, "Base blob upload failed: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "atlas_thread_sync", %path, "Base content unreadable: {e}");
+                None
+            }
+        }
     }
 
     /// The file's id in this thread, asking the server for an entry if it has
@@ -659,18 +935,20 @@ impl<T: Transport> ThreadSession<T> {
         if let Some(id) = self.replica.file_id(path) {
             return Ok(id);
         }
+        let base_blob = if introduced {
+            self.upload_base(path).await
+        } else {
+            None
+        };
         let client_seq = self.take_client_seq();
         self.pending_tree.insert(client_seq, path.to_string());
         let ensure = ClientControl::TreeEnsure {
             client_seq,
             path: path.to_string(),
             kind: FileKind::Text,
+            base_blob,
         };
-        self.transport
-            .send(Message::Text(
-                serde_json::to_string(&ensure).expect("tree.ensure is JSON"),
-            ))
-            .await?;
+        self.send_control(&ensure).await?;
         let file_id = loop {
             if let Some(id) = self.replica.file_id(path) {
                 break id;
@@ -709,6 +987,10 @@ impl<T: Transport> ThreadSession<T> {
         self.transport.send(Message::Binary(bytes)).await?;
         self.updates_sent += 1;
         Ok(())
+    }
+
+    fn is_our_bundle(&self, request_id: &str) -> bool {
+        matches!(&self.bundle_request, Some((_, Some(id))) if id == request_id)
     }
 
     fn take_client_seq(&mut self) -> u64 {
@@ -815,6 +1097,35 @@ impl<T: Transport> ThreadSession<T> {
                         }
                         if let Some(view) = self.runs.get_mut(&run_id) {
                             view.files = paths;
+                        }
+                    }
+                    ServerControl::BundleWanted { request_id, have } => {
+                        self.wanted.push(BundleWant { request_id, have });
+                    }
+                    ServerControl::BundlePending {
+                        client_seq,
+                        request_id,
+                    } => {
+                        if let Some((ours, id)) = &mut self.bundle_request {
+                            if *ours == client_seq {
+                                *id = Some(request_id);
+                            }
+                        }
+                    }
+                    ServerControl::BundleAvailable {
+                        request_id, sha, ..
+                    } => {
+                        if self.is_our_bundle(&request_id) {
+                            self.bundle_answer = Some(BundleAnswer::Available { sha });
+                        }
+                    }
+                    ServerControl::BundleUnavailable {
+                        request_id,
+                        reason,
+                        bytes,
+                    } => {
+                        if self.is_our_bundle(&request_id) {
+                            self.bundle_answer = Some(BundleAnswer::Unavailable { reason, bytes });
                         }
                     }
                     ServerControl::Other => {}

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use atlas_thread_sync::{
-    run, transport::FakeBlobs, Command as SyncCommand, FakeThreadServer, FakeTransport,
+    run, Command as SyncCommand, FakeThreadServer, FakeTransport,
     LocalChange, Replica, ReplicaError, SecretReason, SyncStatus, ThreadSession,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -21,7 +21,7 @@ async fn sharer_work_reaches_a_joiner_who_already_has_the_base() {
     let server = FakeThreadServer::new();
 
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    let report = joy.share_working_changes(&w.joy).await.unwrap();
+    let report = joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut shared = report.shared.clone();
     shared.sort();
     assert_eq!(
@@ -73,7 +73,7 @@ async fn saves_from_any_editor_converge_both_ways_without_echo() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut monzim = open(
         &server,
         &w.monzim,
@@ -135,7 +135,7 @@ async fn concurrent_saves_to_one_file_merge() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut monzim = open(
         &server,
         &w.monzim,
@@ -173,7 +173,7 @@ async fn a_save_racing_a_remote_change_is_kept() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut monzim = open(
         &server,
         &w.monzim,
@@ -219,7 +219,7 @@ async fn a_reconnecting_replica_does_not_reuse_client_seqs() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let head = server.head();
     drop(joy);
 
@@ -240,7 +240,7 @@ async fn the_run_loop_syncs_watched_saves_and_never_echoes() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let monzim = open(
         &server,
         &w.monzim,
@@ -253,7 +253,7 @@ async fn the_run_loop_syncs_watched_saves_and_never_echoes() {
     let spawn = |session: ThreadSession<FakeTransport>| {
         let (commands, rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(SyncStatus::default());
-        tokio::spawn(run(session, rx, status_tx, FakeBlobs::default()));
+        tokio::spawn(run(session, rx, status_tx));
         (commands, status)
     };
     let materialize = |commands: mpsc::UnboundedSender<SyncCommand>| async move {
@@ -328,7 +328,7 @@ async fn a_secret_pasted_into_a_tracked_file_is_held_then_merged_when_removed() 
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    joy.share_working_changes(&w.joy).await.unwrap();
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let mut monzim = open(
         &server,
         &w.monzim,

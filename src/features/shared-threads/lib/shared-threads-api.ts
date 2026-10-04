@@ -55,6 +55,11 @@ export interface SharedThreadStatus {
   held: string[];
   /** The thread's Runs, newest first. */
   runs: SharedThreadRun[];
+  /**
+   * Why this replica can only watch — the Base never reached this machine,
+   * a viewer's role, a closed thread — or `null` when it can edit.
+   */
+  readOnly: string | null;
   error: string | null;
 }
 
@@ -62,6 +67,18 @@ export interface BlockedFile {
   path: string;
   /** `name`, or the secret categories the content matched. */
   reason: string;
+}
+
+/** One row of the share dialog (ATL-402): a file the share would upload. */
+export interface ShareFile {
+  path: string;
+  /** `text` is co-edited; `binary` (or over 1 MB) syncs as whole bytes. */
+  kind: "text" | "binary";
+  bytes: number;
+  /** Deleted in the working tree: the share deletes it in the thread. */
+  deleted: boolean;
+  /** Held back unless included anyway: `name`, or the secret categories matched. */
+  blocked: string | null;
 }
 
 export interface SharedThreadView {
@@ -72,8 +89,11 @@ export interface SharedThreadView {
   /** The commit the thread's canonical state starts from. */
   base: string;
   role: string;
-  /** The person's own checkout of the project. Only ever read. */
-  projectPath: string;
+  /**
+   * The person's own checkout of the project, when they have one. Only ever
+   * read. `null` for somebody who joined with no copy of the repository.
+   */
+  projectPath: string | null;
   clientId: string;
   /** What to send a teammate. */
   link: string;
@@ -101,12 +121,33 @@ export function sharedThreadError(e: unknown): SharedThreadError {
   return { code: "unknown", message: e instanceof Error ? e.message : String(e) };
 }
 
-/** Share the thread behind an ACP session. Refused for a Local-mode project (`workspace_local`). */
-export function shareThread(args: { sessionId: string; projectPath: string; title: string }) {
+/**
+ * What sharing `projectPath` would upload, and what it holds back as
+ * secret-shaped. The dialog lists exactly these files. Only reads.
+ */
+export function previewShare(projectPath: string) {
+  return invoke<ShareFile[]>("shared_thread_share_preview", { projectPath });
+}
+
+/**
+ * Share the thread behind an ACP session. `include` names blocked files the
+ * person chose to include anyway. Refused for a Local-mode project
+ * (`workspace_local`).
+ */
+export function shareThread(args: {
+  sessionId: string;
+  projectPath: string;
+  title: string;
+  include: string[];
+}) {
   return invoke<SharedThreadView>("shared_thread_share", args);
 }
 
-/** Join from a teammate's link. `projectPath` narrows which local project to use. */
+/**
+ * Join from a teammate's link. `projectPath` narrows which local project to
+ * use; with none, or one without the thread's Base, the Base arrives as a
+ * bundle — or the thread is followed read-only and `status.readOnly` says why.
+ */
 export function joinThread(link: string, projectPath?: string) {
   return invoke<SharedThreadView>("shared_thread_join", { link, projectPath: projectPath ?? null });
 }

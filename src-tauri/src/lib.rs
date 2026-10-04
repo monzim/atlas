@@ -585,6 +585,7 @@ pub fn run() {
             commands::shared_threads::shared_thread_join,
             commands::shared_threads::shared_thread_open,
             commands::shared_threads::shared_thread_run_worktree,
+            commands::shared_threads::shared_thread_share_preview,
             commands::shared_threads::shared_thread_list,
             commands::shared_threads::shared_thread_leave,
             commands::artifacts_cloud::artifacts_cloud_retarget,

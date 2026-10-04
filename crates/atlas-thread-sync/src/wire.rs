@@ -206,6 +206,30 @@ pub enum ClientControl {
         client_seq: u64,
         path: String,
         kind: FileKind,
+        /// The file's Base content, uploaded as a blob first (ATL-402): its
+        /// hash, `Some(None)` when the Base has no such file, or absent when
+        /// this replica could not say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_blob: Option<Option<String>>,
+    },
+    /// This replica lacks the Base: `have` lists the commits it holds, so a
+    /// thin bundle can be built. Empty asks for a full one (ATL-402).
+    #[serde(rename = "bundle.request", rename_all = "camelCase")]
+    BundleRequest { client_seq: u64, have: Vec<String> },
+    /// The bundle somebody asked for is uploaded under `sha`.
+    #[serde(rename = "bundle.ready", rename_all = "camelCase")]
+    BundleReady {
+        client_seq: u64,
+        request_id: String,
+        sha: String,
+    },
+    /// The bundle built for somebody was over the Organisation's limit.
+    #[serde(rename = "bundle.failed", rename_all = "camelCase")]
+    BundleFailed {
+        client_seq: u64,
+        request_id: String,
+        reason: BundleFailure,
+        bytes: u64,
     },
     /// A Run begins (ADR-0022). This replica is its Runner.
     #[serde(rename = "run.start", rename_all = "camelCase")]
@@ -233,6 +257,16 @@ pub enum ClientControl {
         run_id: String,
         files: Vec<MergeFile>,
     },
+}
+
+/// Why no bundle is coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleFailure {
+    /// Over the Organisation's Base bundle limit.
+    TooLarge,
+    /// Nothing cached fits and nobody who could build one is online.
+    NoReplicaOnline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +385,26 @@ pub enum ServerControl {
         version: u64,
         files: Vec<MergedFile>,
     },
+    /// Somebody lacks the Base: build a bundle against `have`, upload it,
+    /// and say `bundle.ready` (ATL-402).
+    #[serde(rename = "bundle.wanted", rename_all = "camelCase")]
+    BundleWanted { request_id: String, have: Vec<String> },
+    /// The first answer to `bundle.request`; what follows names `request_id`.
+    #[serde(rename = "bundle.pending", rename_all = "camelCase")]
+    BundlePending { client_seq: u64, request_id: String },
+    #[serde(rename = "bundle.available", rename_all = "camelCase")]
+    BundleAvailable {
+        request_id: String,
+        sha: String,
+        bytes: u64,
+    },
+    #[serde(rename = "bundle.unavailable", rename_all = "camelCase")]
+    BundleUnavailable {
+        request_id: String,
+        reason: BundleFailure,
+        #[serde(default)]
+        bytes: Option<u64>,
+    },
     /// Any frame this client does not act on yet (presence, bundles, roles…):
     /// read and ignored rather than reported as unreadable.
     #[serde(other)]
@@ -447,6 +501,7 @@ mod tests {
             client_seq: 2,
             path: "src/a.ts".into(),
             kind: FileKind::Text,
+            base_blob: None,
         };
         assert_eq!(
             serde_json::to_value(&ensure).unwrap(),
@@ -520,9 +575,27 @@ mod tests {
         assert!(matches!(run, ServerControl::Run { ref run } if run.run_no == 1));
         // Frames this client does not act on are read, not reported unreadable.
         let presence: ServerControl =
-            serde_json::from_str(r#"{"t":"bundle.pending","clientSeq":1,"requestId":"r"}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"t":"presence.left","peerId":"p","userId":"u"}"#).unwrap();
         assert_eq!(presence, ServerControl::Other);
+        let unavailable: ServerControl = serde_json::from_str(
+            r#"{"t":"bundle.unavailable","requestId":"r","reason":"too_large","bytes":9}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unavailable,
+            ServerControl::BundleUnavailable {
+                request_id: "r".into(),
+                reason: BundleFailure::TooLarge,
+                bytes: Some(9)
+            }
+        );
+        let ensure = ClientControl::TreeEnsure {
+            client_seq: 3,
+            path: "a.ts".into(),
+            kind: FileKind::Text,
+            base_blob: Some(None),
+        };
+        assert_eq!(serde_json::to_value(&ensure).unwrap()["baseBlob"], serde_json::Value::Null);
         let entry: TreeEntry = serde_json::from_str(
             r#"{"fileId":1,"path":"a.ts","kind":"text","baseBlob":null,"mergeVersion":2}"#,
         )
