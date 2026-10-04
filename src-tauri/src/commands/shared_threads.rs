@@ -43,8 +43,8 @@ use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
-    Command as SyncCommand, Connector, ObjectStore, Replica, RunReport, RunSpec, SharePreview,
-    SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
+    Command as SyncCommand, Connector, ObjectStore, Replica, Resolve, RunReport, RunSpec,
+    SharePreview, SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -161,6 +161,9 @@ struct LiveRun {
     shared_thread_id: String,
     run_id: String,
     agent_id: AgentId,
+    /// The Conflict this Run was asked to resolve (ATL-410): its turn's end
+    /// resolves it with what the agent wrote, instead of merging.
+    resolves: Option<u64>,
 }
 
 impl LiveRun {
@@ -195,6 +198,8 @@ impl LiveRun {
 pub struct SharedThreadsState {
     running: Mutex<HashMap<String, Running>>,
     runs: Mutex<HashMap<String, LiveRun>>,
+    /// A Conflict the next Run in each thread is to resolve, by thread.
+    resolving: Mutex<HashMap<String, u64>>,
 }
 
 /// The delta sink, so a Run's start and end can be announced on the session
@@ -294,8 +299,7 @@ pub async fn shared_thread_share(
     let uploading = {
         let path = PathBuf::from(&project_path);
         tauri::async_runtime::spawn_blocking(move || {
-            atlas_thread_sync::share::preview(&path)
-                .map(|p| p.uploads(&include_now).count())
+            atlas_thread_sync::share::preview(&path).map(|p| p.uploads(&include_now).count())
         })
         .await
         .map_err(|e| SharedThreadError::new("internal", e.to_string()))?
@@ -606,8 +610,17 @@ pub async fn shared_thread_set_role(
     }
     let entry = entry_of(&app, &shared_thread_id)?;
     let token = token(&app).await?;
-    let url = thread_url(&entry, &format!("/participants/{}", path_segment(&user_id)?));
-    send_to(client()?.put(url).json(&serde_json::json!({ "role": role })), &token).await?;
+    let url = thread_url(
+        &entry,
+        &format!("/participants/{}", path_segment(&user_id)?),
+    );
+    send_to(
+        client()?
+            .put(url)
+            .json(&serde_json::json!({ "role": role })),
+        &token,
+    )
+    .await?;
     owner_view_of(&entry, &token).await
 }
 
@@ -620,7 +633,10 @@ pub async fn shared_thread_decline(
 ) -> Result<OwnerView> {
     let entry = entry_of(&app, &shared_thread_id)?;
     let token = token(&app).await?;
-    let url = thread_url(&entry, &format!("/participants/{}", path_segment(&user_id)?));
+    let url = thread_url(
+        &entry,
+        &format!("/participants/{}", path_segment(&user_id)?),
+    );
     send_to(client()?.delete(url), &token).await?;
     owner_view_of(&entry, &token).await
 }
@@ -672,7 +688,10 @@ fn path_segment(id: &str) -> Result<&str> {
     if ok {
         Ok(id)
     } else {
-        Err(SharedThreadError::new("bad_request", "That is not a user id."))
+        Err(SharedThreadError::new(
+            "bad_request",
+            "That is not a user id.",
+        ))
     }
 }
 
@@ -807,7 +826,9 @@ async fn start(
     // Under "approval required" a joiner waits as a viewer until the owner
     // says yes (ATL-406). Asking is idempotent: it answers the role as it is.
     if share.is_none() {
-        match post_json::<ServerJoin>(&thread_url(&entry, "/join"), &token, &serde_json::json!({})).await {
+        match post_json::<ServerJoin>(&thread_url(&entry, "/join"), &token, &serde_json::json!({}))
+            .await
+        {
             Ok(join) => session.set_awaiting_approval(join.pending),
             // Over the participant limit, or the like: the socket admitted
             // them as a viewer, and the status says so.
@@ -817,7 +838,10 @@ async fn start(
     // Without the Base the replica can only watch; a bundle fixes that. Not
     // getting one is not a failure — the status says why it is read-only.
     if !session.replica().has_base() {
-        session.bootstrap(own.as_deref()).await.map_err(session_error)?;
+        session
+            .bootstrap(own.as_deref())
+            .await
+            .map_err(session_error)?;
     }
     let mut shared_files = Vec::new();
     let mut blocked_files = Vec::new();
@@ -903,6 +927,21 @@ async fn start(
         blocked_files,
         run_worktree: run_worktree_of(app, &entry.shared_thread_id),
     };
+    // The Conflicts already open, which live frames will not repeat
+    // (ATL-410). Best effort: a failure leaves the list to the frames.
+    {
+        let entry = entry.clone();
+        let commands = commands.clone();
+        let token = token.clone();
+        tauri::async_runtime::spawn(async move {
+            match get_json::<ServerConflicts>(&thread_url(&entry, "/conflicts"), &token).await {
+                Ok(list) => {
+                    let _ = commands.send(SyncCommand::SeedConflicts(list.conflicts));
+                }
+                Err(e) => tracing::warn!(target: "shared_threads", "open Conflicts: {}", e.message),
+            }
+        });
+    }
     {
         let state = app.state::<SharedThreadsState>();
         let mut running = state.running.lock().map_err(|_| poisoned())?;
@@ -917,6 +956,132 @@ async fn start(
     }
     emit_all(app);
     Ok(view)
+}
+
+#[derive(Deserialize)]
+struct ServerConflicts {
+    conflicts: Vec<atlas_thread_sync::wire::ThreadConflict>,
+}
+
+// ---------------------------------------------------------------------------
+// Conflicts (ATL-410)
+// ---------------------------------------------------------------------------
+
+/// Resolve a Conflict on every replica: `side` is `canonical`, `run`,
+/// `both`, or `edited` with the person's `text`. Answers the Thread Version
+/// the resolution recorded.
+#[tauri::command]
+pub async fn shared_thread_resolve_conflict(
+    app: AppHandle,
+    shared_thread_id: String,
+    conflict_id: u64,
+    side: String,
+    text: Option<String>,
+) -> Result<u64> {
+    let choice = match (side.as_str(), text) {
+        ("canonical", _) => Resolve::Canonical,
+        ("run", _) => Resolve::Run,
+        ("both", _) => Resolve::Both,
+        ("edited", Some(text)) => Resolve::Edited(text),
+        _ => {
+            return Err(SharedThreadError::new(
+                "bad_request",
+                "Resolve with canonical, run, both, or edited text.",
+            ))
+        }
+    };
+    let commands = commands_for(&app, &shared_thread_id)?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::ResolveConflict {
+            conflict_id,
+            choice,
+            reply,
+        })
+        .map_err(|_| disconnected())?;
+    answer
+        .await
+        .map_err(|_| disconnected())?
+        .map_err(|e| SharedThreadError::new("resolve_failed", e))
+}
+
+/// Where and what to ask an agent so it resolves a Conflict.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentResolve {
+    /// The thread's Run worktree, holding canonical state now.
+    pub cwd: String,
+    pub prompt: String,
+}
+
+/// Ask an agent to resolve a Conflict (ATL-410). The resolution is itself a
+/// Run: the next prompt sent in this thread's Run worktree is marked as
+/// resolving `conflict_id`, and when its turn ends what the agent left in the
+/// hunk's lines becomes the resolution — nothing else it changed is merged.
+#[tauri::command]
+pub async fn shared_thread_ask_agent_to_resolve(
+    app: AppHandle,
+    shared_thread_id: String,
+    conflict_id: u64,
+) -> Result<AgentResolve> {
+    let conflict = {
+        let state = app.state::<SharedThreadsState>();
+        let running = state.running.lock().map_err(|_| poisoned())?;
+        running
+            .get(&shared_thread_id)
+            .and_then(|r| {
+                r.status
+                    .borrow()
+                    .conflicts
+                    .iter()
+                    .find(|c| c.conflict.conflict_id == conflict_id && c.conflict.status == "open")
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                SharedThreadError::new("conflict_unknown", "That Conflict is not open.")
+            })?
+    };
+    if conflict.conflict.binary {
+        return Err(SharedThreadError::new(
+            "bad_request",
+            "A binary file's Conflict takes one side or the other; an agent cannot merge it.",
+        ));
+    }
+    let cwd = shared_thread_run_worktree(app.clone(), shared_thread_id.clone()).await?;
+    app.state::<SharedThreadsState>()
+        .resolving
+        .lock()
+        .map_err(|_| poisoned())?
+        .insert(shared_thread_id, conflict_id);
+    Ok(AgentResolve {
+        cwd,
+        prompt: resolve_prompt(&conflict),
+    })
+}
+
+/// What an agent is asked: the hunk's three versions, and to rewrite only
+/// canonical's lines in place.
+fn resolve_prompt(view: &atlas_thread_sync::ConflictView) -> String {
+    let c = &view.conflict;
+    let line = c.lines.map_or(1, |l| l.start + 1);
+    format!(
+        "Resolve a merge conflict in `{path}` around line {line}.\n\n\
+         The file currently has this at that spot (keep editing there):\n```\n{canonical}```\n\n\
+         It started as:\n```\n{base}```\n\n\
+         A Run by {who}{agent} changed it to:\n```\n{run}```\n\n\
+         Replace the current lines with one version that keeps the intent of both changes. \
+         Edit only those lines of `{path}`; change nothing else.",
+        path = c.path,
+        canonical = c.canonical.as_deref().unwrap_or(""),
+        base = c.base.as_deref().unwrap_or(""),
+        run = c.run.as_deref().unwrap_or(""),
+        who = view.run_by.as_deref().unwrap_or("a teammate"),
+        agent = view
+            .run_agent
+            .as_deref()
+            .map(|a| format!(" ({a})"))
+            .unwrap_or_default(),
+    )
 }
 
 fn commands_for(
@@ -995,6 +1160,11 @@ pub async fn begin_run(
     tag_session(app, session_id, &shared_thread_id);
     {
         let state = app.state::<SharedThreadsState>();
+        let resolves = state
+            .resolving
+            .lock()
+            .map_err(|_| poisoned().message)?
+            .remove(&shared_thread_id);
         let mut runs = state.runs.lock().map_err(|_| poisoned().message)?;
         runs.insert(
             session_id.to_string(),
@@ -1002,6 +1172,7 @@ pub async fn begin_run(
                 shared_thread_id: shared_thread_id.clone(),
                 run_id: started.run_id.clone(),
                 agent_id: *agent_id,
+                resolves,
             },
         );
     }
@@ -1133,6 +1304,7 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
                 let (reply, answer) = oneshot::channel();
                 let _ = commands.send(SyncCommand::FinishRun {
                     run_id: run.run_id.clone(),
+                    resolves: run.resolves,
                     reply: Some(reply),
                 });
                 let result = answer

@@ -19,8 +19,9 @@ use base64::Engine as _;
 
 use crate::store::FakeStore;
 use crate::wire::{
-    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergedFile, Role,
-    RunOutcome, ServerControl, ThreadRun, TreeEntry,
+    self, BundleFailure, ClientControl, ConflictInvolved, ConflictResolution, FileKind,
+    FileVersion, Frame, FrameKind, MergedFile, RaisedConflict, Role, RunOutcome, ServerControl,
+    ThreadConflict, ThreadRun, TreeEntry,
 };
 
 /// One message on the socket.
@@ -226,6 +227,9 @@ struct Hub {
     owner: Option<String>,
     /// Closed: every write is refused until it is reopened.
     thread_closed: bool,
+    /// Conflicts merges held back (ATL-410), with who resolved each and by
+    /// which frame, for idempotent resends.
+    conflicts: Vec<(ThreadConflict, Option<(String, String, u64, ServerControl)>)>,
 }
 
 struct FakeRun {
@@ -314,6 +318,17 @@ impl FakeThreadServer {
     }
 
     /// The Runs the server holds, by `runNo`.
+    /// The Conflicts merges raised, oldest first.
+    pub fn conflicts(&self) -> Vec<ThreadConflict> {
+        self.hub
+            .lock()
+            .expect("hub")
+            .conflicts
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+
     pub fn runs(&self) -> Vec<ThreadRun> {
         self.hub
             .lock()
@@ -1224,10 +1239,100 @@ impl Hub {
                 );
                 self.broadcast(&ServerControl::Run { run });
             }
+            Ok(ClientControl::ConflictResolve {
+                client_seq,
+                conflict_id,
+                base_version,
+                update,
+                blob: _,
+                resolution,
+                side,
+            }) => {
+                let Some(client) = client else { return };
+                let Some(index) = self
+                    .conflicts
+                    .iter()
+                    .position(|(c, _)| c.conflict_id == conflict_id)
+                else {
+                    return self.nack(conn, client_seq, "conflict_unknown");
+                };
+                if let Some((by, by_client, by_seq, answer)) = &self.conflicts[index].1 {
+                    if *by == user && *by_client == client && *by_seq == client_seq {
+                        let answer = answer.clone();
+                        return self.reply(conn, &answer);
+                    }
+                    return self.nack(conn, client_seq, "conflict_unknown");
+                }
+                let file_id = self.conflicts[index].0.file_id;
+                let current = self
+                    .tree
+                    .iter()
+                    .find(|e| e.file_id == file_id)
+                    .map(|e| e.merge_version.unwrap_or(0))
+                    .unwrap_or(0);
+                if current != base_version {
+                    return self.reply(
+                        conn,
+                        &ServerControl::ConflictRejected {
+                            client_seq,
+                            conflict_id,
+                            version: current,
+                        },
+                    );
+                }
+                let Ok(update) = base64::engine::general_purpose::STANDARD.decode(&update) else {
+                    return self.nack(conn, client_seq, "bad_frame");
+                };
+                let seq = self.journal.len() as u64 + 1;
+                let frame = Frame {
+                    seq,
+                    ..Frame::update(file_id, 0, update)
+                };
+                self.journal.push(Journaled {
+                    seq,
+                    tree: None,
+                    frame: Some(frame.clone()),
+                    author: user.clone(),
+                    client: format!("{client}#resolve{client_seq}"),
+                    client_seq: 1,
+                });
+                let entry = self
+                    .tree
+                    .iter_mut()
+                    .find(|e| e.file_id == file_id)
+                    .expect("a Conflict's file is in the tree");
+                let version = entry.merge_version.unwrap_or(0) + 1;
+                entry.merge_version = Some(version);
+                let file_version = FileVersion { file_id, version };
+                let conflict = &mut self.conflicts[index].0;
+                conflict.status = "resolved".into();
+                conflict.resolution = Some(ConflictResolution {
+                    text: resolution,
+                    side,
+                    resolved_by: user.clone(),
+                    resolved_at: seq,
+                    version: seq,
+                });
+                let resolved = conflict.clone();
+                let accepted = ServerControl::ConflictAccepted {
+                    client_seq,
+                    conflict_id,
+                    version: seq,
+                    file_version,
+                };
+                self.conflicts[index].1 = Some((user, client, client_seq, accepted.clone()));
+                self.reply(conn, &accepted);
+                self.relay(conn, Message::Binary(wire::encode(&frame).expect("encode")));
+                self.broadcast(&ServerControl::ConflictResolved {
+                    conflict: resolved,
+                    file_version,
+                });
+            }
             Ok(ClientControl::MergeSubmit {
                 client_seq,
                 run_id,
                 files,
+                conflicts,
             }) => {
                 let Some(client) = client else { return };
                 if let Some((file_id, update)) = self.racing_merge.take() {
@@ -1253,20 +1358,27 @@ impl Hub {
                         .find(|e| e.file_id == id)
                         .map(|e| e.merge_version.unwrap_or(0))
                 };
-                if files.iter().any(|f| current(f.file_id).is_none()) {
+                // Every file named — merged or held — is compared and set.
+                let named: Vec<(u64, u64)> = files
+                    .iter()
+                    .map(|f| (f.file_id, f.base_version))
+                    .chain(conflicts.iter().map(|c| (c.file_id, c.base_version)))
+                    .collect();
+                if named.iter().any(|(id, _)| current(*id).is_none()) {
                     return self.nack(conn, client_seq, "unknown_file");
                 }
-                if files
-                    .iter()
-                    .any(|f| current(f.file_id) != Some(f.base_version))
-                {
-                    let versions = files
+                if files.is_empty() && conflicts.is_empty() {
+                    return self.nack(conn, client_seq, "bad_frame");
+                }
+                if named.iter().any(|(id, base)| current(*id) != Some(*base)) {
+                    let mut versions: Vec<FileVersion> = named
                         .iter()
-                        .map(|f| FileVersion {
-                            file_id: f.file_id,
-                            version: current(f.file_id).unwrap_or(0),
+                        .map(|(id, _)| FileVersion {
+                            file_id: *id,
+                            version: current(*id).unwrap_or(0),
                         })
                         .collect();
+                    versions.dedup();
                     return self.reply(
                         conn,
                         &ServerControl::MergeRejected {
@@ -1311,14 +1423,70 @@ impl Hub {
                     stored.push(frame);
                 }
                 let version = self.head();
-                if let Some(r) = self.run_mut(&run_id) {
-                    r.run.merged_version = Some(version);
+                if !files.is_empty() {
+                    if let Some(r) = self.run_mut(&run_id) {
+                        r.run.merged_version = Some(version);
+                    }
+                }
+                // The held hunks become Conflicts. Who is involved: the
+                // Runner, and everybody who changed the file since the fork.
+                let fork_seq = self
+                    .runs
+                    .iter()
+                    .find(|r| r.run.run_id == run_id)
+                    .map_or(0, |r| r.run.fork_seq);
+                let mut raised = Vec::new();
+                for hunk in &conflicts {
+                    let mut people = vec![user.clone()];
+                    for j in &self.journal {
+                        let touches = j.frame.as_ref().is_some_and(|f| f.file_id == hunk.file_id)
+                            || j.tree
+                                .as_ref()
+                                .is_some_and(|t| t.file_id == hunk.file_id && t.blob.is_some());
+                        if j.seq > fork_seq && touches && !people.contains(&j.author) {
+                            people.push(j.author.clone());
+                        }
+                    }
+                    let conflict_id = self.conflicts.len() as u64 + 1;
+                    let path = self
+                        .tree
+                        .iter()
+                        .find(|e| e.file_id == hunk.file_id)
+                        .map(|e| e.path.clone())
+                        .unwrap_or_default();
+                    self.conflicts.push((
+                        ThreadConflict {
+                            conflict_id,
+                            file_id: hunk.file_id,
+                            path,
+                            run_id: run_id.clone(),
+                            status: "open".into(),
+                            lines: hunk.lines,
+                            binary: hunk.binary,
+                            base: hunk.base.clone(),
+                            canonical: hunk.canonical.clone(),
+                            run: hunk.run.clone(),
+                            involved: ConflictInvolved {
+                                runs: vec![run_id.clone()],
+                                people,
+                            },
+                            raised_by: user.clone(),
+                            raised_at: version,
+                            resolution: None,
+                        },
+                        None,
+                    ));
+                    raised.push(RaisedConflict {
+                        conflict_id,
+                        file_id: hunk.file_id,
+                    });
                 }
                 let accepted = ServerControl::MergeAccepted {
                     client_seq,
                     run_id: run_id.clone(),
                     version,
                     files: landed.clone(),
+                    conflicts: raised.clone(),
                 };
                 self.merges.insert(key, accepted.clone());
                 self.reply(conn, &accepted);
@@ -1338,10 +1506,21 @@ impl Hub {
                         })
                         .collect(),
                 };
-                self.relay(
-                    conn,
-                    Message::Text(serde_json::to_string(&merged).expect("json")),
-                );
+                if !landed.is_empty() {
+                    self.relay(
+                        conn,
+                        Message::Text(serde_json::to_string(&merged).expect("json")),
+                    );
+                }
+                for r in &raised {
+                    let conflict = self
+                        .conflicts
+                        .iter()
+                        .find(|(c, _)| c.conflict_id == r.conflict_id)
+                        .map(|(c, _)| c.clone())
+                        .expect("just raised");
+                    self.broadcast(&ServerControl::ConflictRaised { conflict });
+                }
             }
             Err(_) => {}
         }

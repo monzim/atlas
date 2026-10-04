@@ -40,9 +40,26 @@ pub struct Fork {
     pub seq: u64,
     pub files: BTreeMap<u64, ForkFile>,
     /// Paths the Base has and canonical state does not: deleted files, and
-    /// where renamed ones used to be (ATL-403). Binary files stay at their
-    /// Base content in a Run worktree; a Run edits text.
+    /// where renamed ones used to be (ATL-403).
     pub removed: Vec<String>,
+    /// The thread's binary files at the fork (ATL-410): a Run that changes
+    /// one either lands it whole or, if somebody changed it since, raises a
+    /// whole-file Conflict.
+    pub binaries: BTreeMap<u64, ForkBinary>,
+}
+
+/// One binary file as a Run forked it.
+#[derive(Debug, Clone)]
+pub struct ForkBinary {
+    pub path: String,
+    /// Its canonical blob at the fork; `None` when it holds its Base content.
+    pub blob: Option<String>,
+    /// The canonical bytes, written into the Run worktree when this machine
+    /// has them; otherwise the worktree keeps the Base's.
+    pub bytes: Option<Vec<u8>>,
+    /// The hash of what the worktree holds for it after the reset: what the
+    /// Run's result is compared with. `None` when nothing is there.
+    pub start: Option<String>,
 }
 
 /// A Run this replica started and has not finished.
@@ -109,17 +126,29 @@ impl RunWorktree {
             let target = crate::path::resolve(&self.root, &file.path)?;
             write_atomic(&target, file.content.as_bytes())?;
         }
+        for file in fork.binaries.values() {
+            if let Some(bytes) = &file.bytes {
+                let target = crate::path::resolve(&self.root, &file.path)?;
+                write_atomic(&target, bytes)?;
+            }
+        }
         Ok(())
     }
 
     /// What the Run left in the worktree: every text file that differs from
     /// the fork — a file the thread holds whose text changed, or a new text
-    /// file — with its content. Deleted and binary files wait for ATL-403;
-    /// files that look like secrets stay on this machine, as at share time.
+    /// file — with its content, and every binary file whose bytes changed
+    /// (ATL-410). Deletions are not a Run's to make; files that look like
+    /// secrets stay on this machine, as at share time.
     pub fn changes(&self, fork: &Fork) -> Result<Vec<RunChange>, ReplicaError> {
         let mut out = Vec::new();
         let tracked: BTreeMap<&str, (u64, &ForkFile)> = fork
             .files
+            .iter()
+            .map(|(id, f)| (f.path.as_str(), (*id, f)))
+            .collect();
+        let binaries: BTreeMap<&str, (u64, &ForkBinary)> = fork
+            .binaries
             .iter()
             .map(|(id, f)| (f.path.as_str(), (*id, f)))
             .collect();
@@ -134,6 +163,7 @@ impl RunWorktree {
             .map(|d| d.path)
             .collect();
         candidates.extend(tracked.keys().map(|p| (*p).to_string()));
+        candidates.extend(binaries.keys().map(|p| (*p).to_string()));
         for path in candidates {
             if !seen.insert(path.clone()) || !crate::path::is_valid(&path) {
                 continue;
@@ -144,7 +174,18 @@ impl RunWorktree {
             let Ok(bytes) = fs::read(&target) else {
                 continue;
             };
+            if let Some((file_id, f)) = binaries.get(path.as_str()) {
+                if f.start.as_deref() != Some(crate::bootstrap::sha256_hex(&bytes).as_str()) {
+                    out.push(RunChange::binary(Some(*file_id), path, bytes));
+                }
+                continue;
+            }
             if !looks_textual(&bytes) {
+                // A new binary file. One the thread holds as text and the
+                // Run turned binary does not sync, as for a person's save.
+                if !tracked.contains_key(path.as_str()) && secret_reason(&path, "").is_none() {
+                    out.push(RunChange::binary(None, path, bytes));
+                }
                 continue;
             }
             let content = String::from_utf8_lossy(&bytes).into_owned();
@@ -155,6 +196,7 @@ impl RunWorktree {
                             file_id: Some(*file_id),
                             path,
                             content,
+                            binary: None,
                         });
                     }
                 }
@@ -167,6 +209,7 @@ impl RunWorktree {
                         file_id: None,
                         path,
                         content,
+                        binary: None,
                     });
                 }
             }
@@ -181,7 +224,21 @@ pub struct RunChange {
     /// `None` for a file the thread did not hold at the fork.
     pub file_id: Option<u64>,
     pub path: String,
+    /// A text file's content; empty for a binary one.
     pub content: String,
+    /// A binary file's bytes (ATL-410).
+    pub binary: Option<Vec<u8>>,
+}
+
+impl RunChange {
+    fn binary(file_id: Option<u64>, path: String, bytes: Vec<u8>) -> Self {
+        Self {
+            file_id,
+            path,
+            content: String::new(),
+            binary: Some(bytes),
+        }
+    }
 }
 
 /// What finishing a Run did.
@@ -196,4 +253,8 @@ pub struct RunReport {
     /// Blobs that could not be uploaded for the Thread Version. The merge
     /// stands; the Version's content is missing until they are.
     pub unuploaded: Vec<String>,
+    /// Conflicts the merge raised (ATL-410): hunks that overlapped changes
+    /// made since the Run forked, held for somebody to resolve. The rest of
+    /// the Run landed.
+    pub conflicts: Vec<u64>,
 }

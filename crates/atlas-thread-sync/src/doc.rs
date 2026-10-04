@@ -180,6 +180,14 @@ impl FileDoc {
     /// a Run's result is merged into a canonical state that moved since the
     /// fork, and a span covering two far-apart hunks would delete (and
     /// re-insert) everything between them, undoing what others did there.
+    /// A Yjs update that changes nothing: what a Conflict resolution that
+    /// keeps canonical state's hunk carries (ATL-410).
+    pub fn empty_update() -> Vec<u8> {
+        let doc = FileDoc::new(random_client_id());
+        let txn = doc.doc.transact_mut();
+        txn.encode_update_v1()
+    }
+
     pub fn replace_lines(
         &self,
         old: &str,

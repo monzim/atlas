@@ -13,7 +13,7 @@ use atlas_thread_sync::wire::FrameKind;
 use atlas_thread_sync::FakeStore;
 use atlas_thread_sync::{
     run, ActiveRun, Command as SyncCommand, FakeThreadServer, FakeTransport, RunSpec, RunWorktree,
-    SessionError, SyncStatus, ThreadEvent, ThreadSession,
+    SyncStatus, ThreadEvent, ThreadSession,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -410,7 +410,7 @@ async fn live_frames_reach_the_other_desktop_and_are_never_stored() {
 }
 
 #[tokio::test]
-async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
+async fn overlapping_hunks_are_held_as_a_conflict_and_the_rest_lands() {
     let Pair {
         w: _w,
         server,
@@ -444,27 +444,20 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
     .await;
 
     joy.finish_run(&joy_run, &joy_runs).await.unwrap();
-    let err = monzim
-        .finish_run(&monzim_run, &monzim_runs)
-        .await
-        .unwrap_err();
-    match err {
-        SessionError::Overlap(files) => assert_eq!(files[0].0, "src/banner.css"),
-        other => panic!("expected an overlap, got {other}"),
-    }
-    // A refused merge adds nothing to the thread, not even its new files.
+    let report = monzim.finish_run(&monzim_run, &monzim_runs).await.unwrap();
+    // The overlap is held for somebody to resolve (ATL-410); his new file,
+    // which overlaps nothing, lands.
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.files, vec!["src/brand-new.ts".to_string()]);
     joy.pump(QUIET).await.unwrap();
-    assert_eq!(joy.replica().file_id("src/brand-new.ts"), None);
-    assert_eq!(monzim.replica().file_id("src/brand-new.ts"), None);
-    // His Run's own result is still in its worktree to recover.
-    assert_eq!(
-        read(&monzim_run.worktree, "src/banner.css"),
-        ".banner {\n  color: navy;\n}\n"
-    );
+    assert!(joy.replica().file_id("src/brand-new.ts").is_some());
     assert_eq!(
         monzim.replica().text("src/banner.css").unwrap(),
         ".banner {\n  color: gold;\n}\n"
     );
+    let held = &server.conflicts()[0];
+    assert_eq!(held.canonical.as_deref(), Some("  color: gold;\n"));
+    assert_eq!(held.run.as_deref(), Some("  color: navy;\n"));
     let status = |id: &str| {
         server
             .runs()
@@ -473,7 +466,7 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
             .unwrap()
             .status
     };
-    assert_eq!(status(&monzim_run.run_id), "ended");
+    assert_eq!(status(&monzim_run.run_id), "merged");
     assert_eq!(status(&joy_run.run_id), "merged");
 }
 
@@ -544,6 +537,7 @@ async fn the_run_loop_runs_streams_and_merges_on_command() {
     commands
         .send(SyncCommand::FinishRun {
             run_id: started.run_id.clone(),
+            resolves: None,
             reply: Some(reply),
         })
         .unwrap();

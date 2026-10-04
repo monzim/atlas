@@ -22,20 +22,24 @@ import { openAgentSession } from "@/features/chat/lib/open-agent-session";
 import { pluginIdForAgent, type AgentType } from "@/types/agent";
 
 import {
+  askAgentToResolve,
   joinThread,
   leaveThread,
   openThread,
   previewShare,
+  resolveConflict,
   runWorktree,
   setServeHistory,
   shareThread,
   sharedThreadError,
   type ShareFile,
+  type SharedThreadConflict,
   type SharedThreadError,
   type SharedThreadRun,
   type SharedThreadView,
 } from "../lib/shared-threads-api";
 import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
+import { ConflictList, conflictPlace, type ConflictAction } from "./conflict-view";
 import { OwnerPanel } from "./owner-panel";
 import { SharePreviewList, uploads } from "./share-preview";
 
@@ -332,6 +336,33 @@ function ThreadCard({
 
   const mayRun = thread.role !== "viewer" && status.readOnly === null;
 
+  /**
+   * Resolve a Conflict (ATL-410). Asking an agent is itself a Run: an agent
+   * chat opens in the thread's Run worktree with the hunk's three versions,
+   * and what it leaves in those lines becomes the resolution.
+   */
+  async function resolve(conflict: SharedThreadConflict, action: ConflictAction) {
+    if (action.side === "agent") {
+      const { cwd, prompt } = await askAgentToResolve(thread.sharedThreadId, conflict.conflictId);
+      const agent = await ensureAgent(pluginIdForAgent(agentType));
+      const { key } = await agents.newSession(agent.agent_id, cwd);
+      await openAgentSession({
+        acpSessionId: key.session_id,
+        title: `${thread.title} · Resolve ${conflictPlace(conflict)}`,
+        cwd,
+        agentType,
+      });
+      await agents.send(key, prompt);
+      return;
+    }
+    await resolveConflict(
+      thread.sharedThreadId,
+      conflict.conflictId,
+      action.side,
+      action.side === "edited" ? action.text : undefined,
+    );
+  }
+
   return (
     <div
       className={cn(
@@ -466,6 +497,8 @@ function ThreadCard({
           {result.sharedFiles.length === 1 ? "file" : "files"}.
         </p>
       )}
+
+      <ConflictList conflicts={status.conflicts ?? []} mayEdit={mayRun} onResolve={resolve} />
 
       {status.runs.length > 0 && <RunList threadId={thread.sharedThreadId} runs={status.runs} />}
 

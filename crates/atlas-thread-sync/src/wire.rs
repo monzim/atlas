@@ -301,7 +301,114 @@ pub enum ClientControl {
         client_seq: u64,
         run_id: String,
         files: Vec<MergeFile>,
+        /// Hunks held back as Conflicts (ATL-410), submitted with the clean
+        /// ones and accepted or rejected with them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflicts: Vec<ConflictHunk>,
     },
+    /// Resolve a Conflict through the same compare-and-set a merge uses:
+    /// `update` (base64 Yjs) turns canonical's hunk into `resolution`.
+    #[serde(rename = "conflict.resolve", rename_all = "camelCase")]
+    ConflictResolve {
+        client_seq: u64,
+        conflict_id: u64,
+        base_version: u64,
+        update: String,
+        blob: String,
+        resolution: String,
+        side: ConflictSide,
+    },
+}
+
+/// One hunk a merge holds back (ATL-410). A text Conflict names canonical's
+/// lines and the three texts; a binary one is whole-file, by blob hash, with
+/// `None` for "absent".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictHunk {
+    pub file_id: u64,
+    pub base_version: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+    pub lines: Option<LineRange>,
+    pub base: Option<String>,
+    pub canonical: Option<String>,
+    pub run: Option<String>,
+}
+
+/// Lines `start..end`, 0-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Which way a Conflict was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictSide {
+    /// Canonical state keeps its hunk.
+    Canonical,
+    /// The Run's hunk replaces it.
+    Run,
+    /// Canonical's, then the Run's.
+    Both,
+    /// Text somebody wrote.
+    Edited,
+    /// Text an agent wrote, in a Run of its own.
+    Agent,
+}
+
+/// A Conflict as the server describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadConflict {
+    pub conflict_id: u64,
+    pub file_id: u64,
+    pub path: String,
+    pub run_id: String,
+    /// `open` or `resolved`.
+    pub status: String,
+    #[serde(default)]
+    pub lines: Option<LineRange>,
+    pub binary: bool,
+    #[serde(default)]
+    pub base: Option<String>,
+    #[serde(default)]
+    pub canonical: Option<String>,
+    #[serde(default)]
+    pub run: Option<String>,
+    pub involved: ConflictInvolved,
+    pub raised_by: String,
+    pub raised_at: u64,
+    #[serde(default)]
+    pub resolution: Option<ConflictResolution>,
+}
+
+/// The Runs and people whose changes meet in a Conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictInvolved {
+    pub runs: Vec<String>,
+    pub people: Vec<String>,
+}
+
+/// How a Conflict was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolution {
+    pub text: String,
+    pub side: ConflictSide,
+    pub resolved_by: String,
+    pub resolved_at: u64,
+    pub version: u64,
+}
+
+/// A Conflict a merge raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaisedConflict {
+    pub conflict_id: u64,
+    pub file_id: u64,
 }
 
 /// One file's hash in a `checksum`.
@@ -345,7 +452,8 @@ impl ClientControl {
             | ClientControl::BundleFailed { client_seq, .. }
             | ClientControl::RunStart { client_seq, .. }
             | ClientControl::RunEnd { client_seq, .. }
-            | ClientControl::MergeSubmit { client_seq, .. } => *client_seq,
+            | ClientControl::MergeSubmit { client_seq, .. }
+            | ClientControl::ConflictResolve { client_seq, .. } => *client_seq,
         }
     }
 }
@@ -465,6 +573,33 @@ pub enum ServerControl {
         run_id: String,
         version: u64,
         files: Vec<FileVersion>,
+        /// The Conflicts it raised, in the order they were submitted.
+        #[serde(default)]
+        conflicts: Vec<RaisedConflict>,
+    },
+    /// A merge held a hunk back. Sent to every socket.
+    #[serde(rename = "conflict.raised")]
+    ConflictRaised { conflict: ThreadConflict },
+    /// A Conflict was resolved; its file is at `file_version` now.
+    #[serde(rename = "conflict.resolved", rename_all = "camelCase")]
+    ConflictResolved {
+        conflict: ThreadConflict,
+        file_version: FileVersion,
+    },
+    /// The resolver's answer: the resolution landed as Thread Version `version`.
+    #[serde(rename = "conflict.accepted", rename_all = "camelCase")]
+    ConflictAccepted {
+        client_seq: u64,
+        conflict_id: u64,
+        version: u64,
+        file_version: FileVersion,
+    },
+    /// The file moved past `base_version`: recompute against `version`.
+    #[serde(rename = "conflict.rejected", rename_all = "camelCase")]
+    ConflictRejected {
+        client_seq: u64,
+        conflict_id: u64,
+        version: u64,
     },
     /// Some file moved past its `baseVersion`: recompute and resubmit.
     #[serde(rename = "merge.rejected", rename_all = "camelCase")]
@@ -670,6 +805,7 @@ mod tests {
         let submit = ClientControl::MergeSubmit {
             client_seq: 5,
             run_id: "run-0001".into(),
+            conflicts: vec![],
             files: vec![MergeFile {
                 file_id: 2,
                 base_version: 1,

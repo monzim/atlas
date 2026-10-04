@@ -592,6 +592,8 @@ pub fn run() {
             commands::shared_threads::shared_thread_decline,
             commands::shared_threads::shared_thread_set_join_policy,
             commands::shared_threads::shared_thread_set_open,
+            commands::shared_threads::shared_thread_resolve_conflict,
+            commands::shared_threads::shared_thread_ask_agent_to_resolve,
             commands::shared_threads::shared_thread_list,
             commands::shared_threads::shared_thread_leave,
             commands::artifacts_cloud::artifacts_cloud_retarget,

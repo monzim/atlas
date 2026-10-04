@@ -44,6 +44,47 @@ export interface SharedRunFrame {
   delta: { kind: string; delta?: string; [key: string]: unknown };
 }
 
+/** Which way a Conflict was, or is to be, resolved (ATL-410). */
+export type ConflictSide = "canonical" | "run" | "both" | "edited" | "agent";
+
+/**
+ * A Conflict (ATL-410): a hunk where a Run's change and a change canonical
+ * state took since the Run forked touch the same lines. Canonical state keeps
+ * its version until somebody resolves it. For a binary file the three sides
+ * are blob hashes and `lines` is `null`.
+ */
+export interface SharedThreadConflict {
+  conflictId: number;
+  fileId: number;
+  path: string;
+  runId: string;
+  status: "open" | "resolved" | (string & {});
+  /** Canonical state's lines, 0-based, `end` exclusive, when it was raised. */
+  lines: { start: number; end: number } | null;
+  binary: boolean;
+  base: string | null;
+  canonical: string | null;
+  run: string | null;
+  involved: { runs: string[]; people: string[] };
+  raisedBy: string;
+  raisedAt: number;
+  resolution: {
+    text: string;
+    side: ConflictSide;
+    resolvedBy: string;
+    resolvedAt: number;
+    version: number;
+  } | null;
+  /** Who ran the Run whose hunk was held, and its agent. */
+  runBy: string | null;
+  runAgent: string | null;
+  /** Who else changed those lines, and other Runs' agents. */
+  canonicalBy: string[];
+  canonicalAgents: string[];
+  /** The proposed result; `null` for a binary file. */
+  proposed: string | null;
+}
+
 export interface SharedThreadStatus {
   connected: boolean;
   role: string | null;
@@ -78,6 +119,8 @@ export interface SharedThreadStatus {
   closed: boolean;
   /** Text files that stopped syncing: they grew past 1 MB or turned binary. */
   outgrown: string[];
+  /** The thread's Conflicts, open ones first (ATL-410). */
+  conflicts: SharedThreadConflict[];
   error: string | null;
 }
 
@@ -239,6 +282,32 @@ export function setJoinPolicy(sharedThreadId: string, joinPolicy: "auto" | "appr
 /** Close the thread (read-only everywhere) or reopen it. */
 export function setThreadOpen(sharedThreadId: string, open: boolean) {
   return invoke<OwnerView>("shared_thread_set_open", { sharedThreadId, open });
+}
+
+/** Resolve a Conflict on every replica; answers the Thread Version it recorded. */
+export function resolveConflict(
+  sharedThreadId: string,
+  conflictId: number,
+  side: Exclude<ConflictSide, "agent">,
+  text?: string,
+) {
+  return invoke<number>("shared_thread_resolve_conflict", {
+    sharedThreadId,
+    conflictId,
+    side,
+    text: text ?? null,
+  });
+}
+
+/**
+ * Mark the thread's next Run as resolving `conflictId`, and get where to run
+ * it and what to ask: the agent's rewrite of the hunk becomes the resolution.
+ */
+export function askAgentToResolve(sharedThreadId: string, conflictId: number) {
+  return invoke<{ cwd: string; prompt: string }>("shared_thread_ask_agent_to_resolve", {
+    sharedThreadId,
+    conflictId,
+  });
 }
 
 export function onJoinRequested(

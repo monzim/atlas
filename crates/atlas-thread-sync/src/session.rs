@@ -17,14 +17,15 @@ use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::git;
 use crate::merge::{self, MergeError};
 use crate::replica::{kind_of, LocalChange, Replica, ReplicaError};
-use crate::runs::{ActiveRun, Fork, RunReport, RunSpec, RunWorktree};
+use crate::runs::{ActiveRun, Fork, ForkBinary, RunReport, RunSpec, RunWorktree};
 use crate::secrets::{secret_reason, SecretReason};
 use crate::share::{self, ShareKind};
 use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{
-    self, BundleFailure, ChecksumStatus, ClientControl, FileHash, FileKind, FileVersion, Frame,
-    FrameKind, MergeFile, Role, RunOutcome, ServerControl, ThreadRun, ThreadStatus,
+    self, BundleFailure, ChecksumStatus, ClientControl, ConflictHunk, ConflictSide, FileHash,
+    FileKind, FileVersion, Frame, FrameKind, LineRange, MergeFile, Role, RunOutcome, ServerControl,
+    ThreadConflict, ThreadRun, ThreadStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -39,11 +40,10 @@ pub enum SessionError {
     ClosedEarly,
     #[error("timed out waiting for the server")]
     Timeout,
-    /// The Run's changes overlap edits made since it forked. Nothing was
-    /// merged; the Run's result is still in its worktree (ATL-410 turns these
-    /// into Conflicts).
-    #[error("the Run's changes overlap edits made since it started: {}", .0.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", "))]
-    Overlap(Vec<(String, Vec<std::ops::Range<usize>>)>),
+    /// A Conflict's hunk is no longer where it was raised: somebody edited
+    /// those very lines since. Resolve it by editing the file instead.
+    #[error("the lines of that Conflict have changed since it was raised; edit {0} directly")]
+    ConflictMoved(String),
     #[error("the merge was rejected {0} times in a row; try again")]
     MergeStarved(u32),
     #[error(transparent)]
@@ -135,6 +135,14 @@ enum Answer {
     Accepted {
         version: u64,
         files: Vec<FileVersion>,
+        conflicts: Vec<u64>,
+    },
+    Resolved {
+        version: u64,
+        file_version: FileVersion,
+    },
+    ResolveRejected {
+        version: u64,
     },
     Rejected {
         versions: Vec<FileVersion>,
@@ -214,6 +222,9 @@ pub struct ThreadSession<T: Transport> {
     /// Each file's merge version, as last heard (ADR-0022).
     versions: HashMap<u64, u64>,
     runs: BTreeMap<String, RunView>,
+    /// Conflicts heard of (ATL-410), by id: raised live, or seeded from the
+    /// thread's REST read when the app opens it.
+    conflicts: BTreeMap<u64, ThreadConflict>,
     /// `client_seq`s whose answer a caller is waiting for, and the answers.
     awaiting: HashSet<u64>,
     answers: HashMap<u64, Answer>,
@@ -295,6 +306,7 @@ impl<T: Transport> ThreadSession<T> {
             last_nack: None,
             versions: HashMap::new(),
             runs: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
             awaiting: HashSet::new(),
             answers: HashMap::new(),
             events: None,
@@ -930,12 +942,52 @@ impl<T: Transport> ThreadSession<T> {
     /// Reset the Run worktree to canonical state now, creating it if needed.
     /// A Run started later resets it again at its own fork.
     pub fn prepare_run(&self, worktree: &RunWorktree) -> Result<(), SessionError> {
-        let fork = Fork {
+        Ok(worktree.reset(&self.fork()?)?)
+    }
+
+    /// Canonical state as this replica holds it now, as a Run forks it.
+    fn fork(&self) -> Result<Fork, SessionError> {
+        let mut binaries = BTreeMap::new();
+        for (file_id, path) in self.replica.files() {
+            if self.replica.kind(file_id) != Some(FileKind::Binary)
+                || self.replica.is_deleted(file_id)
+            {
+                continue;
+            }
+            let blob = self.replica.blob(file_id).map(str::to_string);
+            // The canonical bytes, when this machine has them on disk; the
+            // worktree keeps the Base's otherwise, and says so.
+            let bytes = match (&blob, self.replica.is_materialized()) {
+                (Some(sha), true) => self
+                    .replica
+                    .read_bytes(path)
+                    .ok()
+                    .filter(|b| bootstrap::sha256_hex(b) == *sha),
+                _ => None,
+            };
+            let start = match &bytes {
+                Some(b) => Some(bootstrap::sha256_hex(b)),
+                None => self
+                    .replica
+                    .base_bytes(path)?
+                    .map(|b| bootstrap::sha256_hex(&b)),
+            };
+            binaries.insert(
+                file_id,
+                ForkBinary {
+                    path: path.to_string(),
+                    blob,
+                    bytes,
+                    start,
+                },
+            );
+        }
+        Ok(Fork {
             seq: self.head,
             files: self.replica.fork_files(),
             removed: self.replica.removed_paths(),
-        };
-        Ok(worktree.reset(&fork)?)
+            binaries,
+        })
     }
 
     /// Start a Run: fork canonical state as this replica holds it now, reset
@@ -946,11 +998,7 @@ impl<T: Transport> ThreadSession<T> {
         worktree: &RunWorktree,
         spec: RunSpec,
     ) -> Result<ActiveRun, SessionError> {
-        let fork = Fork {
-            seq: self.head,
-            files: self.replica.fork_files(),
-            removed: self.replica.removed_paths(),
-        };
+        let fork = self.fork()?;
         worktree.reset(&fork)?;
         let client_seq = self.take_client_seq();
         let start = ClientControl::RunStart {
@@ -1007,23 +1055,28 @@ impl<T: Transport> ThreadSession<T> {
     /// another merge got there first — then upload the resulting blobs for the
     /// Thread Version and end the Run.
     ///
-    /// Overlapping hunks fail the merge with [`SessionError::Overlap`]; the
-    /// Run is ended unmerged and its result stays in the worktree.
+    /// Hunks that overlap changes made since the fork are held as Conflicts
+    /// and submitted with the clean ones, which land at once (ATL-410). A
+    /// binary file the Run changed lands whole, unless somebody changed it
+    /// since: then it is a whole-file Conflict.
     pub async fn finish_run(
         &mut self,
         run: &ActiveRun,
         worktree: &RunWorktree,
     ) -> Result<RunReport, SessionError> {
         let changes = worktree.changes(&run.fork)?;
+        let (texts, binaries): (Vec<_>, Vec<_>) = changes.iter().partition(|c| c.binary.is_none());
         let mut report = RunReport::default();
+        // Binary results the merge carries: (file id, path, blob, bytes) to
+        // land whole, and whole-file Conflicts.
+        let mut landing: Vec<(Option<u64>, String, String, Vec<u8>)> = Vec::new();
         for _ in 0..MERGE_ATTEMPTS {
             // Plan on the newest state the socket has delivered: what already
             // arrived is handled first, so an overlap with it is found before
             // anything — a new file's tree entry included — reaches the thread.
             self.drain_ready().await?;
             let mut planned = Vec::new();
-            let mut overlaps = Vec::new();
-            for change in &changes {
+            for change in &texts {
                 // A file the Run created forks from its Base content (or
                 // nothing), even if somebody else created it meanwhile; it
                 // gets a tree entry only once the whole merge is known to go
@@ -1052,32 +1105,89 @@ impl<T: Transport> ThreadSession<T> {
                         planned.push((file_id, base_version, change.path.clone(), merged))
                     }
                     Ok(None) => {}
-                    Err(MergeError::Overlap { lines }) => {
-                        overlaps.push((change.path.clone(), lines))
-                    }
                     Err(MergeError::Doc(e)) => return Err(ReplicaError::Doc(e).into()),
                 }
             }
-            if !overlaps.is_empty() {
-                self.end_run(&run.run_id, RunOutcome::Completed).await?;
-                return Err(SessionError::Overlap(overlaps));
+            // Binary files: whole, or a whole-file Conflict.
+            landing.clear();
+            let mut held_binaries = Vec::new();
+            for change in &binaries {
+                let bytes = change.binary.clone().expect("partitioned on it");
+                let sha = bootstrap::sha256_hex(&bytes);
+                let file_id = change
+                    .file_id
+                    .or_else(|| self.replica.file_id(&change.path));
+                let forked = change
+                    .file_id
+                    .and_then(|id| run.fork.binaries.get(&id))
+                    .and_then(|f| f.blob.clone().or_else(|| f.start.clone()));
+                let now = file_id.and_then(|id| self.replica.blob(id).map(str::to_string));
+                let canonical_now = match (file_id, &now) {
+                    (Some(_), Some(blob)) => Some(blob.clone()),
+                    // Still at its Base content, or not in the thread yet.
+                    (Some(_), None) => forked.clone(),
+                    (None, _) => None,
+                };
+                if canonical_now.as_deref() == Some(sha.as_str()) {
+                    continue;
+                }
+                let unchanged = match file_id {
+                    None => true,
+                    Some(_) => change.file_id.is_some() && canonical_now == forked,
+                };
+                if unchanged {
+                    landing.push((file_id, change.path.clone(), sha, bytes));
+                } else {
+                    let id = file_id.expect("a changed binary is in the thread");
+                    held_binaries.push((
+                        id,
+                        self.merge_version(id),
+                        forked,
+                        canonical_now,
+                        sha,
+                        bytes,
+                    ));
+                }
             }
-            if planned.is_empty() {
+            if planned.is_empty() && landing.is_empty() && held_binaries.is_empty() {
                 self.end_run(&run.run_id, RunOutcome::Completed).await?;
                 return Ok(report);
             }
-            let total: usize = planned.iter().map(|(_, _, _, m)| m.update.len()).sum();
-            if total > MAX_MERGE_BYTES
-                || planned
+            let held_count: usize = planned
+                .iter()
+                .map(|(_, _, _, m)| m.held.len())
+                .sum::<usize>()
+                + held_binaries.len();
+            let held_bytes: usize = planned
+                .iter()
+                .flat_map(|(_, _, _, m)| &m.held)
+                .map(|h| h.base.len() + h.canonical.len() + h.run.len())
+                .sum();
+            let total: usize = planned
+                .iter()
+                .filter_map(|(_, _, _, m)| m.update.as_ref().map(Vec::len))
+                .sum::<usize>()
+                + held_bytes;
+            let oversized_hunk = planned.iter().flat_map(|(_, _, _, m)| &m.held).any(|h| {
+                [&h.base, &h.canonical, &h.run]
                     .iter()
-                    .any(|(_, _, _, m)| m.update.len() > wire::MAX_PAYLOAD_BYTES)
+                    .any(|t| t.len() > MAX_CONFLICT_TEXT)
+            });
+            if total > MAX_MERGE_BYTES
+                || held_count > MAX_CONFLICTS_PER_MERGE
+                || oversized_hunk
+                || planned.iter().any(|(_, _, _, m)| {
+                    m.update
+                        .as_ref()
+                        .is_some_and(|u| u.len() > wire::MAX_PAYLOAD_BYTES)
+                })
             {
                 // Splitting a merge across submits is not this slice's.
                 self.end_run(&run.run_id, RunOutcome::Completed).await?;
                 return Err(SessionError::Refused {
                     code: "payload_too_large".into(),
                     message: format!(
-                        "the Run's merge is {total} bytes of updates, over what one merge carries"
+                        "the Run's merge is {total} bytes and {held_count} Conflicts, over what one merge carries"
                     ),
                 });
             }
@@ -1090,72 +1200,407 @@ impl<T: Transport> ThreadSession<T> {
                 ready.push((file_id, base_version, path, merged));
             }
             let planned = ready;
+            // A Conflict's Run side must be fetchable by whoever resolves it.
+            for (_, _, _, _, sha, bytes) in &held_binaries {
+                self.store.put_blob(sha.clone(), bytes.clone()).await?;
+            }
             let files: Vec<MergeFile> = planned
                 .iter()
-                .map(|(file_id, base_version, _, m)| MergeFile {
-                    file_id: *file_id,
-                    base_version: *base_version,
-                    update: base64::engine::general_purpose::STANDARD.encode(&m.update),
-                    blob: bootstrap::sha256_hex(m.content.as_bytes()),
+                .filter_map(|(file_id, base_version, _, m)| {
+                    m.update.as_ref().map(|update| MergeFile {
+                        file_id: *file_id,
+                        base_version: *base_version,
+                        update: base64::engine::general_purpose::STANDARD.encode(update),
+                        blob: bootstrap::sha256_hex(m.content.as_bytes()),
+                    })
                 })
                 .collect();
-            let client_seq = self.take_client_seq();
-            let submit = ClientControl::MergeSubmit {
-                client_seq,
-                run_id: run.run_id.clone(),
-                files: files.clone(),
+            let mut conflicts: Vec<ConflictHunk> = planned
+                .iter()
+                .flat_map(|(file_id, base_version, _, m)| {
+                    m.held.iter().map(move |h| ConflictHunk {
+                        file_id: *file_id,
+                        base_version: *base_version,
+                        binary: false,
+                        lines: Some(LineRange {
+                            start: h.lines.start as u64,
+                            end: h.lines.end as u64,
+                        }),
+                        base: Some(h.base.clone()),
+                        canonical: Some(h.canonical.clone()),
+                        run: Some(h.run.clone()),
+                    })
+                })
+                .collect();
+            conflicts.extend(held_binaries.iter().map(
+                |(file_id, base_version, base, canonical, sha, _)| ConflictHunk {
+                    file_id: *file_id,
+                    base_version: *base_version,
+                    binary: true,
+                    lines: None,
+                    base: base.clone(),
+                    canonical: canonical.clone(),
+                    run: Some(sha.clone()),
+                },
+            ));
+            let accepted = if files.is_empty() && conflicts.is_empty() {
+                // Only binary files to land: nothing to compare-and-set.
+                Some((self.head, Vec::new(), Vec::new()))
+            } else {
+                let client_seq = self.take_client_seq();
+                let submit = ClientControl::MergeSubmit {
+                    client_seq,
+                    run_id: run.run_id.clone(),
+                    files: files.clone(),
+                    conflicts,
+                };
+                match self.ask(client_seq, &submit).await? {
+                    Answer::Accepted {
+                        version,
+                        files: landed,
+                        conflicts,
+                    } => Some((version, landed, conflicts)),
+                    Answer::Rejected { versions } => {
+                        // Another merge landed on one of these files; its
+                        // changes arrived ahead of this answer, so recomputing
+                        // against the replica now merges onto them — and finds
+                        // where two Runs overlap.
+                        for v in versions {
+                            self.versions.insert(v.file_id, v.version);
+                        }
+                        report.retries += 1;
+                        None
+                    }
+                    Answer::Nack { code, message } => {
+                        return Err(SessionError::Refused { code, message })
+                    }
+                    other => return Err(unexpected(&other)),
+                }
             };
-            match self.ask(client_seq, &submit).await? {
-                Answer::Accepted {
+            let Some((version, landed, raised)) = accepted else {
+                continue;
+            };
+            for (file_id, _, _, merged) in &planned {
+                // The server relays the merge to everybody else; this replica
+                // applies it itself. A save made meanwhile is folded in and
+                // goes out as its own change.
+                if let Some(update) = &merged.update {
+                    let local = self.replica.apply_remote(*file_id, update)?;
+                    self.send_updates(*file_id, local).await?;
+                }
+            }
+            for v in landed {
+                self.versions.insert(v.file_id, v.version);
+            }
+            self.head = self.head.max(version);
+            report.conflicts = raised;
+            report.files = planned
+                .iter()
+                .filter(|(_, _, _, m)| m.update.is_some())
+                .map(|(_, _, path, _)| path.clone())
+                .collect();
+            if !files.is_empty() {
+                report.version = Some(version);
+            }
+            for ((_, _, path, merged), file) in planned
+                .iter()
+                .filter(|(_, _, _, m)| m.update.is_some())
+                .zip(&files)
+            {
+                let put = self
+                    .store
+                    .put_blob(file.blob.clone(), merged.content.clone().into_bytes())
+                    .await;
+                if let Err(e) = put {
+                    tracing::warn!(target: "atlas_thread_sync", %path, "Thread Version blob upload failed: {e}");
+                    report.unuploaded.push(path.clone());
+                }
+            }
+            // Binary results nobody else touched land whole, last writer wins.
+            for (file_id, path, sha, bytes) in std::mem::take(&mut landing) {
+                let file_id = match file_id {
+                    Some(id) => id,
+                    None => self.ensure_file(&path, true, FileKind::Binary).await?,
+                };
+                self.set_blob(file_id, &sha, bytes.clone()).await?;
+                if self.replica.is_materialized() {
+                    self.replica.write_blob(file_id, &bytes)?;
+                }
+                report.files.push(path);
+            }
+            if let Some(view) = self.runs.get_mut(&run.run_id) {
+                view.files.clone_from(&report.files);
+            }
+            self.end_run(&run.run_id, RunOutcome::Completed).await?;
+            return Ok(report);
+        }
+        self.end_run(&run.run_id, RunOutcome::Completed).await?;
+        Err(SessionError::MergeStarved(MERGE_ATTEMPTS))
+    }
+
+    // -----------------------------------------------------------------------
+    // Conflicts (ADR-0022, ATL-410)
+    // -----------------------------------------------------------------------
+
+    /// The Conflicts this session knows of, open ones first, newest first.
+    pub fn conflicts(&self) -> Vec<ConflictView> {
+        let mut views: Vec<ConflictView> = self
+            .conflicts
+            .values()
+            .map(|c| self.conflict_view(c))
+            .collect();
+        views.sort_by_key(|v| {
+            (
+                v.conflict.status != "open",
+                std::cmp::Reverse(v.conflict.conflict_id),
+            )
+        });
+        views
+    }
+
+    /// Open Conflicts: what blocks Apply (ATL-408).
+    pub fn open_conflicts(&self) -> usize {
+        self.conflicts
+            .values()
+            .filter(|c| c.status == "open")
+            .count()
+    }
+
+    /// Conflicts read over REST (`GET …/conflicts?status=open`) when the app
+    /// opens the thread; live frames keep them current after that.
+    pub fn seed_conflicts(&mut self, conflicts: Vec<ThreadConflict>) {
+        for c in conflicts {
+            self.conflicts.entry(c.conflict_id).or_insert(c);
+        }
+    }
+
+    fn conflict_view(&self, c: &ThreadConflict) -> ConflictView {
+        let run = self.runs.get(&c.run_id).map(|v| &v.run);
+        let runner = run.map(|r| r.runner_id.clone());
+        let canonical_agents = c
+            .involved
+            .runs
+            .iter()
+            .filter(|id| **id != c.run_id)
+            .filter_map(|id| self.runs.get(id).map(|v| v.run.agent.clone()))
+            .collect();
+        ConflictView {
+            proposed: (!c.binary).then(|| {
+                merge::proposal(
+                    c.base.as_deref().unwrap_or(""),
+                    c.canonical.as_deref().unwrap_or(""),
+                    c.run.as_deref().unwrap_or(""),
+                )
+            }),
+            canonical_by: c
+                .involved
+                .people
+                .iter()
+                .filter(|p| Some(*p) != runner.as_ref())
+                .cloned()
+                .collect(),
+            canonical_agents,
+            run_by: runner,
+            run_agent: run.map(|r| r.agent.clone()),
+            conflict: c.clone(),
+        }
+    }
+
+    /// Resolve an open Conflict on every replica: the chosen text replaces
+    /// canonical state's version of the hunk, through the same
+    /// compare-and-set a merge uses — recomputed if a merge got there first.
+    /// Answers the Thread Version the resolution recorded.
+    pub async fn resolve_conflict(
+        &mut self,
+        conflict_id: u64,
+        choice: Resolve,
+    ) -> Result<u64, SessionError> {
+        for _ in 0..MERGE_ATTEMPTS {
+            self.drain_ready().await?;
+            let conflict = self
+                .conflicts
+                .get(&conflict_id)
+                .filter(|c| c.status == "open")
+                .cloned()
+                .ok_or_else(|| SessionError::Refused {
+                    code: "conflict_unknown".into(),
+                    message: format!("Conflict {conflict_id} is not open"),
+                })?;
+            let file_id = conflict.file_id;
+            let side = choice.side();
+            let (update, content, resolution) = if conflict.binary {
+                self.binary_resolution(&conflict, &choice).await?
+            } else {
+                self.text_resolution(&conflict, &choice)?
+            };
+            let base_version = self.merge_version(file_id);
+            // A binary file's content hash is the chosen blob's own name.
+            let blob = if conflict.binary {
+                resolution.clone()
+            } else {
+                bootstrap::sha256_hex(&content)
+            };
+            let client_seq = self.take_client_seq();
+            let frame = ClientControl::ConflictResolve {
+                client_seq,
+                conflict_id,
+                base_version,
+                update: base64::engine::general_purpose::STANDARD.encode(&update),
+                blob: blob.clone(),
+                resolution,
+                side,
+            };
+            match self.ask(client_seq, &frame).await? {
+                Answer::Resolved {
                     version,
-                    files: landed,
+                    file_version,
                 } => {
-                    for (file_id, _, _, merged) in &planned {
-                        // The server relays the merge to everybody else; this
-                        // replica applies it itself. A save made meanwhile is
-                        // folded in and goes out as its own change.
-                        let local = self.replica.apply_remote(*file_id, &merged.update)?;
-                        self.send_updates(*file_id, local).await?;
-                    }
-                    for v in landed {
-                        self.versions.insert(v.file_id, v.version);
-                    }
-                    self.head = self.head.max(version);
-                    report.version = Some(version);
-                    report.files = planned.iter().map(|(_, _, path, _)| path.clone()).collect();
-                    if let Some(view) = self.runs.get_mut(&run.run_id) {
-                        view.files.clone_from(&report.files);
-                    }
-                    for ((_, _, path, merged), file) in planned.into_iter().zip(&files) {
-                        let put = self
-                            .store
-                            .put_blob(file.blob.clone(), merged.content.into_bytes())
-                            .await;
-                        if let Err(e) = put {
-                            tracing::warn!(target: "atlas_thread_sync", %path, "Thread Version blob upload failed: {e}");
-                            report.unuploaded.push(path);
+                    if !conflict.binary {
+                        let local = self.replica.apply_remote(file_id, &update)?;
+                        self.send_updates(file_id, local).await?;
+                        // The resolution's Thread Version holds the file's
+                        // content now; best effort, like a merge's.
+                        if let Err(e) = self.store.put_blob(blob, content).await {
+                            tracing::warn!(target: "atlas_thread_sync", "resolution blob upload failed: {e}");
                         }
                     }
-                    self.end_run(&run.run_id, RunOutcome::Completed).await?;
-                    return Ok(report);
-                }
-                Answer::Rejected { versions } => {
-                    // Another merge landed on one of these files; its changes
-                    // arrived ahead of this answer, so recomputing against
-                    // the replica now merges onto them.
-                    for v in versions {
-                        self.versions.insert(v.file_id, v.version);
+                    self.versions
+                        .insert(file_version.file_id, file_version.version);
+                    self.head = self.head.max(version);
+                    if let Some(c) = self.conflicts.get_mut(&conflict_id) {
+                        c.status = "resolved".into();
                     }
-                    report.retries += 1;
+                    return Ok(version);
+                }
+                Answer::ResolveRejected { version } => {
+                    self.versions.insert(file_id, version);
                 }
                 Answer::Nack { code, message } => {
                     return Err(SessionError::Refused { code, message })
                 }
-                other @ (Answer::Ack | Answer::Checksum { .. }) => return Err(unexpected(&other)),
+                other => return Err(unexpected(&other)),
             }
         }
-        self.end_run(&run.run_id, RunOutcome::Completed).await?;
         Err(SessionError::MergeStarved(MERGE_ATTEMPTS))
+    }
+
+    /// The update that turns canonical's hunk into the chosen text, the
+    /// file's content afterwards, and the resolution's text.
+    fn text_resolution(
+        &self,
+        conflict: &ThreadConflict,
+        choice: &Resolve,
+    ) -> Result<(Vec<u8>, Vec<u8>, String), SessionError> {
+        let file_id = conflict.file_id;
+        let canonical = conflict.canonical.clone().unwrap_or_default();
+        let run = conflict.run.clone().unwrap_or_default();
+        let text = match choice {
+            Resolve::Canonical => canonical.clone(),
+            Resolve::Run => run,
+            Resolve::Both => format!("{canonical}{run}"),
+            Resolve::Edited(t) | Resolve::Agent(t) => t.clone(),
+        };
+        let snapshot = self
+            .replica
+            .snapshot(file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        let doc = crate::doc::FileDoc::from_snapshot(crate::doc::random_client_id(), &snapshot)
+            .map_err(ReplicaError::Doc)?;
+        let current = doc.content();
+        if matches!(choice, Resolve::Canonical) || text == canonical {
+            return Ok((
+                crate::doc::FileDoc::empty_update(),
+                current.into_bytes(),
+                text,
+            ));
+        }
+        let near = conflict.lines.map_or(0, |l| l.start as usize);
+        let range = merge::locate(&current, &canonical, near)
+            .ok_or_else(|| SessionError::ConflictMoved(conflict.path.clone()))?;
+        let hunk = merge::Hunk {
+            old: range,
+            new: 0..merge::lines(&text).len(),
+        };
+        let update = doc
+            .replace_lines(&current, &[hunk], &text)
+            .unwrap_or_else(crate::doc::FileDoc::empty_update);
+        Ok((update, doc.content().into_bytes(), text))
+    }
+
+    /// A binary Conflict is resolved by making the chosen blob canonical
+    /// (`blob.set`) and then closing it with an empty update.
+    async fn binary_resolution(
+        &mut self,
+        conflict: &ThreadConflict,
+        choice: &Resolve,
+    ) -> Result<(Vec<u8>, Vec<u8>, String), SessionError> {
+        let chosen = match choice {
+            Resolve::Canonical => conflict.canonical.clone(),
+            Resolve::Run => conflict.run.clone(),
+            _ => {
+                return Err(SessionError::Refused {
+                    code: "bad_choice".into(),
+                    message: "a binary file's Conflict takes one side or the other".into(),
+                })
+            }
+        };
+        let Some(sha) = chosen else {
+            return Err(SessionError::Refused {
+                code: "bad_choice".into(),
+                message: "that side has no content to keep".into(),
+            });
+        };
+        if self.replica.blob(conflict.file_id) != Some(sha.as_str()) {
+            let client_seq = self.take_client_seq();
+            let set = ClientControl::BlobSet {
+                client_seq,
+                file_id: conflict.file_id,
+                blob: sha.clone(),
+            };
+            self.expect_ack(client_seq, &set).await?;
+            self.replica.set_blob(conflict.file_id, &sha)?;
+            if self.replica.is_materialized() {
+                self.fetch_blob(conflict.file_id, sha.clone()).await?;
+            }
+        }
+        // The content hash is the blob's own.
+        Ok((crate::doc::FileDoc::empty_update(), Vec::new(), sha))
+    }
+
+    /// Resolve a Conflict with what an agent wrote in a Run of its own: the
+    /// Run's text for the hunk's lines becomes the resolution, and the Run
+    /// ends without merging anything else.
+    pub async fn resolve_with_run(
+        &mut self,
+        run: &ActiveRun,
+        worktree: &RunWorktree,
+        conflict_id: u64,
+    ) -> Result<u64, SessionError> {
+        let conflict = self.conflicts.get(&conflict_id).cloned();
+        let text = match conflict.as_ref().filter(|c| !c.binary) {
+            Some(c) => {
+                let fork = run.fork.files.get(&c.file_id).map(|f| f.content.clone());
+                let after = crate::path::resolve(worktree.root(), &c.path)
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok());
+                match (fork, after) {
+                    (Some(fork), Some(after)) => {
+                        let near = c.lines.map_or(0, |l| l.start as usize);
+                        merge::locate(&fork, c.canonical.as_deref().unwrap_or(""), near)
+                            .map(|region| merge::region_after(&fork, &after, region))
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        self.end_run(&run.run_id, RunOutcome::Completed).await?;
+        let text = text.ok_or_else(|| SessionError::Refused {
+            code: "conflict_unknown".into(),
+            message: format!("Conflict {conflict_id} could not be read back from the agent's work"),
+        })?;
+        self.resolve_conflict(conflict_id, Resolve::Agent(text))
+            .await
     }
 
     /// The Run will not finish (the agent failed or was cancelled): mark it
@@ -1677,7 +2122,11 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Send an edit's updates, in order.
-    async fn send_updates(&mut self, file_id: u64, updates: Vec<Vec<u8>>) -> Result<(), SessionError> {
+    async fn send_updates(
+        &mut self,
+        file_id: u64,
+        updates: Vec<Vec<u8>>,
+    ) -> Result<(), SessionError> {
         for update in updates {
             self.send_update(file_id, update).await?;
         }
@@ -1827,8 +2276,58 @@ impl<T: Transport> ThreadSession<T> {
                         client_seq,
                         version,
                         files,
+                        conflicts,
                         ..
-                    } => self.answer(client_seq, Answer::Accepted { version, files }),
+                    } => self.answer(
+                        client_seq,
+                        Answer::Accepted {
+                            version,
+                            files,
+                            conflicts: conflicts.into_iter().map(|c| c.conflict_id).collect(),
+                        },
+                    ),
+                    ServerControl::ConflictRaised { conflict } => {
+                        self.conflicts.insert(conflict.conflict_id, conflict);
+                        while self.conflicts.len() > CONFLICTS_KEPT {
+                            // Resolved ones go first; the oldest of them.
+                            let drop = self
+                                .conflicts
+                                .iter()
+                                .find(|(_, c)| c.status != "open")
+                                .or_else(|| self.conflicts.iter().next())
+                                .map(|(id, _)| *id);
+                            match drop {
+                                Some(id) => self.conflicts.remove(&id),
+                                None => break,
+                            };
+                        }
+                    }
+                    ServerControl::ConflictResolved {
+                        conflict,
+                        file_version,
+                    } => {
+                        // The resolution's update arrived ahead of this.
+                        self.versions
+                            .insert(file_version.file_id, file_version.version);
+                        self.conflicts.insert(conflict.conflict_id, conflict);
+                    }
+                    ServerControl::ConflictAccepted {
+                        client_seq,
+                        version,
+                        file_version,
+                        ..
+                    } => self.answer(
+                        client_seq,
+                        Answer::Resolved {
+                            version,
+                            file_version,
+                        },
+                    ),
+                    ServerControl::ConflictRejected {
+                        client_seq,
+                        version,
+                        ..
+                    } => self.answer(client_seq, Answer::ResolveRejected { version }),
                     ServerControl::MergeRejected {
                         client_seq,
                         versions,
@@ -1946,6 +2445,11 @@ impl<T: Transport> ThreadSession<T> {
                     return Ok(Handled::Other);
                 }
                 self.saw_seq(frame.seq);
+                // A binary file's content is its blob; the update a binary
+                // Conflict's resolution journals is empty and changes nothing.
+                if self.replica.kind(frame.file_id) == Some(FileKind::Binary) {
+                    return Ok(Handled::Other);
+                }
                 // A save the person made while this arrived is folded in and
                 // goes out as its own change.
                 let local = self.replica.apply_remote(frame.file_id, &frame.payload)?;
@@ -1957,8 +2461,62 @@ impl<T: Transport> ThreadSession<T> {
 }
 
 /// Largest total of updates one `merge.submit` may carry (the server's
-/// `THREAD_MAX_MERGE_BYTES`).
+/// `THREAD_MAX_MERGE_BYTES`); a held hunk's three texts count toward it.
 const MAX_MERGE_BYTES: usize = 768 * 1024;
+
+/// Largest text one side of a Conflict may carry (`THREAD_MAX_CONFLICT_TEXT`).
+const MAX_CONFLICT_TEXT: usize = 16 * 1024;
+
+/// Most Conflicts one merge may raise (`THREAD_MAX_CONFLICTS_PER_MERGE`).
+const MAX_CONFLICTS_PER_MERGE: usize = 100;
+
+/// Conflicts a session remembers.
+const CONFLICTS_KEPT: usize = 500;
+
+/// How somebody resolves a Conflict (ATL-410).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolve {
+    /// Keep canonical state's version of the hunk.
+    Canonical,
+    /// Take the Run's.
+    Run,
+    /// Canonical's, then the Run's.
+    Both,
+    /// Text the person wrote, starting from the proposal.
+    Edited(String),
+    /// Text an agent wrote.
+    Agent(String),
+}
+
+impl Resolve {
+    fn side(&self) -> ConflictSide {
+        match self {
+            Resolve::Canonical => ConflictSide::Canonical,
+            Resolve::Run => ConflictSide::Run,
+            Resolve::Both => ConflictSide::Both,
+            Resolve::Edited(_) => ConflictSide::Edited,
+            Resolve::Agent(_) => ConflictSide::Agent,
+        }
+    }
+}
+
+/// A Conflict as the app shows it: the server's record, who and which agent
+/// is behind each side, and a proposed result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictView {
+    #[serde(flatten)]
+    pub conflict: ThreadConflict,
+    /// Who ran the Run whose hunk was held, and its agent.
+    pub run_by: Option<String>,
+    pub run_agent: Option<String>,
+    /// Who else changed those lines, and the agents of other Runs involved.
+    pub canonical_by: Vec<String>,
+    pub canonical_agents: Vec<String>,
+    /// One side when only it changed the base, both otherwise. `None` for a
+    /// binary file, which takes one side or the other.
+    pub proposed: Option<String>,
+}
 
 fn unexpected(answer: &Answer) -> SessionError {
     SessionError::Refused {

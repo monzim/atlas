@@ -1,5 +1,5 @@
-//! A Run's three-way merge (ADR-0022, ATL-405): the fork state the Run started
-//! from, the Run's result, and canonical state now.
+//! A Run's three-way merge (ADR-0022, ATL-405, ATL-410): the fork state the
+//! Run started from, the Run's result, and canonical state now.
 //!
 //! The merge is computed as line hunks — the fork against the Run's result —
 //! applied to a document rebuilt from the fork snapshot. The resulting Yjs
@@ -7,8 +7,10 @@
 //! the Run's hunks and leaves everybody else's edits since the fork alone.
 //!
 //! Hunks that overlap (or touch) a change canonical state made since the fork
-//! are **not** merged: this slice fails the merge visibly with the overlapping
-//! lines, and ATL-410 turns them into Conflicts.
+//! — somebody's typing or another Run's merge — are **held**, not merged:
+//! canonical state keeps its own version of those lines, and the hunk is
+//! submitted beside the clean ones as a Conflict (ATL-410). The clean hunks
+//! land at once either way.
 
 use std::ops::Range;
 
@@ -40,28 +42,51 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
         .collect()
 }
 
-/// Do two hunks over the same fork collide? Touching counts, as in git: two
-/// edits on adjacent lines, or two insertions at one point, have no order
-/// anybody chose.
-fn collide(a: &Hunk, b: &Hunk) -> bool {
-    a.old.start <= b.old.end && b.old.start <= a.old.end
+/// Do two fork ranges collide? Touching counts, as in git: two edits on
+/// adjacent lines, or two insertions at one point, have no order anybody chose.
+fn collide(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start <= b.end && b.start <= a.end
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum MergeError {
-    /// The Run changed fork lines canonical state also changed since.
-    #[error("the Run's changes overlap edits made since it started (lines {lines:?})")]
-    Overlap { lines: Vec<Range<usize>> },
     #[error(transparent)]
     Doc(#[from] DocError),
 }
 
-/// A merged file: the update to submit, and the content it produces on
-/// canonical state as this replica holds it.
+/// A hunk held back as a Conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    /// Canonical state's lines once the merge's clean hunks have landed,
+    /// 0-based, `end` exclusive: where canonical's version of the hunk sits.
+    pub lines: Range<usize>,
+    /// The fork's lines there.
+    pub base: String,
+    /// Canonical state's version of them.
+    pub canonical: String,
+    /// The Run's version of them.
+    pub run: String,
+}
+
+/// A merged file: the update to submit (`None` when every hunk was held or
+/// already there), the content it produces on canonical state as this
+/// replica holds it, and the hunks held back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged {
-    pub update: Vec<u8>,
+    pub update: Option<Vec<u8>>,
     pub content: String,
+    pub held: Vec<Held>,
+}
+
+/// The sum of `new.len() - old.len()` over `hunks`.
+fn growth<'a>(hunks: impl Iterator<Item = &'a Hunk>) -> isize {
+    hunks
+        .map(|h| h.new.len() as isize - h.old.len() as isize)
+        .sum()
+}
+
+fn shift(at: usize, by: isize) -> usize {
+    (at as isize + by).max(0) as usize
 }
 
 /// Merge the Run's result `run` for one file.
@@ -83,35 +108,150 @@ pub fn three_way(fork: &[u8], run: &str, canonical: &[u8]) -> Result<Option<Merg
 
     let ours = hunks(&fork_text, run);
     let theirs = hunks(&fork_text, &canonical_text);
-    let (run_lines, canon_lines) = (lines(run), lines(&canonical_text));
-    // The same edit made on both sides is already there; anything else that
-    // collides with their changes is an overlap.
-    let mut kept = Vec::new();
-    let mut overlaps = Vec::new();
-    for hunk in ours {
-        let same = theirs.iter().any(|t| {
-            t.old == hunk.old && run_lines[hunk.new.clone()] == canon_lines[t.new.clone()]
-        });
-        if same {
-            continue;
-        }
-        if let Some(t) = theirs.iter().find(|t| collide(&hunk, t)) {
-            overlaps.push(hunk.old.start.min(t.old.start)..hunk.old.end.max(t.old.end));
-            continue;
-        }
-        kept.push(hunk);
-    }
-    if !overlaps.is_empty() {
-        return Err(MergeError::Overlap { lines: overlaps });
-    }
-    let Some(update) = fork_doc.replace_lines(&fork_text, &kept, run) else {
-        return Ok(None);
+    let (fork_lines, run_lines, canon_lines) =
+        (lines(&fork_text), lines(run), lines(&canonical_text));
+    // The same edit made on both sides is already there.
+    let same = |h: &Hunk| {
+        theirs
+            .iter()
+            .any(|t| t.old == h.old && run_lines[h.new.clone()] == canon_lines[t.new.clone()])
     };
-    canonical_doc.apply(&update)?;
+    let candidates: Vec<&Hunk> = ours.iter().filter(|h| !same(h)).collect();
+
+    // Conflict regions, in fork lines: each starts as a hunk of ours that
+    // collides with one of theirs, and grows to take in every hunk — either
+    // side's — that collides with it, until none does. What is left of ours
+    // is clean.
+    let mut spans: Vec<Range<usize>> = candidates
+        .iter()
+        .filter(|h| theirs.iter().any(|t| collide(&h.old, &t.old)))
+        .map(|h| h.old.clone())
+        .collect();
+    loop {
+        let mut grew = false;
+        for span in spans.iter_mut() {
+            for r in theirs
+                .iter()
+                .map(|t| &t.old)
+                .chain(candidates.iter().map(|h| &h.old))
+            {
+                if collide(span, r) && (r.start < span.start || r.end > span.end) {
+                    *span = span.start.min(r.start)..span.end.max(r.end);
+                    grew = true;
+                }
+            }
+        }
+        spans.sort_by_key(|s| (s.start, s.end));
+        let mut joined: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            match joined.last_mut() {
+                Some(last) if collide(last, &span) => {
+                    last.end = last.end.max(span.end);
+                    grew = true;
+                }
+                _ => joined.push(span),
+            }
+        }
+        spans = joined;
+        if !grew {
+            break;
+        }
+    }
+    let inside = |r: &Range<usize>| spans.iter().any(|s| collide(s, r));
+    let kept: Vec<Hunk> = candidates
+        .into_iter()
+        .filter(|h| !inside(&h.old))
+        .cloned()
+        .collect();
+
+    let held: Vec<Held> = spans
+        .iter()
+        .map(|span| {
+            let before = |r: &Range<usize>| r.end < span.start;
+            let within = |r: &Range<usize>| collide(span, r);
+            let theirs_before = growth(theirs.iter().filter(|t| before(&t.old)));
+            let theirs_within = growth(theirs.iter().filter(|t| within(&t.old)));
+            let ours_before = growth(ours.iter().filter(|h| before(&h.old)));
+            let ours_within = growth(ours.iter().filter(|h| within(&h.old)));
+            let kept_before = growth(kept.iter().filter(|h| before(&h.old)));
+            let canon =
+                shift(span.start, theirs_before)..shift(span.end, theirs_before + theirs_within);
+            let mine = shift(span.start, ours_before)..shift(span.end, ours_before + ours_within);
+            let at = shift(canon.start, kept_before);
+            Held {
+                lines: at..at + canon.len(),
+                base: fork_lines[span.clone()].concat(),
+                canonical: canon_lines[canon].concat(),
+                run: run_lines[mine].concat(),
+            }
+        })
+        .collect();
+
+    let update = fork_doc.replace_lines(&fork_text, &kept, run);
+    if update.is_none() && held.is_empty() {
+        return Ok(None);
+    }
+    if let Some(update) = &update {
+        canonical_doc.apply(update)?;
+    }
     Ok(Some(Merged {
         update,
         content: canonical_doc.content(),
+        held,
     }))
+}
+
+/// What `region` of `before` (lines) became in `after`: the hunks that turn
+/// one into the other, mapped onto it. A hunk that reaches past the region
+/// takes the region with it, so what is answered is whole lines of `after`.
+pub fn region_after(before: &str, after: &str, region: Range<usize>) -> String {
+    let changes = hunks(before, after);
+    let mut span = region;
+    loop {
+        let grown = changes
+            .iter()
+            .filter(|h| collide(&span, &h.old))
+            .fold(span.clone(), |s, h| {
+                s.start.min(h.old.start)..s.end.max(h.old.end)
+            });
+        if grown == span {
+            break;
+        }
+        span = grown;
+    }
+    let before_by = growth(changes.iter().filter(|h| h.old.end < span.start));
+    let within_by = growth(changes.iter().filter(|h| collide(&span, &h.old)));
+    let after_lines = lines(after);
+    let start = shift(span.start, before_by).min(after_lines.len());
+    let end = shift(span.end, before_by + within_by).clamp(start, after_lines.len());
+    after_lines[start..end].concat()
+}
+
+/// The proposed result for a Conflict's hunk: one side when only it changed
+/// the base, both — canonical's first — when each did.
+pub fn proposal(base: &str, canonical: &str, run: &str) -> String {
+    if canonical == base {
+        run.to_string()
+    } else if run == base || run == canonical {
+        canonical.to_string()
+    } else {
+        format!("{canonical}{run}")
+    }
+}
+
+/// Find `hunk` — canonical's lines of a Conflict as they were raised — in
+/// `text` now, nearest to line `near`: typing elsewhere moves it, typing in
+/// it means it cannot be found and the Conflict needs a fresh look.
+pub fn locate(text: &str, hunk: &str, near: usize) -> Option<Range<usize>> {
+    let have = lines(text);
+    let want = lines(hunk);
+    if want.is_empty() {
+        return Some(near.min(have.len())..near.min(have.len()));
+    }
+    (0..=have.len().saturating_sub(want.len()))
+        .filter(|&i| have[i..i + want.len()] == want[..])
+        .min_by_key(|&i| i.abs_diff(near))
+        .map(|i| i..i + want.len())
 }
 
 #[cfg(test)]
@@ -138,22 +278,91 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(merged.content, "ONE\ntwo\nthree\nFOUR\nfive\nSIX\n");
-        canonical.apply(&merged.update).unwrap();
+        assert!(merged.held.is_empty());
+        canonical.apply(merged.update.as_ref().unwrap()).unwrap();
         assert_eq!(canonical.content(), merged.content);
     }
 
     #[test]
-    fn overlapping_and_touching_edits_fail_with_their_lines() {
+    fn overlapping_and_touching_edits_are_held_and_the_rest_lands() {
         let fork = doc(BASE);
         let canonical = FileDoc::from_snapshot(random_client_id(), &fork.snapshot()).unwrap();
         canonical.set_content("one\ntwo\nTHREE\nfour\nfive\nsix\n");
-        for run in [
-            "one\ntwo\nthree!\nfour\nfive\nsix\n",
+        // Overlapping: the same line.
+        let merged = three_way(
+            &fork.snapshot(),
+            "ONE\ntwo\nthree!\nfour\nfive\nsix\n",
+            &canonical.snapshot(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.content, "ONE\ntwo\nTHREE\nfour\nfive\nsix\n");
+        assert_eq!(
+            merged.held,
+            vec![Held {
+                lines: 2..3,
+                base: "three\n".into(),
+                canonical: "THREE\n".into(),
+                run: "three!\n".into(),
+            }]
+        );
+        // Touching: the next line. One region, both lines.
+        let merged = three_way(
+            &fork.snapshot(),
             "one\ntwo\nthree\nfour?\nfive\nsix\n",
-        ] {
-            let err = three_way(&fork.snapshot(), run, &canonical.snapshot()).unwrap_err();
-            assert!(matches!(err, MergeError::Overlap { .. }), "{run:?}");
-        }
+            &canonical.snapshot(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.update, None);
+        assert_eq!(merged.content, "one\ntwo\nTHREE\nfour\nfive\nsix\n");
+        assert_eq!(merged.held[0].base, "three\nfour\n");
+        assert_eq!(merged.held[0].canonical, "THREE\nfour\n");
+        assert_eq!(merged.held[0].run, "three\nfour?\n");
+        assert_eq!(merged.held[0].lines, 2..4);
+    }
+
+    #[test]
+    fn a_held_hunks_lines_count_the_clean_hunks_that_landed_before_it() {
+        let fork = doc(BASE);
+        let canonical = FileDoc::from_snapshot(random_client_id(), &fork.snapshot()).unwrap();
+        canonical.set_content("one\ntwo\nthree\nfour\nFIVE\nsix\n");
+        // The Run adds two lines at the top (clean) and changes line five.
+        let run = "zero\nzero.5\none\ntwo\nthree\nfour\nfive!\nsix\n";
+        let merged = three_way(&fork.snapshot(), run, &canonical.snapshot())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.content,
+            "zero\nzero.5\none\ntwo\nthree\nfour\nFIVE\nsix\n"
+        );
+        assert_eq!(merged.held.len(), 1);
+        assert_eq!(merged.held[0].lines, 6..7);
+        let at = lines(&merged.content)[merged.held[0].lines.clone()].concat();
+        assert_eq!(at, merged.held[0].canonical);
+        assert_eq!(merged.held[0].run, "five!\n");
+    }
+
+    #[test]
+    fn a_conflicts_hunk_is_found_again_after_typing_elsewhere() {
+        let text = "a\nb\nX\nY\nc\nX\nY\n";
+        assert_eq!(locate(text, "X\nY\n", 2), Some(2..4));
+        assert_eq!(locate(text, "X\nY\n", 6), Some(5..7));
+        assert_eq!(locate(text, "Z\n", 2), None);
+        assert_eq!(proposal("a\n", "a\n", "b\n"), "b\n");
+        assert_eq!(proposal("a\n", "c\n", "b\n"), "c\nb\n");
+    }
+
+    #[test]
+    fn an_agents_rewrite_of_a_region_is_read_back_whole() {
+        let before = "a\nb\nX\nY\nc\n";
+        let after = "a!\nb\nZ\nc\n";
+        assert_eq!(region_after(before, after, 2..4), "Z\n");
+        assert_eq!(region_after(before, before, 2..4), "X\nY\n");
+        assert_eq!(
+            region_after(before, "a\nb\nX\nnew\nY\nc\n", 2..4),
+            "X\nnew\nY\n"
+        );
     }
 
     #[test]

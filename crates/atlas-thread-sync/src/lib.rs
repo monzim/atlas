@@ -48,7 +48,10 @@ pub use replica::{LocalChange, Replica, ReplicaError};
 pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
 pub use session::Verification;
-pub use session::{Bootstrapped, RunView, SessionError, ShareReport, ThreadEvent, ThreadSession};
+pub use session::{
+    Bootstrapped, ConflictView, Resolve, RunView, SessionError, ShareReport, ThreadEvent,
+    ThreadSession,
+};
 pub use share::{ShareFile, ShareKind, SharePreview};
 pub use store::{FakeStore, ObjectStore, StoreError};
 pub use transport::{
@@ -76,11 +79,22 @@ pub enum Command {
     /// One live frame of a Run this replica started — a serialized
     /// `SessionDelta`. Best effort: the Session drain is the record.
     RunFrame { run_id: String, payload: Vec<u8> },
-    /// The Run's turn ended: merge it back.
+    /// The Run's turn ended: merge it back — or, for a Run asked to resolve
+    /// a Conflict (ATL-410), resolve it with what the agent wrote.
     FinishRun {
         run_id: String,
+        resolves: Option<u64>,
         reply: Option<oneshot::Sender<Result<RunReport, String>>>,
     },
+    /// Resolve a Conflict on every replica (ATL-410). Answers the Thread
+    /// Version the resolution recorded.
+    ResolveConflict {
+        conflict_id: u64,
+        choice: Resolve,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    /// Conflicts read over REST when the thread was opened.
+    SeedConflicts(Vec<wire::ThreadConflict>),
     /// The Run will not finish: mark it interrupted.
     InterruptRun { run_id: String },
     /// Whether to send this repository's history to teammates who lack the
@@ -131,6 +145,8 @@ pub struct SyncStatus {
     /// Text files that stopped syncing because they grew past 1 MiB or
     /// turned binary: their kind was fixed when they entered the thread.
     pub outgrown: Vec<String>,
+    /// The thread's Conflicts, open ones first (ATL-410).
+    pub conflicts: Vec<ConflictView>,
     pub error: Option<String>,
 }
 
@@ -152,6 +168,7 @@ fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) ->
         unsent: session.unsent(),
         closed: session.is_closed(),
         outgrown: replica.outgrown_files(),
+        conflicts: session.conflicts(),
         error,
     }
 }
@@ -355,7 +372,48 @@ pub async fn run_with<C: Connector>(
                     None => Ok(()),
                 }
             }
-            Event::Command(Some(Command::FinishRun { run_id, reply })) => {
+            Event::Command(Some(Command::FinishRun {
+                run_id,
+                resolves: Some(conflict_id),
+                reply,
+            })) => match active.remove(&run_id) {
+                Some((run, worktree)) => {
+                    let result = session
+                        .resolve_with_run(&run, &worktree, conflict_id)
+                        .await
+                        .map(|version| RunReport {
+                            version: Some(version),
+                            ..RunReport::default()
+                        });
+                    let text = result
+                        .as_ref()
+                        .map(Clone::clone)
+                        .map_err(ToString::to_string);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(text);
+                    }
+                    result.map(|_| ())
+                }
+                None => Ok(()),
+            },
+            Event::Command(Some(Command::ResolveConflict {
+                conflict_id,
+                choice,
+                reply,
+            })) => {
+                let result = session.resolve_conflict(conflict_id, choice).await;
+                let _ = reply.send(result.as_ref().map(|v| *v).map_err(ToString::to_string));
+                result.map(|_| ())
+            }
+            Event::Command(Some(Command::SeedConflicts(conflicts))) => {
+                session.seed_conflicts(conflicts);
+                Ok(())
+            }
+            Event::Command(Some(Command::FinishRun {
+                run_id,
+                resolves: None,
+                reply,
+            })) => {
                 match active.remove(&run_id) {
                     Some((run, worktree)) => {
                         let result = session.finish_run(&run, &worktree).await;
