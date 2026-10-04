@@ -220,6 +220,14 @@ pub enum ClientControl {
         client_id: String,
         since: u64,
     },
+    /// What this replica says about itself (ATL-400, ATL-407): the file it is
+    /// typing in, its cursors, its Runs' current files, how far behind it is.
+    /// Relayed, never journaled, never acked; the latest replaces the last.
+    #[serde(rename = "awareness", rename_all = "camelCase")]
+    Awareness {
+        client_seq: u64,
+        state: AwarenessState,
+    },
     /// Make sure a file has a tree entry; idempotent across replicas.
     #[serde(rename = "tree.ensure", rename_all = "camelCase")]
     TreeEnsure {
@@ -411,6 +419,65 @@ pub struct RaisedConflict {
     pub file_id: u64,
 }
 
+/// A peer's awareness state. Bounded by the server: at most 8 cursors and 8
+/// Runs, 1 KiB of JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwarenessState {
+    /// The file it is typing in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typing: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cursors: Vec<Cursor>,
+    /// Its Runs in flight and the file each is touching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunAt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncState>,
+}
+
+/// A selection in one file: UTF-16 offsets into its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cursor {
+    pub file_id: u64,
+    pub anchor: u64,
+    pub head: u64,
+}
+
+/// A Run and the file it is touching now (`None` between files).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAt {
+    pub run_id: String,
+    pub file_id: Option<u64>,
+}
+
+/// How far a replica is from the thread's head, as it says of itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncState {
+    /// Offline, or catching up.
+    Behind,
+    /// Connected, with changes of its own not yet acknowledged.
+    Syncing,
+    Current,
+}
+
+/// Somebody on the thread socket (ATL-400). `peer_id` is their `clientId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Peer {
+    pub peer_id: String,
+    pub user_id: String,
+    pub role: Role,
+    /// `desktop` or `web`.
+    pub surface: String,
+    #[serde(default)]
+    pub state: Option<AwarenessState>,
+    pub at: u64,
+}
+
 /// One file's hash in a `checksum`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -442,6 +509,7 @@ impl ClientControl {
     pub fn client_seq(&self) -> u64 {
         match self {
             ClientControl::Hello { .. } => 0,
+            ClientControl::Awareness { client_seq, .. } => *client_seq,
             ClientControl::TreeEnsure { client_seq, .. }
             | ClientControl::TreeRename { client_seq, .. }
             | ClientControl::TreeDelete { client_seq, .. }
@@ -673,6 +741,15 @@ pub enum ServerControl {
         #[serde(default)]
         bytes: Option<u64>,
     },
+    /// Everybody else on the thread, once after `synced`.
+    #[serde(rename = "presence.snapshot")]
+    PresenceSnapshot { peers: Vec<Peer> },
+    /// A peer arrived (state `None`) or said something new about itself.
+    #[serde(rename = "presence")]
+    Presence { peer: Peer },
+    /// A peer's last socket went.
+    #[serde(rename = "presence.left", rename_all = "camelCase")]
+    PresenceLeft { peer_id: String, user_id: String },
     /// Any frame this client does not act on yet (presence, bundles, roles…):
     /// read and ignored rather than reported as unreadable.
     #[serde(other)]
@@ -842,10 +919,42 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(run, ServerControl::Run { ref run } if run.run_no == 1));
-        // Frames this client does not act on are read, not reported unreadable.
-        let presence: ServerControl =
+        // Presence (ATL-407), as the server's contract shapes it.
+        let presence: ServerControl = serde_json::from_value(serde_json::json!({
+            "t": "presence", "peer": { "peerId": "c1", "userId": "u", "role": "participant",
+            "surface": "web", "at": 5, "state": { "typing": 3,
+            "cursors": [{ "fileId": 3, "anchor": 1, "head": 4 }],
+            "runs": [{ "runId": "run-0001", "fileId": null }], "sync": "behind" } }
+        }))
+        .unwrap();
+        match presence {
+            ServerControl::Presence { peer } => {
+                let state = peer.state.unwrap();
+                assert_eq!(state.typing, Some(3));
+                assert_eq!(state.cursors[0].head, 4);
+                assert_eq!(state.runs[0].file_id, None);
+                assert_eq!(state.sync, Some(SyncState::Behind));
+            }
+            other => panic!("{other:?}"),
+        }
+        let left: ServerControl =
             serde_json::from_str(r#"{"t":"presence.left","peerId":"p","userId":"u"}"#).unwrap();
-        assert_eq!(presence, ServerControl::Other);
+        assert!(matches!(left, ServerControl::PresenceLeft { .. }));
+        // An awareness frame leaves out what it does not say.
+        let mine = ClientControl::Awareness {
+            client_seq: 4,
+            state: AwarenessState {
+                sync: Some(SyncState::Current),
+                ..AwarenessState::default()
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&mine).unwrap(),
+            serde_json::json!({ "t": "awareness", "clientSeq": 4, "state": { "sync": "current" } })
+        );
+        // Frames this client does not act on are read, not reported unreadable.
+        let other: ServerControl = serde_json::from_str(r#"{"t":"something.new","x":1}"#).unwrap();
+        assert_eq!(other, ServerControl::Other);
         let unavailable: ServerControl = serde_json::from_str(
             r#"{"t":"bundle.unavailable","requestId":"r","reason":"too_large","bytes":9}"#,
         )

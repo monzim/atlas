@@ -95,6 +95,20 @@ impl FileDoc {
             .encode_state_as_update_v1(&StateVector::default())
     }
 
+    /// The document's state vector, encoded: what it has seen.
+    pub fn state_vector(&self) -> Vec<u8> {
+        use yrs::updates::encoder::Encode;
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    /// Everything the document has that a peer at `state_vector` lacks, as
+    /// one update (ATL-407: what an editor bound to it still needs).
+    pub fn diff(&self, state_vector: &[u8]) -> Result<Vec<u8>, DocError> {
+        let sv =
+            StateVector::decode_v1(state_vector).map_err(|e| DocError::Decode(e.to_string()))?;
+        Ok(self.doc.transact().encode_state_as_update_v1(&sv))
+    }
+
     /// A document in exactly the state `snapshot` recorded, editing under
     /// `client_id`. Used to make an edit *relative to that moment* and merge
     /// it into the live document — a three-way merge done by the CRDT.

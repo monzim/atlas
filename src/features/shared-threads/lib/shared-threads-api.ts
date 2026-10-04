@@ -16,6 +16,37 @@ export const SHARED_RUN_FRAME_EVENT = "atlas:shared-run-frame";
 /** Pushed by Rust to the owner when somebody asks to join (ATL-406). */
 export const SHARED_JOIN_REQUEST_EVENT = "atlas:shared-thread-join-requested";
 
+/** Pushed by Rust when who is here, or what they are doing, changes (ATL-407). */
+export const SHARED_PRESENCE_EVENT = "atlas:shared-thread-presence";
+
+/** Pushed by Rust when a file open in the Atlas editor changed (ATL-407). */
+export const SHARED_DOC_UPDATE_EVENT = "atlas:shared-doc-update";
+
+/** How far a replica is from the thread's head, as it says of itself. */
+export type SyncState = "current" | "syncing" | "behind";
+
+/** Somebody else on the thread (ATL-407): a desktop or the web view. */
+export interface SharedPeer {
+  peerId: string;
+  userId: string;
+  role: string;
+  surface: "desktop" | "web" | (string & {});
+  /** The file they are typing in. */
+  typing: string | null;
+  cursors: Array<{ fileId: number; path: string | null; anchor: number; head: number }>;
+  /** Their Runs in flight and the file each is touching. */
+  runs: Array<{ runId: string; path: string | null }>;
+  sync: SyncState | null;
+}
+
+/** A replica file bound to the Atlas editor. */
+export interface SharedDoc {
+  sharedThreadId: string;
+  fileId: number;
+  /** The document now: one Yjs update, base64. */
+  state: string;
+}
+
 /**
  * A Run (ATL-405): one agent turn in the thread, run by a participant in their
  * own Run worktree and merged back when it ends.
@@ -35,6 +66,8 @@ export interface SharedThreadRun {
   mergedVersion: number | null;
   /** The paths its merge changed. */
   files: string[];
+  /** The file it is touching now, as its Runner says (ATL-407). */
+  currentFile: string | null;
 }
 
 /** One live frame: a `SessionDelta` the Runner's agent emitted. */
@@ -121,6 +154,10 @@ export interface SharedThreadStatus {
   outgrown: string[];
   /** The thread's Conflicts, open ones first (ATL-410). */
   conflicts: SharedThreadConflict[];
+  /** Everybody else here (ATL-407). */
+  peers: SharedPeer[];
+  /** Whether this replica is current, syncing or behind. */
+  sync: SyncState | null;
   error: string | null;
 }
 
@@ -335,6 +372,50 @@ export type ApplyOutcome =
  */
 export function applyThread(sharedThreadId: string, stash = false) {
   return invoke<ApplyOutcome>("shared_thread_apply", { sharedThreadId, stash });
+}
+
+/**
+ * Bind the Atlas editor to `path` when it is a text file of a joined thread's
+ * replica; `null` for any other file.
+ */
+export function openSharedDoc(path: string) {
+  return invoke<SharedDoc | null>("shared_thread_doc_open", { path });
+}
+
+export function closeSharedDoc(sharedThreadId: string, fileId: number) {
+  return invoke<void>("shared_thread_doc_close", { sharedThreadId, fileId });
+}
+
+/** Keystrokes, as one batched Yjs update (base64). Rejects `not_syncing`. */
+export function sendDocUpdate(sharedThreadId: string, fileId: number, update: string) {
+  return invoke<void>("shared_thread_doc_update", { sharedThreadId, fileId, update });
+}
+
+/** The person's selections in one file, `[anchor, head]`, and whether they type there. */
+export function sendCursors(
+  sharedThreadId: string,
+  fileId: number,
+  cursors: Array<[number, number]>,
+  typing: boolean,
+) {
+  return invoke<void>("shared_thread_cursors", { sharedThreadId, fileId, cursors, typing });
+}
+
+export function onSharedPresence(
+  apply: (event: { sharedThreadId: string; peers: SharedPeer[] }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ sharedThreadId: string; peers: SharedPeer[] }>(SHARED_PRESENCE_EVENT, (e) =>
+    apply(e.payload),
+  );
+}
+
+export function onSharedDocUpdate(
+  apply: (event: { sharedThreadId: string; fileId: number; update: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ sharedThreadId: string; fileId: number; update: string }>(
+    SHARED_DOC_UPDATE_EVENT,
+    (e) => apply(e.payload),
+  );
 }
 
 export function onJoinRequested(

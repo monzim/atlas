@@ -241,6 +241,8 @@ struct Conn {
     user: String,
     client: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
+    /// Its latest awareness (ATL-400): kept with the connection, never stored.
+    presence: Option<wire::AwarenessState>,
 }
 
 /// An in-process thread server with the real one's rules: everything is
@@ -299,6 +301,7 @@ impl FakeThreadServer {
                 user: user.to_string(),
                 client: None,
                 tx,
+                presence: None,
             },
         );
         FakeTransport {
@@ -573,6 +576,16 @@ impl Hub {
             return;
         };
         let Some(client) = c.client else { return };
+        self.relay(
+            conn,
+            Message::Text(
+                serde_json::to_string(&ServerControl::PresenceLeft {
+                    peer_id: client.clone(),
+                    user_id: c.user.clone(),
+                })
+                .expect("json"),
+            ),
+        );
         let mut ended = Vec::new();
         for r in &mut self.runs {
             if r.run.status == "running" && r.run.runner_id == c.user && r.runner_client == client {
@@ -721,6 +734,23 @@ impl Hub {
         }
     }
 
+    /// A connection as presence describes it, once it has said hello.
+    fn peer(&self, conn: u64) -> Option<wire::Peer> {
+        let c = self.conns.get(&conn)?;
+        Some(wire::Peer {
+            peer_id: c.client.clone()?,
+            user_id: c.user.clone(),
+            role: self
+                .roles
+                .get(&c.user)
+                .copied()
+                .unwrap_or(Role::Participant),
+            surface: "desktop".into(),
+            state: c.presence.clone(),
+            at: 0,
+        })
+    }
+
     fn prior(&self, user: &str, client: &str, client_seq: u64) -> Option<&Journaled> {
         self.journal
             .iter()
@@ -738,7 +768,9 @@ impl Hub {
                 if let Ok(frame) = &parsed {
                     let reads = matches!(
                         frame,
-                        ClientControl::Hello { .. } | ClientControl::Checksum { .. }
+                        ClientControl::Hello { .. }
+                            | ClientControl::Checksum { .. }
+                            | ClientControl::Awareness { .. }
                     );
                     if !reads && client.is_some() {
                         if let Some(code) = self.write_refusal(&user) {
@@ -871,6 +903,39 @@ impl Hub {
                 ));
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.client = Some(client_id);
+                    c.presence = None;
+                }
+                // Presence: the newcomer hears who else is here, and they hear it.
+                let peers = self
+                    .conns
+                    .keys()
+                    .filter(|id| **id != conn)
+                    .filter_map(|id| self.peer(*id))
+                    .collect();
+                self.reply(conn, &ServerControl::PresenceSnapshot { peers });
+                if let Some(peer) = self.peer(conn) {
+                    self.relay(
+                        conn,
+                        Message::Text(
+                            serde_json::to_string(&ServerControl::Presence { peer }).expect("json"),
+                        ),
+                    );
+                }
+            }
+            Ok(ClientControl::Awareness { state, .. }) => {
+                if client.is_none() {
+                    return;
+                }
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.presence = Some(state);
+                }
+                if let Some(peer) = self.peer(conn) {
+                    self.relay(
+                        conn,
+                        Message::Text(
+                            serde_json::to_string(&ServerControl::Presence { peer }).expect("json"),
+                        ),
+                    );
                 }
             }
             Ok(ClientControl::Checksum {

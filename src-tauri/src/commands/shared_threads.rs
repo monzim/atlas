@@ -47,6 +47,7 @@ use atlas_thread_sync::{
     RunSpec, SharePreview, SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError,
     WsTransport,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -61,6 +62,12 @@ pub const SHARED_RUN_FRAME_EVENT: &str = "atlas:shared-run-frame";
 
 /// The window event channel for join requests, heard by the owner (ATL-406).
 pub const SHARED_JOIN_REQUEST_EVENT: &str = "atlas:shared-thread-join-requested";
+
+/// Pushed whenever who is here, or what they are doing, changes (ATL-407).
+pub const SHARED_PRESENCE_EVENT: &str = "atlas:shared-thread-presence";
+
+/// Pushed when a file open in the Atlas editor changed (ATL-407).
+pub const SHARED_DOC_UPDATE_EVENT: &str = "atlas:shared-doc-update";
 
 /// What the person sees about one Shared Thread this machine has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +222,23 @@ struct RunFrameEvent {
     run_no: u64,
     /// The `SessionDelta` the Runner's agent emitted, as JSON.
     delta: serde_json::Value,
+}
+
+/// Who is here, for the avatars and the editor's carets (ATL-407).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PresenceEvent {
+    shared_thread_id: String,
+    peers: Vec<atlas_thread_sync::PeerView>,
+}
+
+/// A change to a file open in the Atlas editor: a Yjs update, base64.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocUpdateEvent {
+    shared_thread_id: String,
+    file_id: u64,
+    update: String,
 }
 
 /// Somebody asked to join, for the owner's panel (ATL-406).
@@ -906,6 +930,25 @@ async fn start(
                             },
                         );
                     }
+                    ThreadEvent::Presence(peers) => {
+                        let _ = forward.emit(
+                            SHARED_PRESENCE_EVENT,
+                            PresenceEvent {
+                                shared_thread_id: shared_thread_id.clone(),
+                                peers,
+                            },
+                        );
+                    }
+                    ThreadEvent::DocUpdate { file_id, update } => {
+                        let _ = forward.emit(
+                            SHARED_DOC_UPDATE_EVENT,
+                            DocUpdateEvent {
+                                shared_thread_id: shared_thread_id.clone(),
+                                file_id,
+                                update: base64::engine::general_purpose::STANDARD.encode(update),
+                            },
+                        );
+                    }
                 }
             }
         });
@@ -1037,6 +1080,117 @@ pub async fn shared_thread_apply(
         .await
         .map_err(|_| disconnected())?
         .map_err(|e| SharedThreadError::new("apply_failed", e))
+}
+
+// ---------------------------------------------------------------------------
+// The Atlas editor in a Shared Thread (ATL-407)
+// ---------------------------------------------------------------------------
+
+/// A file of a joined thread's replica, opened in the Atlas editor.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedDoc {
+    pub shared_thread_id: String,
+    pub file_id: u64,
+    /// The document now: one Yjs update, base64.
+    pub state: String,
+}
+
+/// If `path` is a text file in a joined thread's replica, bind the editor to
+/// it: keystrokes then sync as they are typed, and changes from anywhere
+/// arrive as `atlas:shared-doc-update`. `None` for any other file, which the
+/// editor opens as usual.
+#[tauri::command]
+pub async fn shared_thread_doc_open(app: AppHandle, path: String) -> Result<Option<SharedDoc>> {
+    let found = {
+        let state = app.state::<SharedThreadsState>();
+        let running = state.running.lock().map_err(|_| poisoned())?;
+        running.iter().find_map(|(id, r)| {
+            let root = r.status.borrow().worktree.clone();
+            let rel = Path::new(&path).strip_prefix(&root).ok()?;
+            Some((
+                id.clone(),
+                r.commands.clone(),
+                rel.to_string_lossy().replace('\\', "/"),
+            ))
+        })
+    };
+    let Some((shared_thread_id, commands, rel)) = found else {
+        return Ok(None);
+    };
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::OpenDoc { path: rel, reply })
+        .map_err(|_| disconnected())?;
+    Ok(answer
+        .await
+        .map_err(|_| disconnected())?
+        .map(|doc| SharedDoc {
+            shared_thread_id,
+            file_id: doc.file_id,
+            state: base64::engine::general_purpose::STANDARD.encode(doc.state),
+        }))
+}
+
+#[tauri::command]
+pub fn shared_thread_doc_close(
+    app: AppHandle,
+    shared_thread_id: String,
+    file_id: u64,
+) -> Result<()> {
+    if let Ok(commands) = commands_for(&app, &shared_thread_id) {
+        let _ = commands.send(SyncCommand::CloseDoc(file_id));
+    }
+    Ok(())
+}
+
+/// Keystrokes from the Atlas editor: one batched Yjs update, base64. Refused
+/// (`not_syncing`, with why) where a save would not sync — a viewer, a
+/// closed thread, a file that now looks like a secret; the editor then
+/// saves to disk instead.
+#[tauri::command]
+pub async fn shared_thread_doc_update(
+    app: AppHandle,
+    shared_thread_id: String,
+    file_id: u64,
+    update: String,
+) -> Result<()> {
+    let update = base64::engine::general_purpose::STANDARD
+        .decode(update)
+        .map_err(|_| SharedThreadError::new("bad_request", "the update is not base64"))?;
+    let commands = commands_for(&app, &shared_thread_id)?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::EditorUpdate {
+            file_id,
+            update,
+            reply,
+        })
+        .map_err(|_| disconnected())?;
+    answer
+        .await
+        .map_err(|_| disconnected())?
+        .map_err(|e| SharedThreadError::new("not_syncing", e))
+}
+
+/// The person's selections in a file of the Atlas editor, as `[anchor, head]`
+/// UTF-16 offsets, and whether they are typing there.
+#[tauri::command]
+pub fn shared_thread_cursors(
+    app: AppHandle,
+    shared_thread_id: String,
+    file_id: u64,
+    cursors: Vec<[u64; 2]>,
+    typing: bool,
+) -> Result<()> {
+    let commands = commands_for(&app, &shared_thread_id)?;
+    commands
+        .send(SyncCommand::Cursors {
+            file_id,
+            cursors: cursors.into_iter().take(8).map(|[a, h]| (a, h)).collect(),
+            typing,
+        })
+        .map_err(|_| disconnected())
 }
 
 /// Where and what to ask an agent so it resolves a Conflict.
@@ -1346,6 +1500,22 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
                 run_id: run.run_id.clone(),
                 payload,
             });
+        }
+        // The file the agent is touching, for everyone's badge (ATL-407).
+        if let SessionDelta::ToolCallUpserted { tool_call, .. } = &envelope.delta {
+            let root = run_root(&self.app, &run.shared_thread_id).ok();
+            let touched = tool_call
+                .locations
+                .iter()
+                .find_map(|l| l.get("path").and_then(|p| p.as_str()))
+                .and_then(|p| Some(Path::new(p).strip_prefix(root.as_ref()?).ok()?.to_owned()))
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+            if touched.is_some() {
+                let _ = commands.send(SyncCommand::RunFile {
+                    run_id: run.run_id.clone(),
+                    path: touched,
+                });
+            }
         }
         let interrupted = match &envelope.delta {
             SessionDelta::TurnFinished { .. } => false,

@@ -51,8 +51,8 @@ pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
 pub use session::Verification;
 pub use session::{
-    Bootstrapped, ConflictView, Resolve, RunView, SessionError, ShareReport, ThreadEvent,
-    ThreadSession,
+    Bootstrapped, ConflictView, OpenedDoc, PeerCursor, PeerRun, PeerView, Resolve, RunView,
+    SessionError, ShareReport, ThreadEvent, ThreadSession,
 };
 pub use share::{ShareFile, ShareKind, SharePreview};
 pub use store::{FakeStore, ObjectStore, StoreError};
@@ -60,6 +60,7 @@ pub use transport::{
     Connector, FakeConnector, FakeThreadServer, FakeTransport, Message, NoReconnect, Transport,
     TransportError, WsTransport,
 };
+pub use wire::SyncState;
 
 /// What the app can ask a running thread to do.
 pub enum Command {
@@ -80,7 +81,10 @@ pub enum Command {
     },
     /// One live frame of a Run this replica started — a serialized
     /// `SessionDelta`. Best effort: the Session drain is the record.
-    RunFrame { run_id: String, payload: Vec<u8> },
+    RunFrame {
+        run_id: String,
+        payload: Vec<u8>,
+    },
     /// The Run's turn ended: merge it back — or, for a Run asked to resolve
     /// a Conflict (ATL-410), resolve it with what the agent wrote.
     FinishRun {
@@ -97,6 +101,33 @@ pub enum Command {
     },
     /// Conflicts read over REST when the thread was opened.
     SeedConflicts(Vec<wire::ThreadConflict>),
+    /// Open a file of the replica in the Atlas editor (ATL-407): its
+    /// document now, or `None` for a path the thread does not hold as text.
+    OpenDoc {
+        path: String,
+        reply: oneshot::Sender<Option<OpenedDoc>>,
+    },
+    CloseDoc(u64),
+    /// Keystrokes from the Atlas editor, one batched Yjs update. An error
+    /// says why they may not sync; the editor then saves to disk instead.
+    EditorUpdate {
+        file_id: u64,
+        update: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// The person's selections in a file of the Atlas editor, and whether
+    /// they are typing there.
+    Cursors {
+        file_id: u64,
+        cursors: Vec<(u64, u64)>,
+        typing: bool,
+    },
+    /// The file one of this machine's Runs is touching, by its path in the
+    /// Run worktree; `None` between files.
+    RunFile {
+        run_id: String,
+        path: Option<String>,
+    },
     /// Write the thread's changes into the person's checkout (ATL-408).
     Apply {
         checkout: PathBuf,
@@ -104,7 +135,9 @@ pub enum Command {
         reply: oneshot::Sender<Result<ApplyOutcome, String>>,
     },
     /// The Run will not finish: mark it interrupted.
-    InterruptRun { run_id: String },
+    InterruptRun {
+        run_id: String,
+    },
     /// Whether to send this repository's history to teammates who lack the
     /// Base (ATL-402). Off until the person agrees.
     ServeHistory(bool),
@@ -155,6 +188,10 @@ pub struct SyncStatus {
     pub outgrown: Vec<String>,
     /// The thread's Conflicts, open ones first (ATL-410).
     pub conflicts: Vec<ConflictView>,
+    /// Everybody else here, and what they are doing (ATL-407).
+    pub peers: Vec<PeerView>,
+    /// Whether this replica is current, syncing or behind.
+    pub sync: Option<SyncState>,
     pub error: Option<String>,
 }
 
@@ -177,6 +214,8 @@ fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) ->
         closed: session.is_closed(),
         outgrown: replica.outgrown_files(),
         conflicts: session.conflicts(),
+        peers: session.peers(),
+        sync: Some(session.sync_state()),
         error,
     }
 }
@@ -427,6 +466,40 @@ pub async fn run_with<C: Connector>(
                 );
                 result.map(|_| ())
             }
+            Event::Command(Some(Command::OpenDoc { path, reply })) => {
+                let _ = reply.send(session.open_doc(&path));
+                Ok(())
+            }
+            Event::Command(Some(Command::CloseDoc(file_id))) => {
+                session.close_doc(file_id);
+                Ok(())
+            }
+            Event::Command(Some(Command::EditorUpdate {
+                file_id,
+                update,
+                reply,
+            })) => {
+                let result = session.editor_update(file_id, update).await;
+                let _ = reply.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                // A refusal is the editor's to handle; it is not the loop's error.
+                match result {
+                    Err(SessionError::ReadOnly(_)) => Ok(()),
+                    other => other,
+                }
+            }
+            Event::Command(Some(Command::Cursors {
+                file_id,
+                cursors,
+                typing,
+            })) => {
+                session.set_cursors(file_id, cursors);
+                session.set_typing(typing.then_some(file_id));
+                Ok(())
+            }
+            Event::Command(Some(Command::RunFile { run_id, path })) => {
+                session.set_run_file(&run_id, path.as_deref());
+                Ok(())
+            }
             Event::Command(Some(Command::SeedConflicts(conflicts))) => {
                 session.seed_conflicts(conflicts);
                 Ok(())
@@ -504,6 +577,12 @@ pub async fn run_with<C: Connector>(
             if let Err(e) = session.flush_unsent().await {
                 error.get_or_insert_with(|| e.to_string());
             }
+        }
+        // Editors bound to a file hear what changed in it; everyone hears
+        // where this replica is (ATL-407).
+        session.flush_docs();
+        if let Err(e) = session.flush_awareness().await {
+            tracing::debug!(target: "atlas_thread_sync", "awareness: {e}");
         }
         let wants = session.take_bundle_wants();
         if let Err(e) = session.serve_bundles(wants).await {

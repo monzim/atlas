@@ -38,8 +38,9 @@ import {
   type SharedThreadRun,
   type SharedThreadView,
 } from "../lib/shared-threads-api";
-import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
+import { runKey, usePeers, useSharedThreadsStore } from "../stores/shared-threads-store";
 import { ApplyPanel } from "./apply-panel";
+import { PresenceBar, SyncBadge } from "./presence-bar";
 import { ConflictList, conflictPlace, type ConflictAction } from "./conflict-view";
 import { OwnerPanel } from "./owner-panel";
 import { SharePreviewList, uploads } from "./share-preview";
@@ -336,6 +337,7 @@ function ThreadCard({
   }
 
   const mayRun = thread.role !== "viewer" && status.readOnly === null;
+  const peers = usePeers(thread.sharedThreadId);
 
   /**
    * Resolve a Conflict (ATL-410). Asking an agent is itself a Run: an agent
@@ -375,14 +377,13 @@ function ThreadCard({
         <span className="min-w-0 flex-1 truncate font-medium text-[var(--foreground)]">
           {thread.title}
         </span>
-        <Badge variant={status.connected ? "success" : "outline"}>
-          {status.connected ? "Live" : "Offline"}
-        </Badge>
+        <SyncBadge sync={status.sync ?? null} connected={status.connected} />
         {status.closed && <Badge variant="outline">Closed</Badge>}
         <Badge variant="secondary" className="capitalize">
           {thread.role}
         </Badge>
       </div>
+      <PresenceBar peers={peers} />
       <div className="flex flex-wrap gap-x-3 gap-y-1 text-[var(--muted-foreground)]">
         <span className="font-mono">base {thread.base.slice(0, 8)}</span>
         <span className="tabular-nums">
@@ -592,6 +593,14 @@ function RunList({ threadId, runs }: { threadId: string; runs: SharedThreadRun[]
               </span>
               <Badge variant={status.variant}>{status.label}</Badge>
             </div>
+            {run.status === "running" && run.currentFile && (
+              <span className="flex items-center gap-1 truncate text-[var(--secondary-foreground)]">
+                <Badge variant="secondary">Editing</Badge>
+                <span className="truncate font-mono" title={run.currentFile}>
+                  {run.currentFile}
+                </span>
+              </span>
+            )}
             <span className="truncate text-[var(--muted-foreground)]">
               {run.promptedBy === run.runnerId
                 ? `Prompted and run by ${run.runnerId}`

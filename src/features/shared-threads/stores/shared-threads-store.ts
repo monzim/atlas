@@ -14,8 +14,10 @@ import { createSelectors } from "@/lib/create-selectors";
 import {
   listThreads,
   onJoinRequested,
+  onSharedPresence,
   onSharedRunFrame,
   onSharedThreadsChanged,
+  type SharedPeer,
   type SharedRunFrame,
   type SharedThreadView,
 } from "../lib/shared-threads-api";
@@ -38,6 +40,11 @@ interface SharedThreadsState {
   live: Record<string, string>;
   /** Bumped per thread whenever somebody asks to join, so the owner panel refetches. */
   joinRequests: Record<string, number>;
+  /**
+   * Everybody else on each thread, as presence last said (ATL-407) — pushed
+   * on every cursor move, so kept apart from the heavier thread views.
+   */
+  peers: Record<string, SharedPeer[]>;
   loaded: boolean;
   load: () => Promise<void>;
   apply: (threads: SharedThreadView[]) => void;
@@ -51,12 +58,16 @@ const useSharedThreadsStoreBase = create<SharedThreadsState>((set, get) => ({
   lastResult: null,
   live: {},
   joinRequests: {},
+  peers: {},
   loaded: false,
   load: async () => {
     if (get().loaded) return;
     set({ loaded: true });
     void onSharedThreadsChanged((threads) => get().apply(threads));
     void onSharedRunFrame((frame) => get().heard(frame));
+    void onSharedPresence(({ sharedThreadId, peers }) =>
+      set((state) => ({ peers: { ...state.peers, [sharedThreadId]: peers } })),
+    );
     void onJoinRequested(({ sharedThreadId }) =>
       set((state) => ({
         joinRequests: {
@@ -71,7 +82,14 @@ const useSharedThreadsStoreBase = create<SharedThreadsState>((set, get) => ({
       // Not signed in, or the backend is not up yet: the next push fills it.
     }
   },
-  apply: (threads) => set({ threads }),
+  // A status push carries presence too; it seeds a thread nobody has moved in yet.
+  apply: (threads) =>
+    set((state) => ({
+      threads,
+      peers: Object.fromEntries(
+        threads.map((t) => [t.sharedThreadId, state.peers[t.sharedThreadId] ?? t.status.peers ?? []]),
+      ),
+    })),
   heard: ({ sharedThreadId, runNo, delta }) => {
     // Only the answer's text is drawn on a chip; the full Run is the Runner's
     // Session, read from the timeline once it lands.
@@ -114,4 +132,12 @@ export function runLockFor(threads: SharedThreadView[], cwd: string | null | und
 export function useRunLock(cwd: string | null | undefined): string | null {
   const threads = useSharedThreadsStore.use.threads();
   return runLockFor(threads, cwd);
+}
+
+const NOBODY: SharedPeer[] = [];
+
+/** Everybody else on `sharedThreadId` now. */
+export function usePeers(sharedThreadId: string | null | undefined): SharedPeer[] {
+  const peers = useSharedThreadsStore.use.peers();
+  return (sharedThreadId && peers[sharedThreadId]) || NOBODY;
 }

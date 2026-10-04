@@ -17,16 +17,16 @@ use crate::apply::{self as applying, ApplyError, ApplyOutcome, ThreadChange};
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::git;
 use crate::merge::{self, MergeError};
-use crate::replica::{kind_of, LocalChange, Replica, ReplicaError};
+use crate::replica::{kind_of, EditorEdit, LocalChange, Replica, ReplicaError};
 use crate::runs::{ActiveRun, Fork, ForkBinary, RunReport, RunSpec, RunWorktree};
 use crate::secrets::{secret_reason, SecretReason};
 use crate::share::{self, ShareKind};
 use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{
-    self, BundleFailure, ChecksumStatus, ClientControl, ConflictHunk, ConflictSide, FileHash,
-    FileKind, FileVersion, Frame, FrameKind, LineRange, MergeFile, Role, RunOutcome, ServerControl,
-    ThreadConflict, ThreadRun, ThreadStatus,
+    self, AwarenessState, BundleFailure, ChecksumStatus, ClientControl, ConflictHunk, ConflictSide,
+    Cursor, FileHash, FileKind, FileVersion, Frame, FrameKind, LineRange, MergeFile, Peer, Role,
+    RunAt, RunOutcome, ServerControl, SyncState, ThreadConflict, ThreadRun, ThreadStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +100,52 @@ pub enum ThreadEvent {
         kind: u8,
         payload: Vec<u8>,
     },
+    /// Who is here and what they are doing changed (ATL-407).
+    Presence(Vec<PeerView>),
+    /// A file open in the Atlas editor changed: apply `update` to the
+    /// editor's copy of its document (ATL-407). It may hold changes the
+    /// editor already has, which Yjs ignores.
+    DocUpdate { file_id: u64, update: Vec<u8> },
+}
+
+/// A peer as the app shows it: its awareness with file ids turned into paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerView {
+    pub peer_id: String,
+    pub user_id: String,
+    pub role: Role,
+    pub surface: String,
+    /// The file it is typing in.
+    pub typing: Option<String>,
+    pub cursors: Vec<PeerCursor>,
+    /// Its Runs in flight and the file each is touching.
+    pub runs: Vec<PeerRun>,
+    pub sync: Option<SyncState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerCursor {
+    pub file_id: u64,
+    pub path: Option<String>,
+    pub anchor: u64,
+    pub head: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerRun {
+    pub run_id: String,
+    pub path: Option<String>,
+}
+
+/// What a file opened in the Atlas editor starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedDoc {
+    pub file_id: u64,
+    /// The whole document, as one Yjs update.
+    pub state: Vec<u8>,
 }
 
 /// A Run as the app shows it: the server's view plus the files its merge
@@ -110,6 +156,8 @@ pub struct RunView {
     #[serde(flatten)]
     pub run: ThreadRun,
     pub files: Vec<String>,
+    /// The file it is touching now, as its Runner says (ATL-407).
+    pub current_file: Option<String>,
 }
 
 /// Bundle requests kept while the person has not agreed to send history.
@@ -228,6 +276,13 @@ pub struct ThreadSession<T: Transport> {
     /// Conflicts heard of (ATL-410), by id: raised live, or seeded from the
     /// thread's REST read when the app opens it.
     conflicts: BTreeMap<u64, ThreadConflict>,
+    /// Everybody else on the socket, by peer id (ATL-407).
+    peers: BTreeMap<String, Peer>,
+    /// What this replica says about itself, and what it last said.
+    awareness: AwarenessState,
+    said: Option<AwarenessState>,
+    /// Files open in the Atlas editor, with the state vector it was last sent.
+    open_docs: HashMap<u64, Vec<u8>>,
     /// `client_seq`s whose answer a caller is waiting for, and the answers.
     awaiting: HashSet<u64>,
     answers: HashMap<u64, Answer>,
@@ -310,6 +365,10 @@ impl<T: Transport> ThreadSession<T> {
             versions: HashMap::new(),
             runs: BTreeMap::new(),
             conflicts: BTreeMap::new(),
+            peers: BTreeMap::new(),
+            awareness: AwarenessState::default(),
+            said: None,
+            open_docs: HashMap::new(),
             awaiting: HashSet::new(),
             answers: HashMap::new(),
             events: None,
@@ -341,6 +400,9 @@ impl<T: Transport> ThreadSession<T> {
     /// Say hello from `since` and handle the catch-up until `synced`. Answers
     /// `true` when the server says this replica is ahead of it instead.
     async fn greet(&mut self, since: u64) -> Result<bool, SessionError> {
+        // A new socket: presence starts over, and this replica says its piece again.
+        self.peers.clear();
+        self.said = None;
         let hello = ClientControl::Hello {
             protocol: wire::PROTOCOL_VERSION,
             client_id: self.client_id.clone(),
@@ -918,7 +980,27 @@ impl<T: Transport> ThreadSession<T> {
 
     /// The Runs this session has heard of, newest first.
     pub fn runs(&self) -> Vec<RunView> {
-        let mut runs: Vec<RunView> = self.runs.values().cloned().collect();
+        let at: HashMap<&str, Option<u64>> = self
+            .peers
+            .values()
+            .filter_map(|p| p.state.as_ref())
+            .chain(std::iter::once(&self.awareness))
+            .flat_map(|s| s.runs.iter().map(|r| (r.run_id.as_str(), r.file_id)))
+            .collect();
+        let mut runs: Vec<RunView> = self
+            .runs
+            .values()
+            .cloned()
+            .map(|mut view| {
+                view.current_file = at
+                    .get(view.run.run_id.as_str())
+                    .copied()
+                    .flatten()
+                    .filter(|_| view.run.status == "running")
+                    .and_then(|id| self.replica.path_of(id));
+                view
+            })
+            .collect();
         runs.sort_by_key(|r| std::cmp::Reverse(r.run.run_no));
         runs
     }
@@ -1571,6 +1653,191 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     // -----------------------------------------------------------------------
+    // Presence, the Atlas editor and sync state (ATL-407)
+    // -----------------------------------------------------------------------
+
+    /// Everybody else here now, with paths for the files they point at.
+    pub fn peers(&self) -> Vec<PeerView> {
+        self.peers.values().map(|p| self.peer_view(p)).collect()
+    }
+
+    fn peer_view(&self, p: &Peer) -> PeerView {
+        let state = p.state.clone().unwrap_or_default();
+        PeerView {
+            peer_id: p.peer_id.clone(),
+            user_id: p.user_id.clone(),
+            role: p.role,
+            surface: p.surface.clone(),
+            typing: state.typing.and_then(|id| self.replica.path_of(id)),
+            cursors: state
+                .cursors
+                .iter()
+                .map(|c| PeerCursor {
+                    file_id: c.file_id,
+                    path: self.replica.path_of(c.file_id),
+                    anchor: c.anchor,
+                    head: c.head,
+                })
+                .collect(),
+            runs: state
+                .runs
+                .iter()
+                .map(|r| PeerRun {
+                    run_id: r.run_id.clone(),
+                    path: r.file_id.and_then(|id| self.replica.path_of(id)),
+                })
+                .collect(),
+            sync: state.sync,
+        }
+    }
+
+    fn tell_presence(&self) {
+        if let Some(events) = &self.events {
+            let _ = events.send(ThreadEvent::Presence(self.peers()));
+        }
+    }
+
+    /// How far this replica is from the thread, as it says of itself:
+    /// `behind` while offline, `syncing` while its own changes are not all
+    /// acknowledged (or saves made offline wait to go), `current` otherwise.
+    pub fn sync_state(&self) -> SyncState {
+        if !self.is_connected() {
+            SyncState::Behind
+        } else if !self.unacked.is_empty()
+            || !self.offline.is_empty()
+            || !self.pending_snapshots.is_empty()
+        {
+            SyncState::Syncing
+        } else {
+            SyncState::Current
+        }
+    }
+
+    /// The person's selections in one file of the Atlas editor (at most
+    /// eight are kept across files); an empty list clears that file's.
+    pub fn set_cursors(&mut self, file_id: u64, cursors: Vec<(u64, u64)>) {
+        self.awareness.cursors.retain(|c| c.file_id != file_id);
+        let room = 8usize.saturating_sub(self.awareness.cursors.len());
+        self.awareness
+            .cursors
+            .extend(cursors.into_iter().take(room).map(|(anchor, head)| Cursor {
+                file_id,
+                anchor,
+                head,
+            }));
+    }
+
+    /// The file the person is typing in, or `None` once they stop.
+    pub fn set_typing(&mut self, file_id: Option<u64>) {
+        self.awareness.typing = file_id;
+    }
+
+    /// The file one of this replica's Runs is touching now, by its path in
+    /// the Run worktree; `None` between files. A Run that ends drops out.
+    pub fn set_run_file(&mut self, run_id: &str, path: Option<&str>) {
+        let file_id = path.and_then(|p| self.replica.file_id(p));
+        let runs = &mut self.awareness.runs;
+        match runs.iter().position(|r| r.run_id == run_id) {
+            Some(i) => runs[i].file_id = file_id,
+            None if runs.len() < 8 => runs.push(RunAt {
+                run_id: run_id.to_string(),
+                file_id,
+            }),
+            None => {}
+        }
+    }
+
+    /// Say what changed about this replica since it last said anything —
+    /// its sync state included. Never acked, so nothing waits on it.
+    pub async fn flush_awareness(&mut self) -> Result<(), SessionError> {
+        if !self.is_connected() {
+            return Ok(());
+        }
+        let running: HashSet<String> = self
+            .runs
+            .values()
+            .filter(|v| v.run.status == "running")
+            .map(|v| v.run.run_id.clone())
+            .collect();
+        self.awareness.runs.retain(|r| running.contains(&r.run_id));
+        let mut state = self.awareness.clone();
+        state.sync = Some(self.sync_state());
+        if self.said.as_ref() == Some(&state) {
+            return Ok(());
+        }
+        let client_seq = self.take_client_seq();
+        self.send_control(&ClientControl::Awareness {
+            client_seq,
+            state: state.clone(),
+        })
+        .await?;
+        self.said = Some(state);
+        Ok(())
+    }
+
+    /// Open `path` in the Atlas editor: its document as it is now. Changes
+    /// from anywhere then arrive as [`ThreadEvent::DocUpdate`]. `None` for a
+    /// path the thread does not hold as text.
+    pub fn open_doc(&mut self, path: &str) -> Option<OpenedDoc> {
+        let file_id = self.replica.file_id(path)?;
+        let (state, vector) = self.replica.doc_state(file_id)?;
+        self.open_docs.insert(file_id, vector);
+        Some(OpenedDoc { file_id, state })
+    }
+
+    pub fn close_doc(&mut self, file_id: u64) {
+        self.open_docs.remove(&file_id);
+        self.awareness.cursors.retain(|c| c.file_id != file_id);
+        if self.awareness.typing == Some(file_id) {
+            self.awareness.typing = None;
+        }
+    }
+
+    /// Keystrokes from the Atlas editor, batched into one Yjs update: applied
+    /// to the replica, written to disk, and sent. An error says why they may
+    /// not sync — the editor then saves to disk instead, and the usual rules
+    /// for a save take over.
+    pub async fn editor_update(
+        &mut self,
+        file_id: u64,
+        update: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if let Some(why) = self.read_only() {
+            return Err(SessionError::ReadOnly(why));
+        }
+        if update.len() > wire::MAX_PAYLOAD_BYTES {
+            return Err(SessionError::Refused {
+                code: "payload_too_large".into(),
+                message: "that edit is too large to send as keystrokes".into(),
+            });
+        }
+        match self.replica.apply_editor(file_id, &update)? {
+            EditorEdit::Refused(why) => Err(SessionError::ReadOnly(why)),
+            EditorEdit::Applied(pending) => {
+                self.send_updates(file_id, pending).await?;
+                self.send_updates(file_id, vec![update]).await
+            }
+        }
+    }
+
+    /// What each file open in the Atlas editor gained since it was last sent
+    /// anything, as events. Called after every message and command.
+    pub fn flush_docs(&mut self) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        for (file_id, vector) in self.open_docs.iter_mut() {
+            if let Some((update, now)) = self.replica.doc_diff(*file_id, vector) {
+                *vector = now;
+                let _ = events.send(ThreadEvent::DocUpdate {
+                    file_id: *file_id,
+                    update,
+                });
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Apply (ATL-408)
     // -----------------------------------------------------------------------
 
@@ -1742,6 +2009,7 @@ impl<T: Transport> ThreadSession<T> {
                     RunView {
                         run,
                         files: Vec::new(),
+                        current_file: None,
                     },
                 );
             }
@@ -2350,6 +2618,19 @@ impl<T: Transport> ThreadSession<T> {
                             conflicts: conflicts.into_iter().map(|c| c.conflict_id).collect(),
                         },
                     ),
+                    ServerControl::PresenceSnapshot { peers } => {
+                        self.peers = peers.into_iter().map(|p| (p.peer_id.clone(), p)).collect();
+                        self.tell_presence();
+                    }
+                    ServerControl::Presence { peer } => {
+                        self.peers.insert(peer.peer_id.clone(), peer);
+                        self.tell_presence();
+                    }
+                    ServerControl::PresenceLeft { peer_id, .. } => {
+                        if self.peers.remove(&peer_id).is_some() {
+                            self.tell_presence();
+                        }
+                    }
                     ServerControl::ConflictRaised { conflict } => {
                         self.conflicts.insert(conflict.conflict_id, conflict);
                         while self.conflicts.len() > CONFLICTS_KEPT {

@@ -169,6 +169,15 @@ pub enum LocalChange {
     Buffered,
 }
 
+/// What the Atlas editor's edit came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorEdit {
+    /// Applied; these updates (a save from another editor) go out first.
+    Applied(Vec<Vec<u8>>),
+    /// Not applied, and why.
+    Refused(String),
+}
+
 /// One file of the thread, for Apply.
 #[derive(Debug, Clone)]
 pub struct ThreadFile {
@@ -929,6 +938,74 @@ impl Replica {
             self.sync_disk(file_id)?;
         }
         Ok(updates)
+    }
+
+    /// The Atlas editor's keystrokes in a file (ATL-407): a Yjs update made
+    /// on a copy of this file's document, applied here and written to disk so
+    /// every other editor sees it. A save from another editor that this
+    /// replica has not read yet is folded in first and returned, to send.
+    ///
+    /// Refused — nothing applied — where a save would not sync either: a
+    /// replica that may only watch, a file held or outgrown, or an edit that
+    /// would make the file look like it holds a secret or grow past 1 MiB.
+    /// The editor then writes to disk instead, and the usual rules take over.
+    pub fn apply_editor(
+        &mut self,
+        file_id: u64,
+        update: &[u8],
+    ) -> Result<EditorEdit, ReplicaError> {
+        let file = self
+            .files
+            .get(&file_id)
+            .ok_or(ReplicaError::UnknownFile(file_id))?;
+        if self.read_only {
+            return Ok(EditorEdit::Refused("this replica may only watch".into()));
+        }
+        if file.kind != FileKind::Text
+            || file.deleted
+            || file.held.is_some()
+            || file.outgrown
+            || !self.materialized
+        {
+            return Ok(EditorEdit::Refused(format!(
+                "{} is not syncing keystrokes",
+                file.path
+            )));
+        }
+        let after = FileDoc::from_snapshot(random_client_id(), &file.doc.snapshot())?;
+        after.apply(update)?;
+        let content = after.content();
+        if content.len() >= MAX_TEXT_BYTES {
+            return Ok(EditorEdit::Refused(format!("{} is past 1 MB", file.path)));
+        }
+        if secret_reason(&file.path, &content).is_some() {
+            return Ok(EditorEdit::Refused(format!(
+                "{} now looks like it holds a secret",
+                file.path
+            )));
+        }
+        let pending = self.ingest_disk(file_id)?;
+        self.files[&file_id].doc.apply(update)?;
+        self.sync_disk(file_id)?;
+        Ok(EditorEdit::Applied(pending))
+    }
+
+    /// A file's document as one update, and its state vector — what an
+    /// editor binding to it starts from.
+    pub fn doc_state(&self, file_id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let file = self.files.get(&file_id)?;
+        (file.kind == FileKind::Text).then(|| (file.doc.snapshot(), file.doc.state_vector()))
+    }
+
+    /// What `file_id`'s document has beyond `state_vector`, and its state
+    /// vector now; `None` when nothing is new.
+    pub fn doc_diff(&self, file_id: u64, state_vector: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let file = self.files.get(&file_id)?;
+        let now = file.doc.state_vector();
+        if now == state_vector {
+            return None;
+        }
+        Some((file.doc.diff(state_vector).ok()?, now))
     }
 
     /// Apply an update from the thread. When the worktree exists the file is
