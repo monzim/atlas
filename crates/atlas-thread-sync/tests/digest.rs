@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_thread_sync::digest::{
-    build, prompt_frame, DigestRun, RunTranscript, DIGEST_BUDGET_CHARS, SUMMARY_INSTRUCTION,
-    SUMMARY_MARK,
+    build, prompt_frame, DigestRun, FileChange, RunTranscript, DIGEST_BUDGET_CHARS,
+    SUMMARY_INSTRUCTION, SUMMARY_MARK,
 };
 use atlas_thread_sync::wire::FrameKind;
 use atlas_thread_sync::{
@@ -42,7 +42,8 @@ fn fixture_session() -> RunTranscript {
             "tool_call": { "id": "c1", "title": "Read banner.css", "status": "completed", "raw_output": "RAW-TOOL-OUTPUT .banner{}" }
         })),
         delta(
-            serde_json::json!({ "kind": "text_chunk", "message_id": "m2", "delta": "Changed the banner to " }),
+            // The final message's first fragment arrives with the message itself.
+            serde_json::json!({ "kind": "message_appended", "message": { "id": "m2", "role": "assistant", "content": "Changed the banner to ", "thinking": "SECRET-THINKING again" } }),
         ),
         delta(
             serde_json::json!({ "kind": "text_chunk", "message_id": "m2", "delta": "green: it matches the brand." }),
@@ -253,18 +254,27 @@ async fn a_run_after_another_participants_run_has_that_run_in_its_digest_and_con
         theirs.files
     );
     // The thread's files against its Base, with line counts.
-    let hero = first
-        .files
-        .iter()
-        .find(|f| f.path == "src/hero.ts")
-        .expect("hero.ts");
-    assert_eq!((hero.added, hero.removed), (1, 0));
-    let banner = first
-        .files
-        .iter()
-        .find(|f| f.path == "src/banner.css")
-        .expect("banner.css");
-    assert_eq!((banner.added, banner.removed), (1, 1));
+    let change = |path: &str| {
+        first
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.change)
+    };
+    assert_eq!(
+        change("src/hero.ts"),
+        Some(FileChange::Lines {
+            added: 1,
+            removed: 0
+        })
+    );
+    assert_eq!(
+        change("src/banner.css"),
+        Some(FileChange::Lines {
+            added: 1,
+            removed: 1
+        })
+    );
     let digest = build(&first, DIGEST_BUDGET_CHARS, names, never)
         .await
         .unwrap();
@@ -303,5 +313,50 @@ async fn a_run_after_another_participants_run_has_that_run_in_its_digest_and_con
     assert_eq!(
         read(&mine.worktree, "src/hero.ts"),
         "export const hero = true;\n"
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_ended_after_my_last_run_forked_is_still_news() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
+    joy.share_working_changes(&w.joy, &[]).await.unwrap();
+    let mut monzim = open(
+        &server,
+        &w.monzim,
+        &w.base,
+        &w.replicas.join("monzim"),
+        "monzim",
+    )
+    .await;
+    monzim.pump(QUIET).await.unwrap();
+    let blobs = FakeStore::default();
+    joy.set_store(Arc::new(blobs.clone()));
+    monzim.set_store(Arc::new(blobs.clone()));
+    let spec = |agent: &str| RunSpec {
+        run_id: RunSpec::new_id(),
+        agent: agent.into(),
+        model: "m".into(),
+        context_anchor: None,
+    };
+    // Joy's Run starts first; Monzim's starts while hers is still going.
+    let joy_runs = RunWorktree::new(&w.joy, &w.base, &w.replicas.join("joy-run"));
+    let monzim_runs = RunWorktree::new(&w.monzim, &w.base, &w.replicas.join("monzim-run"));
+    let hers = joy.start_run(&joy_runs, spec("claude-code")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mine = monzim.start_run(&monzim_runs, spec("codex")).await.unwrap();
+    assert!(hers.run_no < mine.run_no);
+    monzim.finish_run(&mine, &monzim_runs).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    write(&hers.worktree, "src/hero.ts", "export const hero = true;\n");
+    joy.finish_run(&hers, &joy_runs).await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+
+    // Hers has the lower number, but my last Run never saw what it did.
+    let next = monzim.digest_input("Banner colour", DigestScope::Since(Some(mine.run_no)));
+    assert_eq!(
+        next.runs.iter().map(|r| r.run_no).collect::<Vec<_>>(),
+        vec![hers.run_no]
     );
 }

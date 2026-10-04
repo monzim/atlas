@@ -69,6 +69,25 @@ impl RunTranscript {
                     self.prompt = Some(cut_head(text, PROMPT_KEPT));
                 }
             }
+            // A message starts with its first fragment; the rest arrives as
+            // `text_chunk`s addressed to its id.
+            Some("message_appended") => {
+                let Some(message) = delta.get("message") else {
+                    return;
+                };
+                if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                    return;
+                }
+                self.message = message
+                    .get("id")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+                self.answer = message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+            }
             Some("text_chunk") => {
                 let Some(text) = delta.get("delta").and_then(|t| t.as_str()) else {
                     return;
@@ -112,10 +131,15 @@ pub struct DigestRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestFile {
     pub path: String,
-    pub added: usize,
-    pub removed: usize,
-    pub binary: bool,
-    pub deleted: bool,
+    pub change: FileChange,
+}
+
+/// How a file differs from the Base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Lines { added: usize, removed: usize },
+    Binary,
+    Deleted,
 }
 
 /// An open Conflict.
@@ -139,7 +163,8 @@ pub struct DigestComment {
 /// Which Runs a digest covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestScope {
-    /// Everything since this agent session's last Run — `None` on its first.
+    /// Everything this agent session has not seen: Runs after its last Run,
+    /// and Runs that ended after that Run forked — `None` on its first.
     Since(Option<u64>),
     /// Continue from here: everything up to and including this Run.
     UpTo(u64),
@@ -158,12 +183,11 @@ pub struct DigestInput {
 }
 
 impl DigestInput {
-    /// Nothing anyone else did: no digest at all.
+    /// Nothing new to tell: no Run in scope, nothing waiting on a decision.
+    /// The changed files alone are no news — the agent finds them in its
+    /// worktree — so they ride along only with something that is.
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty()
-            && self.files.is_empty()
-            && self.conflicts.is_empty()
-            && self.comments.is_empty()
+        self.runs.is_empty() && self.conflicts.is_empty() && self.comments.is_empty()
     }
 }
 
@@ -298,12 +322,10 @@ fn rest_sections(input: &DigestInput, name: &impl Fn(&str) -> String) -> String 
     if !input.files.is_empty() {
         out.push_str("## Files this thread changed (against its Base)\n");
         for f in input.files.iter().take(FILES_LISTED) {
-            let what = if f.deleted {
-                "deleted".to_string()
-            } else if f.binary {
-                "binary".to_string()
-            } else {
-                format!("+{} -{}", f.added, f.removed)
+            let what = match f.change {
+                FileChange::Deleted => "deleted".to_string(),
+                FileChange::Binary => "binary".to_string(),
+                FileChange::Lines { added, removed } => format!("+{added} -{removed}"),
             };
             out.push_str(&format!("- {} {what}\n", plain(&f.path)));
         }

@@ -39,6 +39,9 @@
 //! unresolved comments, quoted as data — or, after "continue from here", the
 //! thread's work up to the chosen Run. Over budget, the oldest Runs are
 //! summarized by the `atlas-ai` gateway on the Runner's own entitlement.
+//! A slash command goes to its agent without one: it must stay at byte 0.
+//! Where each session's last Run was is kept in memory, so after a restart
+//! the first digest covers the whole thread again.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1408,10 +1411,21 @@ pub async fn begin_run(
             reply,
         })
         .map_err(|_| disconnected().message)?;
-    let started = answer
-        .await
-        .map_err(|_| disconnected().message)?
-        .map_err(|e| format!("This Shared Thread refused the Run: {e}"))?;
+    let started = match answer.await {
+        Ok(Ok(started)) => started,
+        refused => {
+            // The Run never began: "continue from here" still applies to the next one.
+            if let Some(run_no) = anchor {
+                if let Ok(mut pending) = app.state::<SharedThreadsState>().continue_from.lock() {
+                    pending.entry(shared_thread_id.clone()).or_insert(run_no);
+                }
+            }
+            return Err(match refused {
+                Ok(Err(e)) => format!("This Shared Thread refused the Run: {e}"),
+                _ => disconnected().message,
+            });
+        }
+    };
     tag_session(app, session_id, &shared_thread_id);
     // The prompt, as the Run's first live frame: no `SessionDelta` carries
     // it, and every other replica's digest needs it.
@@ -1563,15 +1577,7 @@ async fn open_comments(app: &AppHandle, entry: &SharedThreadEntry) -> Vec<Digest
     let Ok(token) = token(app).await else {
         return Vec::new();
     };
-    let Ok(res) = reqwest::Client::new()
-        .get(thread_url(entry, "/comments"))
-        .bearer_auth(token)
-        .send()
-        .await
-    else {
-        return Vec::new();
-    };
-    let Ok(list) = res.json::<List>().await else {
+    let Ok(list) = get_json::<List>(&thread_url(entry, "/comments"), &token).await else {
         return Vec::new();
     };
     list.comments

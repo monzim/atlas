@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use crate::apply::{self as applying, ApplyError, ApplyOutcome, ThreadChange};
 use crate::bootstrap::{self, BootstrapError, ThreadRepo};
 use crate::digest::{
-    line_stats, DigestConflict, DigestFile, DigestInput, DigestRun, DigestScope, RunTranscript,
+    line_stats, DigestConflict, DigestFile, DigestInput, DigestRun, DigestScope, FileChange,
+    RunTranscript,
 };
 use crate::git;
 use crate::merge::{self, MergeError};
@@ -2116,12 +2117,26 @@ impl<T: Transport> ThreadSession<T> {
     /// caller adds the thread's goal and its unresolved comments, which this
     /// session does not hold.
     pub fn digest_input(&self, goal: &str, scope: DigestScope) -> DigestInput {
+        // A Run that started before this session's last one but ended after
+        // it forked is work that Run never saw.
+        let forked_at = match scope {
+            DigestScope::Since(Some(last)) => self
+                .runs
+                .values()
+                .find(|v| v.run.run_no == last)
+                .map(|v| v.run.started_at),
+            _ => None,
+        };
         let mut runs: Vec<&RunView> = self
             .runs
             .values()
             .filter(|v| match scope {
                 DigestScope::Since(None) => true,
-                DigestScope::Since(Some(last)) => v.run.run_no > last,
+                DigestScope::Since(Some(last)) => {
+                    v.run.run_no > last
+                        || (v.run.run_no != last
+                            && forked_at.is_some_and(|at| v.run.ended_at.is_some_and(|e| e > at)))
+                }
                 DigestScope::UpTo(anchor) => v.run.run_no <= anchor,
             })
             .filter(|v| v.run.status != "declined")
@@ -2144,46 +2159,30 @@ impl<T: Transport> ThreadSession<T> {
         let mut files = Vec::new();
         for f in self.replica.thread_files() {
             let base = self.replica.base_bytes(&f.origin).ok().flatten();
-            if f.deleted {
-                if base.is_some() {
-                    files.push(DigestFile {
-                        path: f.path,
-                        added: 0,
-                        removed: 0,
-                        binary: false,
-                        deleted: true,
-                    });
-                }
-                continue;
-            }
-            match f.kind {
-                FileKind::Binary => {
-                    if f.blob.is_some() || base.is_none() {
-                        files.push(DigestFile {
-                            path: f.path,
-                            added: 0,
-                            removed: 0,
-                            binary: true,
-                            deleted: false,
-                        });
+            let change = if f.deleted {
+                base.is_some().then_some(FileChange::Deleted)
+            } else {
+                match f.kind {
+                    FileKind::Binary => {
+                        (f.blob.is_some() || base.is_none()).then_some(FileChange::Binary)
+                    }
+                    FileKind::Text => {
+                        let before = base
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default();
+                        let after = f.text.unwrap_or_default();
+                        (before != after || f.path != f.origin).then(|| {
+                            let (added, removed) = line_stats(&before, &after);
+                            FileChange::Lines { added, removed }
+                        })
                     }
                 }
-                FileKind::Text => {
-                    let before = base
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default();
-                    let after = f.text.unwrap_or_default();
-                    if before != after || f.path != f.origin {
-                        let (added, removed) = line_stats(&before, &after);
-                        files.push(DigestFile {
-                            path: f.path,
-                            added,
-                            removed,
-                            binary: false,
-                            deleted: false,
-                        });
-                    }
-                }
+            };
+            if let Some(change) = change {
+                files.push(DigestFile {
+                    path: f.path,
+                    change,
+                });
             }
         }
 
