@@ -1600,7 +1600,18 @@ impl<T: Transport> ThreadSession<T> {
                 Some(text.into_bytes())
             } else {
                 match f.blob {
-                    Some(sha) => Some(self.store.get_blob(sha).await?),
+                    Some(sha) => {
+                        // Written into the person's own checkout: only bytes
+                        // that are the blob the thread names.
+                        let bytes = self.store.get_blob(sha.clone()).await?;
+                        if bootstrap::sha256_hex(&bytes) != sha {
+                            return Err(SessionError::Refused {
+                                code: "digest_mismatch".into(),
+                                message: format!("{} did not download intact; try again", f.path),
+                            });
+                        }
+                        Some(bytes)
+                    }
                     // Still its Base content: only a move changes anything.
                     None if origin.is_none() => continue,
                     None => git::blob_at(checkout, &base, &f.origin).map_err(ApplyError::from)?,

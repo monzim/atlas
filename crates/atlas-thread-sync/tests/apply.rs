@@ -34,6 +34,7 @@ fn repo(dir: &Path) -> String {
     write(dir, "old.ts", "moved();\n");
     write(dir, "gone.ts", "bye();\n");
     fs::write(dir.join("logo.png"), b"\x89PNG\0base").unwrap();
+    write(dir, ".gitignore", "local/\n");
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "--quiet", "-m", "base"]);
     git(dir, &["rev-parse", "HEAD"])
@@ -173,6 +174,54 @@ fn uncommitted_edits_refuse_it_and_stash_and_apply_keeps_them() {
     assert!(git(&dir, &["stash", "list"]).contains("atlas: set aside"));
     let kept = git(&dir, &["stash", "show", "-p", "stash@{0}"]);
     assert!(kept.contains("my unsaved 8"), "{kept}");
+}
+
+#[test]
+fn an_ignored_file_of_the_persons_is_never_overwritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    let base = repo(&dir);
+    // git status does not show it; Apply still sees it.
+    write(&dir, "local/settings.json", "{\"mine\": true}\n");
+    let changes = vec![ThreadChange {
+        path: "local/settings.json".into(),
+        origin: None,
+        content: Some(b"{\"thread\": true}\n".to_vec()),
+    }];
+    match apply(&dir, &base, &changes, None) {
+        Err(ApplyError::Dirty(files)) => assert_eq!(files, vec!["local/settings.json".to_string()]),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(read(&dir, "local/settings.json"), "{\"mine\": true}\n");
+    // Stash and apply sets it aside too, rather than writing over it.
+    apply(&dir, &base, &changes, Some("atlas: set aside")).unwrap();
+    assert_eq!(read(&dir, "local/settings.json"), "{\"thread\": true}\n");
+    assert!(git(&dir, &["stash", "list"]).contains("atlas: set aside"));
+}
+
+#[test]
+fn a_binary_conflict_never_writes_over_a_file_beside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    let base = repo(&dir);
+    fs::write(dir.join("logo.png"), b"\x89PNG\0mine").unwrap();
+    git(&dir, &["commit", "--quiet", "-am", "mine"]);
+    // Something of the person's already has the obvious name.
+    let taken = format!("logo.png{THREAD_COPY}");
+    write(&dir, "notes-to-self.txt", "x\n");
+    fs::write(dir.join(&taken), b"my own").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "--quiet", "-m", "keep"]);
+    let changes = vec![ThreadChange {
+        path: "logo.png".into(),
+        origin: None,
+        content: Some(b"\x89PNG\0thread".to_vec()),
+    }];
+    let applied = apply(&dir, &base, &changes, None).unwrap();
+    assert_eq!(fs::read(dir.join(&taken)).unwrap(), b"my own");
+    let second = format!("{taken}-2");
+    assert_eq!(applied.beside, vec![second.clone()]);
+    assert_eq!(fs::read(dir.join(second)).unwrap(), b"\x89PNG\0thread");
 }
 
 #[test]

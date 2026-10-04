@@ -90,6 +90,12 @@ pub const THREAD_COPY: &str = ".atlas-thread";
 /// `checkout`, three-way against `base`. With `stash`, uncommitted edits to
 /// those files are stashed first (and only those); without it they refuse
 /// the Apply.
+///
+/// Everything is decided before anything is written: every target path is
+/// checked (no symlinks, nothing outside the checkout), and every file Apply
+/// would write or remove must hold what the checkout's commit has there — so
+/// an ignored or untracked file of the person's, which `git status` does not
+/// show, is never overwritten either. A refusal writes nothing.
 pub fn apply(
     checkout: &Path,
     base: &str,
@@ -100,42 +106,73 @@ pub fn apply(
         return Err(ApplyError::BaseMissing(base.to_string()));
     }
     let head = git::head_commit(checkout)?;
+    let changes: Vec<&ThreadChange> = changes
+        .iter()
+        .filter(|c| path::is_valid(&c.path) && c.origin.as_deref().is_none_or(path::is_valid))
+        .collect();
 
     // Every path Apply may write: where files are now, and where moved ones were.
     let mut touched: Vec<String> = changes
         .iter()
         .flat_map(|c| std::iter::once(c.path.clone()).chain(c.origin.clone()))
-        .filter(|p| path::is_valid(p))
         .collect();
     touched.sort();
     touched.dedup();
-    // An uncommitted file already as Apply would leave it — an earlier Apply
-    // of the same state — is not the person's work in the way.
+    // The person's work in the way: what git sees as changed, and any file on
+    // disk that differs from the commit — ignored ones included. A file
+    // already as Apply would leave it (an earlier Apply of the same state)
+    // is not in the way.
     let mut dirty = git::dirty_among(checkout, &touched)?;
-    dirty.retain(|rel| !already_applied(checkout, rel, changes));
+    for rel in &touched {
+        if on_disk(checkout, rel)? != git::blob_at(checkout, &head, rel)? {
+            dirty.push(rel.clone());
+        }
+    }
+    dirty.sort();
+    dirty.dedup();
+    let mut kept_dirty = Vec::new();
+    for rel in dirty {
+        if !already_applied(checkout, &rel, &changes)? {
+            kept_dirty.push(rel);
+        }
+    }
     let mut applied = Applied::default();
-    if !dirty.is_empty() {
+    if !kept_dirty.is_empty() {
         match stash {
-            None => return Err(ApplyError::Dirty(dirty)),
+            None => return Err(ApplyError::Dirty(kept_dirty)),
             Some(message) => {
-                git::stash_paths(checkout, &dirty, message)?;
+                git::stash_paths(checkout, &kept_dirty, message)?;
                 applied.stashed = Some(message.to_string());
+                // Anything a stash could not take is still in the way.
+                let left: Vec<String> = kept_dirty
+                    .into_iter()
+                    .filter(|rel| {
+                        !matches!(
+                            (on_disk(checkout, rel), git::blob_at(checkout, &head, rel)),
+                            (Ok(disk), Ok(commit)) if disk == commit
+                        )
+                    })
+                    .collect();
+                if !left.is_empty() {
+                    return Err(ApplyError::Dirty(left));
+                }
             }
         }
     }
 
-    for change in changes {
-        if !path::is_valid(&change.path) {
-            continue;
-        }
+    // Plan.
+    let mut writes: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    let now_at: std::collections::BTreeSet<&str> =
+        changes.iter().map(|c| c.path.as_str()).collect();
+    for change in &changes {
         // A file moved in the thread leaves its old place, if the checkout
-        // still has it as the Base did.
+        // still has it as the Base did — and no file of the thread is there now.
         if let Some(origin) = change.origin.as_deref().filter(|o| *o != change.path) {
-            if path::is_valid(origin) {
+            if !now_at.contains(origin) {
                 let base_old = git::blob_at(checkout, base, origin)?;
                 let head_old = git::blob_at(checkout, &head, origin)?;
                 if base_old.is_some() && head_old == base_old {
-                    remove(checkout, origin)?;
+                    writes.push((origin.to_string(), None));
                     applied.files.push(origin.to_string());
                 } else if head_old.is_some() {
                     // Changed in the checkout since, and moved in the thread.
@@ -148,11 +185,13 @@ pub fn apply(
         let head_bytes = git::blob_at(checkout, &head, &change.path)?;
         let theirs = change.content.as_ref();
 
-        if head_bytes.as_ref() == theirs {
+        if head_bytes.as_ref() == theirs
+            || theirs == base_bytes.as_ref() && head_bytes == base_bytes
+        {
             continue; // Already so.
         }
         if head_bytes == base_bytes {
-            write_or_remove(checkout, &change.path, theirs)?;
+            writes.push((change.path.clone(), theirs.cloned()));
             applied.files.push(change.path.clone());
             continue;
         }
@@ -170,7 +209,7 @@ pub fn apply(
                     theirs,
                     ["yours", "base", "shared thread"],
                 )?;
-                write(checkout, &change.path, &merged)?;
+                writes.push((change.path.clone(), Some(merged)));
                 if conflicts {
                     applied.conflicted.push(change.path.clone());
                 } else {
@@ -178,10 +217,10 @@ pub fn apply(
                 }
             }
             (Some(_), Some(theirs)) => {
-                // Binary: no markers to leave. Yours stays; the thread's goes beside it.
-                let beside = format!("{}{THREAD_COPY}", change.path);
-                if path::is_valid(&beside) {
-                    write(checkout, &beside, theirs)?;
+                // Binary: no markers to leave. Yours stays; the thread's goes
+                // beside it, under a name nothing of the person's holds.
+                if let Some(beside) = beside_name(checkout, &change.path, theirs)? {
+                    writes.push((beside.clone(), Some(theirs.clone())));
                     applied.beside.push(beside);
                 }
                 applied.conflicted.push(change.path.clone());
@@ -189,7 +228,7 @@ pub fn apply(
             (None, Some(theirs)) => {
                 // Gone from the checkout, changed in the thread: the thread's
                 // version comes back for the person to decide.
-                write(checkout, &change.path, theirs)?;
+                writes.push((change.path.clone(), Some(theirs.clone())));
                 applied.conflicted.push(change.path.clone());
             }
             (Some(_), None) => {
@@ -199,6 +238,18 @@ pub fn apply(
             (None, None) => {}
         }
     }
+    // Every target is checked before the first write.
+    for (rel, _) in &writes {
+        path::resolve(checkout, rel)?;
+    }
+
+    // Write.
+    for (rel, bytes) in &writes {
+        match bytes {
+            Some(bytes) => write(checkout, rel, bytes)?,
+            None => remove(checkout, rel)?,
+        }
+    }
     applied.files.sort();
     applied.files.dedup();
     applied.conflicted.sort();
@@ -206,30 +257,60 @@ pub fn apply(
     Ok(applied)
 }
 
+/// A file's bytes in the checkout now; `None` when there is none. A path
+/// through a symlink, or anything else `resolve` refuses, is an error.
+fn on_disk(checkout: &Path, rel: &str) -> Result<Option<Vec<u8>>, ApplyError> {
+    let target = path::resolve(checkout, rel)?;
+    match fs::read(&target) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ApplyError::Io {
+            path: target,
+            source,
+        }),
+    }
+}
+
+/// Where a binary file's thread version goes beside it: `<path>.atlas-thread`,
+/// or the first `<path>.atlas-thread-N` nothing of the person's holds. `None`
+/// when one already holds exactly these bytes (an earlier Apply).
+fn beside_name(checkout: &Path, rel: &str, bytes: &[u8]) -> Result<Option<String>, ApplyError> {
+    for n in 1..=100 {
+        let name = if n == 1 {
+            format!("{rel}{THREAD_COPY}")
+        } else {
+            format!("{rel}{THREAD_COPY}-{n}")
+        };
+        if !path::is_valid(&name) {
+            return Ok(None);
+        }
+        match on_disk(checkout, &name)? {
+            None => return Ok(Some(name)),
+            Some(existing) if existing == bytes => return Ok(None),
+            Some(_) => {}
+        }
+    }
+    Ok(None)
+}
+
 /// Does `rel` in the checkout already hold what the thread has there — the
 /// thread's content, or nothing where the thread removed or moved it away?
-fn already_applied(checkout: &Path, rel: &str, changes: &[ThreadChange]) -> bool {
-    let Ok(target) = path::resolve(checkout, rel) else {
-        return false;
-    };
-    let on_disk = fs::read(&target).ok();
+fn already_applied(
+    checkout: &Path,
+    rel: &str,
+    changes: &[&ThreadChange],
+) -> Result<bool, ApplyError> {
+    let disk = on_disk(checkout, rel)?;
     if let Some(change) = changes.iter().find(|c| c.path == rel) {
-        return on_disk == change.content;
+        return Ok(disk == change.content);
     }
     // Only a move's old place: applied once it is gone.
-    on_disk.is_none()
+    Ok(disk.is_none())
 }
 
 /// Text, for merging: no NUL in the first 8 KiB, as git decides.
 fn is_text(bytes: &[u8]) -> bool {
     !bytes.iter().take(8000).any(|b| *b == 0)
-}
-
-fn write_or_remove(root: &Path, rel: &str, bytes: Option<&Vec<u8>>) -> Result<(), ApplyError> {
-    match bytes {
-        Some(bytes) => write(root, rel, bytes),
-        None => remove(root, rel),
-    }
 }
 
 fn write(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), ApplyError> {
