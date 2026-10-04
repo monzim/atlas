@@ -322,3 +322,27 @@ async fn an_edit_the_thread_lost_is_kept_beside_the_file_and_said() {
         .iter()
         .any(|n| n.contains("lost recent changes to src/banner.css")));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kept_copy_is_as_private_as_the_file_it_came_from() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (_joy, mut monzim) = pair(&w, &server).await;
+    let monzim_root = monzim.replica().root().to_path_buf();
+    let kept = server.head();
+    let file = monzim_root.join("src/banner.css");
+    write(&monzim_root, "src/banner.css", ".banner {\n  color: private;\n}\n");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    monzim.file_saved("src/banner.css").await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+    server.forget_after(kept);
+    server.cut("monzim");
+    monzim.mark_disconnected();
+    monzim.reconnect(server.connect("monzim")).await.unwrap();
+
+    let copy = monzim_root.join("src/banner.css.atlas-mine");
+    let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

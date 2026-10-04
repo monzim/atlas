@@ -337,7 +337,13 @@ impl Replica {
             n += 1;
         };
         let target = path::resolve(&self.root, &name)?;
-        write_atomic(&target, bytes)?;
+        // The copy is as private as the file it came from — a 0600 file stays
+        // 0600 — and owner-only when that is gone. Set before it appears.
+        let like = path::resolve(&self.root, rel)
+            .ok()
+            .and_then(|original| fs::metadata(original).ok())
+            .map(|meta| meta.permissions());
+        write_atomic_as(&target, bytes, like)?;
         Ok(name)
     }
 
@@ -1079,6 +1085,27 @@ impl Replica {
 /// Write `bytes` to `target` through a temporary file in the same directory
 /// and a rename, so a reader sees the old file or the new one and never half.
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), ReplicaError> {
+    let existing = fs::metadata(target).ok().map(|meta| meta.permissions());
+    write_atomic_inner(target, bytes, existing, 0o644)
+}
+
+/// [`write_atomic`] for a new file that must be no more readable than one
+/// with permissions `like` — owner-only when there is none. The mode is set
+/// before the file appears under its name.
+pub fn write_atomic_as(
+    target: &Path,
+    bytes: &[u8],
+    like: Option<fs::Permissions>,
+) -> Result<(), ReplicaError> {
+    write_atomic_inner(target, bytes, like, 0o600)
+}
+
+fn write_atomic_inner(
+    target: &Path,
+    bytes: &[u8],
+    like: Option<fs::Permissions>,
+    #[cfg_attr(not(unix), allow(unused_variables))] fallback_mode: u32,
+) -> Result<(), ReplicaError> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).map_err(io(dir))?;
     let temp = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple()));
@@ -1093,14 +1120,15 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), ReplicaError> {
         let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        match fs::metadata(target) {
-            Ok(meta) => fs::set_permissions(&temp, meta.permissions())?,
+        match like {
+            Some(permissions) => fs::set_permissions(&temp, permissions)?,
             #[cfg(unix)]
-            Err(_) => {
-                fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?
-            }
+            None => fs::set_permissions(
+                &temp,
+                std::os::unix::fs::PermissionsExt::from_mode(fallback_mode),
+            )?,
             #[cfg(not(unix))]
-            Err(_) => {}
+            None => {}
         }
         fs::rename(&temp, target)
     })();
