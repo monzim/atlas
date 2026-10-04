@@ -152,6 +152,12 @@ function Outcome({
           <span className="font-mono">{outcome.beside.join(", ")}</span>.
         </span>
       )}
+      {outcome.setAside.length > 0 && (
+        <span>
+          Your own copies of ignored files were in the way and are kept as{" "}
+          <span className="font-mono">{outcome.setAside.join(", ")}</span>.
+        </span>
+      )}
       {outcome.stashed && (
         <span>
           Your edits to those files are stashed as &ldquo;{outcome.stashed}&rdquo; —{" "}

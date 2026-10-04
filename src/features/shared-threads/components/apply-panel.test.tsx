@@ -45,6 +45,7 @@ describe("ApplyPanel", () => {
           files: ["src/app.ts", "notes.md"],
           conflicted: [],
           beside: [],
+          setAside: [],
           stashed: "atlas: your edits, set aside to apply a Shared Thread",
         }),
       );
@@ -67,6 +68,7 @@ describe("ApplyPanel", () => {
         files: ["a.ts"],
         conflicted: ["util.ts"],
         beside: ["logo.png.atlas-thread"],
+        setAside: ["local/settings.json.atlas-mine"],
         stashed: null,
       }),
     );
@@ -75,6 +77,7 @@ describe("ApplyPanel", () => {
     await waitFor(() => expect(screen.getByText("util.ts")).toBeTruthy());
     expect(screen.getByText(/conflict markers/)).toBeTruthy();
     expect(screen.getByText("logo.png.atlas-thread")).toBeTruthy();
+    expect(screen.getByText("local/settings.json.atlas-mine")).toBeTruthy();
   });
 
   it("says where Apply writes when this machine joined without a checkout", () => {

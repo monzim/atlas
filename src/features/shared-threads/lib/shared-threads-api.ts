@@ -357,6 +357,8 @@ export interface Applied {
   beside: string[];
   /** The stash the person's own edits went into, when they asked for it. */
   stashed: string | null;
+  /** Ignored files of theirs that were in the way, moved beside themselves. */
+  setAside: string[];
 }
 
 /** Apply's answer: done, or refused with what to do about it. */
