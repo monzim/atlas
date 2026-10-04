@@ -31,6 +31,18 @@ use crate::wire::{FileKind, TreeEntry};
 /// [`path::relative`] ignore anything named like this.
 pub const TEMP_PREFIX: &str = ".atlas-sync-tmp-";
 
+/// Marks a file of the person's that a remote change moved out of its way
+/// (`notes.md.atlas-mine`). Such a file is theirs alone: it never syncs, and
+/// [`path::relative`] ignores it, across restarts too.
+pub const ASIDE_MARK: &str = ".atlas-mine";
+
+/// Is this a file a remote change set aside?
+pub fn is_set_aside(rel: &str) -> bool {
+    rel.rsplit('/')
+        .next()
+        .is_some_and(|name| name.contains(ASIDE_MARK))
+}
+
 /// Files at or above this size are not co-edited as text: they sync whole, as
 /// blobs (ATL-403).
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
@@ -222,9 +234,9 @@ impl Replica {
         let mut n = 0;
         let moved_to = loop {
             let candidate = if n == 0 {
-                format!("{rel}.mine")
+                format!("{rel}{ASIDE_MARK}")
             } else {
-                format!("{rel}.mine-{n}")
+                format!("{rel}{ASIDE_MARK}-{n}")
             };
             if !path::resolve(&self.root, &candidate)?.exists() {
                 break candidate;
@@ -694,7 +706,7 @@ impl Replica {
     /// The person saved, created, moved or removed `rel` in their replica
     /// (from any editor, or a shell).
     pub fn local_change(&mut self, rel: &str) -> Result<LocalChange, ReplicaError> {
-        if !self.materialized || !path::is_valid(rel) {
+        if !self.materialized || !path::is_valid(rel) || is_set_aside(rel) {
             return Ok(LocalChange::Ignored);
         }
         let target = path::resolve(&self.root, rel)?;

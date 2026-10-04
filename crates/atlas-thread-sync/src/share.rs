@@ -72,7 +72,7 @@ pub fn preview(checkout: &Path) -> Result<SharePreview, ReplicaError> {
 
     let mut files = Vec::new();
     for d in dirty {
-        if ignored.contains(&d.path) {
+        if ignored.contains(&d.path) || crate::replica::is_set_aside(&d.path) {
             continue;
         }
         if d.deleted {

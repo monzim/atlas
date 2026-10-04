@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_thread_sync::{
-    git, run, share, Bootstrapped, Command as SyncCommand, FakeStore, FakeThreadServer, FakeTransport, LocalChange,
+    git, run, share, Bootstrapped, Command as SyncCommand, Message, Transport, FakeStore, FakeThreadServer, FakeTransport, LocalChange,
     Replica, SecretReason, ShareKind, SyncStatus, ThreadRepo, ThreadSession,
 };
 use tokio::sync::{mpsc, watch};
@@ -410,4 +410,40 @@ async fn a_secret_in_a_files_base_content_never_leaves_with_it() {
         .iter()
         .any(|p| p.windows(key.len()).any(|w| w == key.as_bytes())));
     assert_eq!(joy.replica().text("config/aws.ini").unwrap(), "aws_profile = default\n");
+}
+
+#[tokio::test]
+async fn a_stream_of_bundle_requests_builds_one_bundle_at_a_time() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
+    joy.set_store(Arc::new(server.store()));
+    joy.set_thread_repo(ThreadRepo::at(&w.replicas.join("joy-thread")));
+    joy.set_serve_bundles(true);
+
+    // Three joiners ask at once, each with a different history.
+    let mut askers = Vec::new();
+    for (n, have) in [vec![], vec!["a".repeat(40)], vec!["b".repeat(40)]].into_iter().enumerate() {
+        let mut t = server.connect(&format!("asker{n}"));
+        t.send(Message::Text(format!(
+            r#"{{"t":"hello","protocol":1,"clientId":"asker-replica-{n}","since":0}}"#
+        )))
+        .await
+        .unwrap();
+        t.send(Message::Text(
+            serde_json::json!({ "t": "bundle.request", "clientSeq": 1, "have": have }).to_string(),
+        ))
+        .await
+        .unwrap();
+        askers.push(t);
+    }
+    joy.pump(std::time::Duration::from_millis(50)).await.unwrap();
+
+    // One is built now; the rest wait out the cooldown.
+    let mut wants = joy.take_bundle_wants();
+    assert_eq!(wants.len(), 1);
+    joy.serve_bundle(wants.pop().unwrap()).await.unwrap();
+    assert_eq!(server.store().bundles().len(), 1);
+    assert!(joy.take_bundle_wants().is_empty());
+    drop(askers);
 }

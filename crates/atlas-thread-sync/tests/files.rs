@@ -290,18 +290,24 @@ async fn a_move_onto_a_path_the_person_uses_keeps_their_file_and_never_sends_it(
 
     // His file is beside it, untouched, and he is told.
     assert_eq!(
-        read(&monzim_root, "src/brand.css.mine"),
+        read(&monzim_root, "src/brand.css.atlas-mine"),
         "/* monzim's private notes */\n"
     );
     assert_eq!(
         read(&monzim_root, "src/brand.css"),
         ".banner {\n  color: green;\n}\n"
     );
-    assert!(monzim.notices().iter().any(|n| n.contains("src/brand.css.mine")));
-    // And nothing of it reached the thread.
+    assert!(monzim.notices().iter().any(|n| n.contains("src/brand.css.atlas-mine")));
+    // And nothing of it reached the thread — not when the watcher reports
+    // the file set aside, nor the path it left.
     let sent = monzim.updates_sent();
+    assert_eq!(
+        monzim.file_saved("src/brand.css.atlas-mine").await.unwrap(),
+        LocalChange::Ignored
+    );
     monzim.file_saved("src/brand.css").await.unwrap();
     assert_eq!(monzim.updates_sent(), sent);
+    assert!(!server.tree().iter().any(|e| e.path.contains("atlas-mine")));
     assert!(!server
         .journaled_payloads()
         .iter()

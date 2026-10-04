@@ -105,6 +105,9 @@ pub struct RunView {
 /// Bundle requests kept while the person has not agreed to send history.
 const MAX_WANTED: usize = 16;
 
+/// The least time between two bundles this replica builds.
+pub const BUNDLE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// How many times a rejected merge is recomputed before giving up.
 const MERGE_ATTEMPTS: u32 = 8;
 
@@ -180,6 +183,9 @@ pub struct ThreadSession<T: Transport> {
     /// who lack the Base? A bundle is the whole history behind the Base, so
     /// nothing is built until they say yes (ATL-402).
     serve_bundles: bool,
+    /// When this replica last built a bundle: builds are rate-limited, so a
+    /// stream of requests cannot keep it packing history.
+    last_bundle_built: Option<tokio::time::Instant>,
     /// Blocked paths the person included anyway in this share: their Base
     /// content may be published too.
     included: HashSet<String>,
@@ -232,6 +238,7 @@ impl<T: Transport> ThreadSession<T> {
             bundle_answer: None,
             wanted: Vec::new(),
             serve_bundles: false,
+            last_bundle_built: None,
             included: HashSet::new(),
             watch_only: None,
             notices: Vec::new(),
@@ -440,12 +447,21 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Bundle requests from others to serve now: none until the person has
-    /// agreed to send history ([`ThreadSession::set_serve_bundles`]).
+    /// agreed to send history ([`ThreadSession::set_serve_bundles`]), and at
+    /// most one per [`BUNDLE_COOLDOWN`] — the newest; the rest wait. Packing
+    /// history is heavy, and every request the server could not answer from
+    /// a cached bundle lands here.
     pub fn take_bundle_wants(&mut self) -> Vec<BundleWant> {
-        if !self.serve_bundles {
+        if !self.serve_bundles || self.wanted.is_empty() {
             return Vec::new();
         }
-        std::mem::take(&mut self.wanted)
+        if self
+            .last_bundle_built
+            .is_some_and(|at| at.elapsed() < BUNDLE_COOLDOWN)
+        {
+            return Vec::new();
+        }
+        self.wanted.pop().into_iter().collect()
     }
 
     /// Build the bundle somebody asked for, upload it and say so — or, when it
@@ -458,6 +474,7 @@ impl<T: Transport> ThreadSession<T> {
             return Ok(());
         };
         repo.ensure(Some(&own))?;
+        self.last_bundle_built = Some(tokio::time::Instant::now());
         let bundle = repo.build(self.replica.base(), &want.have)?;
         let size = bundle.bytes.len() as u64;
         let put = self

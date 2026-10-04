@@ -107,10 +107,9 @@ pub fn relative(root: &Path, abs: &Path) -> Option<String> {
         }
     }
     let joined = parts.join("/");
-    if parts
-        .last()
-        .is_some_and(|name| name.starts_with(crate::replica::TEMP_PREFIX))
-    {
+    if parts.last().is_some_and(|name| {
+        name.starts_with(crate::replica::TEMP_PREFIX) || name.contains(crate::replica::ASIDE_MARK)
+    }) {
         return None;
     }
     is_valid(&joined).then_some(joined)
@@ -181,6 +180,9 @@ mod tests {
         );
         assert_eq!(relative(root, Path::new("/w/.git/index")), None);
         assert_eq!(relative(root, Path::new("/w/src/.atlas-sync-tmp-1")), None);
+        // A file of the person's set aside for a remote change never syncs.
+        assert_eq!(relative(root, Path::new("/w/src/a.rs.atlas-mine")), None);
+        assert_eq!(relative(root, Path::new("/w/src/a.rs.atlas-mine-2")), None);
         assert_eq!(relative(root, Path::new("/elsewhere/a")), None);
     }
 }
