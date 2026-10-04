@@ -461,6 +461,12 @@ impl Replica {
             if let Some(origin) = entry.origin.as_ref().filter(|o| path::is_valid(o)) {
                 file.origin.clone_from(origin);
             }
+            // A file the person keeps where git (or `.atlas/shareignore`)
+            // ignores it — build output, a local config — is theirs, not this
+            // file's content: set it aside rather than fold it in and send it.
+            if self.materialized && !entry.deleted && self.ignores_on_disk(&entry.path)? {
+                self.set_aside(&entry.path)?;
+            }
         }
         // The path must not be another live file's here.
         if !entry.deleted {
@@ -484,6 +490,13 @@ impl Replica {
         }
         // Deleted, or back.
         let was_deleted = self.files[&id].deleted;
+        // Coming back where the person has put a file of their own since.
+        if was_deleted && !entry.deleted && self.materialized {
+            let target = path::resolve(&self.root, &entry.path)?;
+            if target.exists() {
+                self.set_aside(&entry.path)?;
+            }
+        }
         if entry.deleted && !was_deleted {
             self.by_path.remove(&entry.path);
             if self.materialized {
@@ -621,19 +634,33 @@ impl Replica {
     fn move_on_disk(&mut self, from: &str, to: &str) -> Result<(), ReplicaError> {
         let source = path::resolve(&self.root, from)?;
         let target = path::resolve(&self.root, to)?;
-        if !source.exists() {
-            return Ok(());
-        }
         // Whatever is at the new path is the person's own (no live file of
         // the thread holds it): keep it, beside, rather than lose it — or,
-        // worse, read it back later as an edit of the moved file.
+        // worse, read it back later as an edit of the moved file. Even when
+        // there is nothing to move: the file is the thread's path from now on.
         if target.exists() {
             self.set_aside(to)?;
+        }
+        if !source.exists() {
+            return Ok(());
         }
         if let Some(dir) = target.parent() {
             fs::create_dir_all(dir).map_err(io(dir))?;
         }
         fs::rename(&source, &target).map_err(io(&target))
+    }
+
+    /// Is there a file at `rel` that git, or `.atlas/shareignore`, ignores?
+    fn ignores_on_disk(&self, rel: &str) -> Result<bool, ReplicaError> {
+        if !path::resolve(&self.root, rel)?.exists() {
+            return Ok(false);
+        }
+        let ignored = git::ignored(
+            &self.root,
+            &[rel.to_string()],
+            Some(&self.root.join(crate::share::SHAREIGNORE)),
+        )?;
+        Ok(ignored.contains(rel))
     }
 
     fn remove_on_disk(&mut self, rel: &str) -> Result<(), ReplicaError> {

@@ -341,3 +341,67 @@ async fn a_file_moved_to_a_secret_name_leaves_the_thread_and_stays_home() {
     monzim.pump(QUIET).await.unwrap();
     assert!(!monzim_root.join(".env.production").exists());
 }
+
+#[tokio::test]
+async fn a_teammates_new_file_never_folds_in_an_ignored_file_of_the_persons() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
+    // Monzim keeps build output in his replica; `dist/` is ignored.
+    write(&monzim_root, "dist/config.js", "window.KEY = 'monzim-only';\n");
+
+    // A teammate's client puts a file at that path in the thread.
+    write(&joy_root, "dist/config.js", "window.KEY = 'shared';\n");
+    joy.share_working_changes(&joy_root, &[]).await.ok();
+    let mut t = server.connect("mallory");
+    use atlas_thread_sync::{Message, Transport};
+    t.send(Message::Text(
+        r#"{"t":"hello","protocol":1,"clientId":"mallory-replica-1","since":0}"#.into(),
+    ))
+    .await
+    .unwrap();
+    t.send(Message::Text(
+        r#"{"t":"tree.ensure","clientSeq":1,"path":"dist/config.js","kind":"text"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    monzim.pump(QUIET).await.unwrap();
+
+    // His file was set aside, not read as the thread's — and nothing of it
+    // left his machine.
+    assert_eq!(
+        read(&monzim_root, "dist/config.js.atlas-mine"),
+        "window.KEY = 'monzim-only';\n"
+    );
+    let sent = monzim.updates_sent();
+    monzim.file_saved("dist/config.js").await.unwrap();
+    assert_eq!(monzim.updates_sent(), sent);
+    assert!(!server
+        .journaled_payloads()
+        .iter()
+        .any(|p| p.windows(11).any(|w| w == b"monzim-only")));
+}
+
+#[tokio::test]
+async fn a_rename_onto_the_persons_file_sets_it_aside_even_when_the_source_is_gone() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
+    // Monzim already removed the file locally (not yet settled), and keeps a
+    // file of his own where Joy is about to move it.
+    fs::remove_file(monzim_root.join("notes.md")).unwrap();
+    write(&monzim_root, "todo.md", "monzim's own list\n");
+
+    fs::rename(joy_root.join("notes.md"), joy_root.join("todo.md")).unwrap();
+    joy.file_saved("todo.md").await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+
+    assert_eq!(read(&monzim_root, "todo.md.atlas-mine"), "monzim's own list\n");
+    let sent = monzim.updates_sent();
+    monzim.file_saved("todo.md").await.unwrap();
+    assert!(!server
+        .journaled_payloads()
+        .iter()
+        .any(|p| p.windows(9).any(|w| w == b"own list\n")));
+    let _ = sent;
+}

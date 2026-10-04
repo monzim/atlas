@@ -323,10 +323,9 @@ pub async fn run<T: Transport>(
         };
         let mut error = outcome.err().map(|e| e.to_string());
         // Somebody lacks the Base and this replica may hold it (ATL-402).
-        for want in session.take_bundle_wants() {
-            if let Err(e) = session.serve_bundle(want).await {
-                error.get_or_insert_with(|| format!("could not send the Base: {e}"));
-            }
+        let wants = session.take_bundle_wants();
+        if let Err(e) = session.serve_bundles(wants).await {
+            error.get_or_insert_with(|| format!("could not send the Base: {e}"));
         }
         if let Some(e) = &error {
             tracing::warn!(target: "atlas_thread_sync", "thread sync: {e}");

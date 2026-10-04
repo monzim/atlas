@@ -446,11 +446,13 @@ impl<T: Transport> ThreadSession<T> {
         }
     }
 
-    /// Bundle requests from others to serve now: none until the person has
-    /// agreed to send history ([`ThreadSession::set_serve_bundles`]), and at
-    /// most one per [`BUNDLE_COOLDOWN`] — the newest; the rest wait. Packing
-    /// history is heavy, and every request the server could not answer from
-    /// a cached bundle lands here.
+    /// Bundle requests from others to serve now — every one waiting, to be
+    /// answered by a single build ([`ThreadSession::serve_bundles`]). None
+    /// until the person has agreed to send history
+    /// ([`ThreadSession::set_serve_bundles`]), and none within
+    /// [`BUNDLE_COOLDOWN`] of the last build: packing history is heavy, so a
+    /// stream of requests is answered a minute at a time — all of them, so
+    /// none is starved by newer ones.
     pub fn take_bundle_wants(&mut self) -> Vec<BundleWant> {
         if !self.serve_bundles || self.wanted.is_empty() {
             return Vec::new();
@@ -461,7 +463,7 @@ impl<T: Transport> ThreadSession<T> {
         {
             return Vec::new();
         }
-        self.wanted.pop().into_iter().collect()
+        std::mem::take(&mut self.wanted)
     }
 
     /// Build the bundle somebody asked for, upload it and say so — or, when it
@@ -469,40 +471,56 @@ impl<T: Transport> ThreadSession<T> {
     /// waiting. A replica without the Base, or without a thread repository,
     /// leaves the request to somebody else.
     pub async fn serve_bundle(&mut self, want: BundleWant) -> Result<(), SessionError> {
+        self.serve_bundles(vec![want]).await
+    }
+
+    /// Answer every request in `wants` with one build: a thin bundle against
+    /// the one requester's history, or — for several — a full bundle, which
+    /// fits them all.
+    pub async fn serve_bundles(&mut self, wants: Vec<BundleWant>) -> Result<(), SessionError> {
+        if wants.is_empty() {
+            return Ok(());
+        }
         let (Some(own), Some(repo)) = (self.replica.repo().map(Path::to_path_buf), self.thread_repo.clone())
         else {
             return Ok(());
         };
         repo.ensure(Some(&own))?;
         self.last_bundle_built = Some(tokio::time::Instant::now());
-        let bundle = repo.build(self.replica.base(), &want.have)?;
+        let have: &[String] = match wants.as_slice() {
+            [one] => &one.have,
+            _ => &[],
+        };
+        let bundle = repo.build(self.replica.base(), have)?;
         let size = bundle.bytes.len() as u64;
         let put = self
             .store
             .put_bundle(bundle.sha256.clone(), bundle.bytes, bundle.prerequisites)
             .await;
-        let client_seq = self.take_client_seq();
-        let frame = match put {
-            Ok(()) => ClientControl::BundleReady {
-                client_seq,
-                request_id: want.request_id,
-                sha: bundle.sha256,
-            },
-            Err(StoreError::Refused { code, .. }) if code == "limit_reached" => {
+        let too_large = match put {
+            Ok(()) => false,
+            Err(StoreError::Refused { code, .. }) if code == "limit_reached" => true,
+            Err(e) => return Err(e.into()),
+        };
+        for want in wants {
+            let client_seq = self.take_client_seq();
+            let frame = if too_large {
                 ClientControl::BundleFailed {
                     client_seq,
                     request_id: want.request_id,
                     reason: BundleFailure::TooLarge,
                     bytes: size,
                 }
-            }
-            Err(e) => return Err(e.into()),
-        };
-        match self.ask(client_seq, &frame).await? {
-            Answer::Ack => Ok(()),
-            Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
-            other => Err(unexpected(&other)),
+            } else {
+                ClientControl::BundleReady {
+                    client_seq,
+                    request_id: want.request_id,
+                    sha: bundle.sha256.clone(),
+                }
+            };
+            self.expect_ack(client_seq, &frame).await?;
         }
+        Ok(())
     }
 
     async fn send_control(&mut self, frame: &ClientControl) -> Result<(), SessionError> {

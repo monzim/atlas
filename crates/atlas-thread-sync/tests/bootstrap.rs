@@ -413,7 +413,7 @@ async fn a_secret_in_a_files_base_content_never_leaves_with_it() {
 }
 
 #[tokio::test]
-async fn a_stream_of_bundle_requests_builds_one_bundle_at_a_time() {
+async fn a_stream_of_bundle_requests_is_answered_by_one_build_at_a_time() {
     let w = world();
     let server = FakeThreadServer::new();
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
@@ -439,11 +439,38 @@ async fn a_stream_of_bundle_requests_builds_one_bundle_at_a_time() {
     }
     joy.pump(std::time::Duration::from_millis(50)).await.unwrap();
 
-    // One is built now; the rest wait out the cooldown.
-    let mut wants = joy.take_bundle_wants();
-    assert_eq!(wants.len(), 1);
-    joy.serve_bundle(wants.pop().unwrap()).await.unwrap();
-    assert_eq!(server.store().bundles().len(), 1);
+    // All three are answered by one full bundle — nobody starved by newer
+    // requests — and the next build waits out the cooldown.
+    let wants = joy.take_bundle_wants();
+    assert_eq!(wants.len(), 3);
+    joy.serve_bundles(wants).await.unwrap();
+    let bundles = server.store().bundles();
+    assert_eq!(bundles.len(), 1);
+    assert!(bundles[0].1.prerequisites.is_empty());
+    for asker in &mut askers {
+        loop {
+            let Some(Message::Text(text)) = asker.recv().await else {
+                panic!("asker closed");
+            };
+            if text.contains("bundle.available") {
+                break;
+            }
+        }
+    }
+    let mut late = server.connect("late");
+    late.send(Message::Text(
+        r#"{"t":"hello","protocol":1,"clientId":"late-replica-1","since":0}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // A fourth asks with a history the cached full bundle fits: served from
+    // the cache, nothing built.
+    late.send(Message::Text(
+        serde_json::json!({ "t": "bundle.request", "clientSeq": 1, "have": ["c".repeat(40)] })
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    joy.pump(std::time::Duration::from_millis(50)).await.unwrap();
     assert!(joy.take_bundle_wants().is_empty());
-    drop(askers);
 }
