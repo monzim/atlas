@@ -278,17 +278,27 @@ function ThreadCard({
 /** A refusal, with the way out when there is one. */
 function ErrorNote({ error }: { error: SharedThreadError }) {
   const hint =
-    error.code === "workspace_local"
-      ? "Promote the project to Cloud mode from the capture menu in the title bar, then share again."
-      : error.code === "feature_disabled"
-        ? "Shared Threads is not enabled for your organization yet."
-        : error.code === "base_missing"
-          ? "Fetch or pull so this repository has the commit the thread starts from."
-          : null;
+    error.code === "feature_disabled"
+      ? "Shared Threads is not enabled for your organization yet."
+      : error.code === "base_missing"
+        ? "Fetch or pull so this repository has the commit the thread starts from."
+        : null;
   return (
-    <div className="flex flex-col gap-1 rounded bg-error-muted p-2 text-error">
+    <div className="flex flex-col gap-1.5 rounded bg-error-muted p-2 text-error">
       <span>{error.message}</span>
       {hint && <span className="text-[var(--secondary-foreground)]">{hint}</span>}
+      {error.code === "workspace_local" && (
+        // Promotion is a disclosure with its own confirmation step; this opens
+        // that flow rather than repeating it here.
+        <Button
+          size="xs"
+          variant="outline"
+          className="self-start"
+          onClick={() => window.dispatchEvent(new CustomEvent("atlas:open-capture"))}
+        >
+          Promote to Cloud…
+        </Button>
+      )}
     </div>
   );
 }

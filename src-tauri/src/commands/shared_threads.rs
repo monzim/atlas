@@ -141,7 +141,7 @@ pub async fn shared_thread_share(
 
     let token = token(&app).await?;
     let created: ServerThread = post_json(
-        &format!("{}/threads", ingest_base()),
+        &format!("{}/threads", atlas_artifacts::ingest_base()),
         &token,
         &serde_json::json!({
             "orgId": org_id,
@@ -218,7 +218,7 @@ pub async fn shared_thread_join(
     let thread: ServerThread = get_json(
         &format!(
             "{}/threads/{}?org={}&workspace={}",
-            ingest_base(),
+            atlas_artifacts::ingest_base(),
             parsed.thread,
             parsed.org,
             parsed.workspace
@@ -352,7 +352,7 @@ async fn start(
 ) -> Result<SharedThreadView> {
     let token = token(app).await?;
     let url = atlas_thread_sync::transport::thread_socket_url(
-        &ingest_base(),
+        &atlas_artifacts::ingest_base(),
         &entry.org_id,
         &entry.workspace_id,
         &entry.shared_thread_id,
@@ -542,23 +542,27 @@ fn active_org(app: &AppHandle) -> Result<String> {
         })
 }
 
+/// The project's cloud binding, if it is bound to Cloud in `org_id`.
+fn cloud_binding(project_path: &str, org_id: &str) -> Option<atlas_checkpoint::Binding> {
+    crate::commands::capture::open_reader(project_path)
+        .ok()
+        .flatten()
+        .and_then(|store| store.binding().ok().flatten())
+        .filter(|b| crate::commands::artifacts_cloud::is_cloud_bound(b, org_id))
+}
+
 /// The project's server Workspace id, if it is bound to Cloud in `org_id`.
 async fn cloud_workspace(project_path: &str, org_id: &str) -> Result<String> {
     let path = project_path.to_string();
     let org = org_id.to_string();
-    let binding = tauri::async_runtime::spawn_blocking(move || {
-        crate::commands::capture::open_reader(&path)
-            .ok()
-            .flatten()
-            .and_then(|store| store.binding().ok().flatten())
-    })
-    .await
-    .map_err(|e| SharedThreadError::new("internal", e.to_string()))?;
+    let binding = tauri::async_runtime::spawn_blocking(move || cloud_binding(&path, &org))
+        .await
+        .map_err(|e| SharedThreadError::new("internal", e.to_string()))?;
     match binding {
-        Some(b) if crate::commands::artifacts_cloud::is_cloud_bound(&b, &org) => b.remote_workspace_id.ok_or_else(|| {
+        Some(b) => b.remote_workspace_id.ok_or_else(|| {
             SharedThreadError::new("workspace_local", "This project is not connected to Atlas Cloud yet.")
         }),
-        _ => Err(SharedThreadError::new(
+        None => Err(SharedThreadError::new(
             "workspace_local",
             "This project is in Local mode, so nothing from it leaves your machine. Promote it to Cloud mode to share a thread.",
         )),
@@ -591,14 +595,8 @@ async fn find_project(candidates: Vec<String>, org: &str, workspace: &str) -> Op
     let workspace = workspace.to_string();
     tauri::async_runtime::spawn_blocking(move || {
         candidates.into_iter().find(|path| {
-            crate::commands::capture::open_reader(path)
-                .ok()
-                .flatten()
-                .and_then(|store| store.binding().ok().flatten())
-                .is_some_and(|b| {
-                    crate::commands::artifacts_cloud::is_cloud_bound(&b, &org)
-                        && b.remote_workspace_id.as_deref() == Some(workspace.as_str())
-                })
+            cloud_binding(path, &org)
+                .is_some_and(|b| b.remote_workspace_id.as_deref() == Some(workspace.as_str()))
         })
     })
     .await
@@ -616,10 +614,6 @@ async fn token(app: &AppHandle) -> Result<String> {
             format!("Could not get an access token: {e:?}"),
         )
     })
-}
-
-fn ingest_base() -> String {
-    atlas_artifacts::ingest_base()
 }
 
 fn new_client_id() -> String {

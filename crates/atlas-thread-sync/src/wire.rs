@@ -235,49 +235,60 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The server's `THREAD_WIRE_FIXTURES`, verbatim.
+    /// The server's wire fixtures (`@atlas/contracts`
+    /// `fixtures/thread-wire-v1.json`), vendored here as a copy.
+    const FIXTURES: &str = include_str!("../tests/fixtures/thread-wire-v1.json");
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Fixture {
+        name: String,
+        frame: FixtureFrame,
+        hex: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureFrame {
+        version: u8,
+        kind: u8,
+        seq: u64,
+        file_id: u64,
+        client_seq: u64,
+        payload: Vec<u8>,
+    }
+
     #[test]
     fn matches_the_server_fixtures() {
-        let fixtures = [
-            (
-                Frame {
-                    version: 1,
-                    kind: 1,
-                    seq: 0,
-                    file_id: 1,
-                    client_seq: 1,
-                    payload: vec![0xaa, 0xbb],
-                },
-                "0101000101aabb",
-            ),
-            (
-                Frame {
-                    version: 1,
-                    kind: 1,
-                    seq: 300,
-                    file_id: 128,
-                    client_seq: 0,
-                    payload: vec![],
-                },
-                "0101ac02800100",
-            ),
-            (
-                Frame {
-                    version: 1,
-                    kind: 2,
-                    seq: 0,
-                    file_id: 0,
-                    client_seq: 1 << 32,
-                    payload: vec![0x01],
-                },
-                "01020000808080801001",
-            ),
-        ];
-        for (frame, expected) in fixtures {
+        let fixtures: Vec<Fixture> = serde_json::from_str(FIXTURES).unwrap();
+        assert!(!fixtures.is_empty());
+        for f in fixtures {
+            let frame = Frame {
+                version: f.frame.version,
+                kind: f.frame.kind,
+                seq: f.frame.seq,
+                file_id: f.frame.file_id,
+                client_seq: f.frame.client_seq,
+                payload: f.frame.payload,
+            };
             let bytes = encode(&frame).unwrap();
-            assert_eq!(hex(&bytes), expected);
-            assert_eq!(decode(&bytes).unwrap(), frame);
+            assert_eq!(hex(&bytes), f.hex, "{}", f.name);
+            assert_eq!(decode(&bytes).unwrap(), frame, "{}", f.name);
         }
+    }
+
+    /// When the server checkout sits beside this one (the usual layout), the
+    /// vendored copy must still equal the contract's file.
+    #[test]
+    fn the_vendored_fixtures_match_the_server_checkout_when_present() {
+        let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../server/packages/contracts/fixtures/thread-wire-v1.json");
+        let Ok(theirs) = std::fs::read_to_string(&server) else {
+            return;
+        };
+        let ours: serde_json::Value = serde_json::from_str(FIXTURES).unwrap();
+        let theirs: serde_json::Value = serde_json::from_str(&theirs).unwrap();
+        assert_eq!(ours, theirs, "re-copy {}", server.display());
     }
 
     #[test]
