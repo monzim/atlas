@@ -623,7 +623,7 @@ pub async fn begin_run(
             LiveRun {
                 shared_thread_id: shared_thread_id.clone(),
                 run_id: started.run_id.clone(),
-                agent_id: agent_id.clone(),
+                agent_id: *agent_id,
             },
         );
     }
@@ -691,7 +691,7 @@ fn tag_session(app: &AppHandle, session_id: &str, shared_thread_id: &str) {
 fn emit_delta(app: &AppHandle, agent_id: &AgentId, session_id: &str, delta: SessionDelta) {
     if let Some(sink) = app.try_state::<RunDeltaSink>() {
         sink.0.emit(SessionDeltaEnvelope {
-            agent_id: agent_id.clone(),
+            agent_id: *agent_id,
             session_id: session_id.to_string(),
             delta,
         });
