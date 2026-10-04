@@ -57,6 +57,8 @@ pub enum ReplicaError {
     UnknownFile(u64),
     #[error("{0} did not hash to the blob it was fetched as")]
     CorruptBlob(String),
+    #[error("{path} is already file {holder} in this replica")]
+    PathTaken { path: String, holder: u64 },
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ReplicaError + '_ {
@@ -149,6 +151,14 @@ pub struct ForkFile {
     pub content: String,
 }
 
+/// What a remote change moved out of the way so it would not overwrite the
+/// person's own file: where the file was, and where it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAside {
+    pub path: String,
+    pub moved_to: String,
+}
+
 pub struct Replica {
     /// The repository the worktree comes from: the person's own, or the
     /// thread repository a bundle was fetched into (ATL-402). `None` while
@@ -160,6 +170,8 @@ pub struct Replica {
     materialized: bool,
     files: BTreeMap<u64, TrackedFile>,
     by_path: HashMap<String, u64>,
+    /// Files of the person's that remote changes moved aside.
+    set_aside: Vec<SetAside>,
 }
 
 impl Replica {
@@ -190,7 +202,43 @@ impl Replica {
             materialized: false,
             files: BTreeMap::new(),
             by_path: HashMap::new(),
+            set_aside: Vec::new(),
         })
+    }
+
+    /// Files of the person's that remote changes moved out of the way, since
+    /// this was last asked.
+    pub fn take_set_aside(&mut self) -> Vec<SetAside> {
+        std::mem::take(&mut self.set_aside)
+    }
+
+    /// Move a file of the person's at `rel` to a free name beside it, so a
+    /// remote change can take the path without overwriting it.
+    fn set_aside(&mut self, rel: &str) -> Result<(), ReplicaError> {
+        let target = path::resolve(&self.root, rel)?;
+        if !target.exists() {
+            return Ok(());
+        }
+        let mut n = 0;
+        let moved_to = loop {
+            let candidate = if n == 0 {
+                format!("{rel}.mine")
+            } else {
+                format!("{rel}.mine-{n}")
+            };
+            if !path::resolve(&self.root, &candidate)?.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        let dest = path::resolve(&self.root, &moved_to)?;
+        fs::rename(&target, &dest).map_err(io(&dest))?;
+        tracing::info!(target: "atlas_thread_sync", %rel, %moved_to, "moved the person's file aside for a remote change");
+        self.set_aside.push(SetAside {
+            path: rel.to_string(),
+            moved_to,
+        });
+        Ok(())
     }
 
     /// The Base arrived (or was always in `repo`): worktrees come from `repo`
@@ -353,6 +401,13 @@ impl Replica {
         if !path::is_valid(rel) {
             return Err(path::PathError::Invalid(rel.to_string()).into());
         }
+        // One live file per path: a second would write over the first.
+        if let Some(holder) = self.by_path.get(rel).copied() {
+            return Err(ReplicaError::PathTaken {
+                path: rel.to_string(),
+                holder,
+            });
+        }
         let doc = FileDoc::new(self.client_id);
         if kind == FileKind::Text {
             for update in self.seed_for(rel)? {
@@ -393,6 +448,15 @@ impl Replica {
             let file = self.files.get_mut(&id).ok_or(ReplicaError::UnknownFile(id))?;
             if let Some(origin) = entry.origin.as_ref().filter(|o| path::is_valid(o)) {
                 file.origin.clone_from(origin);
+            }
+        }
+        // The path must not be another live file's here.
+        if !entry.deleted {
+            if let Some(holder) = self.by_path.get(&entry.path).copied().filter(|h| *h != id) {
+                return Err(ReplicaError::PathTaken {
+                    path: entry.path.clone(),
+                    holder,
+                });
             }
         }
         // A rename: the bytes move with the file.
@@ -472,7 +536,19 @@ impl Replica {
         if file.deleted || !self.materialized {
             return Ok(());
         }
-        let target = path::resolve(&self.root, &file.path)?;
+        let rel = file.path.clone();
+        let ours = file.disk;
+        let target = path::resolve(&self.root, &rel)?;
+        // Bytes this replica never wrote or read are the person's own: set
+        // them aside rather than overwrite them.
+        if ours.is_none() {
+            if let Ok(existing) = fs::read(&target) {
+                if hash(&existing) != seen {
+                    self.set_aside(&rel)?;
+                }
+            }
+        }
+        let file = self.files.get_mut(&file_id).expect("known");
         file.disk = Some(seen);
         write_atomic(&target, bytes)
     }
@@ -533,8 +609,14 @@ impl Replica {
     fn move_on_disk(&mut self, from: &str, to: &str) -> Result<(), ReplicaError> {
         let source = path::resolve(&self.root, from)?;
         let target = path::resolve(&self.root, to)?;
-        if !source.exists() || target.exists() {
+        if !source.exists() {
             return Ok(());
+        }
+        // Whatever is at the new path is the person's own (no live file of
+        // the thread holds it): keep it, beside, rather than lose it — or,
+        // worse, read it back later as an edit of the moved file.
+        if target.exists() {
+            self.set_aside(to)?;
         }
         if let Some(dir) = target.parent() {
             fs::create_dir_all(dir).map_err(io(dir))?;

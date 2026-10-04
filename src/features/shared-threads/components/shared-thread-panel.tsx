@@ -5,6 +5,7 @@ import {
   Copy,
   Eye,
   FolderOpen,
+  Info,
   Link2,
   LogOut,
   Play,
@@ -385,6 +386,16 @@ function ThreadCard({
             Send history
           </Button>
         </div>
+      )}
+      {status.notices.length > 0 && (
+        <ul className="flex flex-col gap-1 text-[var(--secondary-foreground)]">
+          {status.notices.map((n, i) => (
+            <li key={i} className="flex items-start gap-1.5">
+              <Info size={12} className="mt-px shrink-0 text-[var(--muted-foreground)]" />
+              <span>{n}</span>
+            </li>
+          ))}
+        </ul>
       )}
       {status.error && <p className="text-warning">{status.error}</p>}
       {status.held.length > 0 && (

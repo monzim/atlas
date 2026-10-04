@@ -121,6 +121,8 @@ pub struct SyncStatus {
     /// lack the Base, and how many are waiting for it while it does not.
     pub serves_history: bool,
     pub history_wanted: usize,
+    /// Things done on the person's behalf they should hear about, newest last.
+    pub notices: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -142,6 +144,7 @@ fn status_of<T: Transport>(
         read_only: session.read_only(),
         serves_history: session.serves_bundles(),
         history_wanted: session.bundles_wanted(),
+        notices: session.notices().to_vec(),
         error,
     }
 }

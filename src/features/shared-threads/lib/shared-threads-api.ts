@@ -64,6 +64,11 @@ export interface SharedThreadStatus {
   servesHistory: boolean;
   /** Teammates waiting for that history while it is not being sent. */
   historyWanted: number;
+  /**
+   * What was done on the person's behalf — a file of theirs moved aside for a
+   * teammate's change, a drifted replica repaired — newest last.
+   */
+  notices: string[];
   error: string | null;
 }
 

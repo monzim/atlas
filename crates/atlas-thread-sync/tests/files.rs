@@ -271,3 +271,67 @@ async fn touching_more_files_than_the_limit_is_refused_with_the_limit_named() {
     assert_eq!(code, "limit_reached");
     assert!(message.contains("touched files per thread: 2"), "{message}");
 }
+
+#[tokio::test]
+async fn a_move_onto_a_path_the_person_uses_keeps_their_file_and_never_sends_it() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
+    // Monzim has a file of his own at the path, not in the thread.
+    write(&monzim_root, "src/brand.css", "/* monzim's private notes */\n");
+
+    fs::rename(
+        joy_root.join("src/banner.css"),
+        joy_root.join("src/brand.css"),
+    )
+    .unwrap();
+    joy.file_saved("src/brand.css").await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+
+    // His file is beside it, untouched, and he is told.
+    assert_eq!(
+        read(&monzim_root, "src/brand.css.mine"),
+        "/* monzim's private notes */\n"
+    );
+    assert_eq!(
+        read(&monzim_root, "src/brand.css"),
+        ".banner {\n  color: green;\n}\n"
+    );
+    assert!(monzim.notices().iter().any(|n| n.contains("src/brand.css.mine")));
+    // And nothing of it reached the thread.
+    let sent = monzim.updates_sent();
+    monzim.file_saved("src/brand.css").await.unwrap();
+    assert_eq!(monzim.updates_sent(), sent);
+    assert!(!server
+        .journaled_payloads()
+        .iter()
+        .any(|p| p.windows(7).any(|w| w == b"private")));
+}
+
+#[tokio::test]
+async fn a_file_moved_to_a_secret_name_leaves_the_thread_and_stays_home() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
+    let id = joy.replica().file_id("notes.md").unwrap();
+    fs::rename(joy_root.join("notes.md"), joy_root.join(".env.production")).unwrap();
+    assert_eq!(
+        joy.file_saved(".env.production").await.unwrap(),
+        LocalChange::Ignored
+    );
+    joy.file_saved("notes.md").await.unwrap();
+    joy.settle_removals().await.unwrap();
+    let entry = server.tree().into_iter().find(|e| e.file_id == id).unwrap();
+    assert!(entry.deleted);
+    assert_eq!(entry.path, "notes.md");
+    assert!(!server.tree().iter().any(|e| e.path.contains(".env")));
+
+    // Edits there stay home too.
+    write(&joy_root, ".env.production", "SECRET=1\n");
+    assert_eq!(
+        joy.file_saved(".env.production").await.unwrap(),
+        LocalChange::Ignored
+    );
+    monzim.pump(QUIET).await.unwrap();
+    assert!(!monzim_root.join(".env.production").exists());
+}

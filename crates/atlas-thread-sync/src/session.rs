@@ -185,6 +185,9 @@ pub struct ThreadSession<T: Transport> {
     included: HashSet<String>,
     /// Why this replica can only watch, when it can.
     watch_only: Option<String>,
+    /// Things done on the person's behalf they should hear about — a file of
+    /// theirs moved aside, a replica repaired — newest last.
+    notices: Vec<String>,
 }
 
 impl<T: Transport> ThreadSession<T> {
@@ -231,6 +234,7 @@ impl<T: Transport> ThreadSession<T> {
             serve_bundles: false,
             included: HashSet::new(),
             watch_only: None,
+            notices: Vec::new(),
         };
         loop {
             let message = tokio::time::timeout(ANSWER_TIMEOUT, session.transport.recv())
@@ -284,6 +288,19 @@ impl<T: Transport> ThreadSession<T> {
     /// This machine's bare repository for the thread (ATL-402).
     pub fn set_thread_repo(&mut self, repo: ThreadRepo) {
         self.thread_repo = Some(repo);
+    }
+
+    /// What was done on the person's behalf, newest last (at most a few).
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    fn notice(&mut self, text: String) {
+        const KEPT: usize = 5;
+        self.notices.push(text);
+        if self.notices.len() > KEPT {
+            self.notices.remove(0);
+        }
     }
 
     /// Why this replica may not change the thread, or `None` when it may.
@@ -889,6 +906,12 @@ impl<T: Transport> ThreadSession<T> {
                 sha256,
                 bytes,
             } => {
+                // A binary file is judged by its name, at every save: one moved
+                // to a credential's name (`cert.p12`) stays home.
+                if let Some(reason) = secret_reason(rel, "") {
+                    tracing::info!(target: "atlas_thread_sync", ?reason, "holding a binary file that looks secret");
+                    return Ok(LocalChange::Ignored);
+                }
                 self.set_blob(file_id, &sha256, bytes).await?;
                 Ok(LocalChange::Blob {
                     file_id,
@@ -905,7 +928,20 @@ impl<T: Transport> ThreadSession<T> {
                 Ok(LocalChange::Missing { file_id })
             }
             LocalChange::Renamed { file_id, from, to } => {
-                if self.ignores(&to)? {
+                // Moved somewhere that does not sync — ignored, or a name that
+                // holds credentials (`.env`): the thread sees a deletion, and
+                // the file stays on this machine.
+                let secret = match self.replica.kind(file_id) {
+                    Some(FileKind::Text) => {
+                        let content = String::from_utf8_lossy(&self.replica.read_bytes(&to)?).into_owned();
+                        secret_reason(&to, &content).is_some()
+                    }
+                    _ => secret_reason(&to, "").is_some(),
+                };
+                if secret || self.ignores(&to)? {
+                    if !self.missing.contains(&file_id) {
+                        self.missing.push(file_id);
+                    }
                     return Ok(LocalChange::Ignored);
                 }
                 let client_seq = self.take_client_seq();
@@ -1226,12 +1262,19 @@ impl<T: Transport> ThreadSession<T> {
                         if let Some(version) = entry.merge_version {
                             self.versions.insert(entry.file_id, version);
                         }
-                        if let Some(sha) = self.replica.learn(&entry)? {
+                        let fetch = self.replica.learn(&entry)?;
+                        if let Some(sha) = fetch {
                             // A blob that cannot be fetched now is fetched at
                             // the next checkout; the change is not lost.
                             if let Err(e) = self.fetch_blob(entry.file_id, sha).await {
                                 tracing::warn!(target: "atlas_thread_sync", path = %entry.path, "blob fetch failed: {e}");
                             }
+                        }
+                        for aside in self.replica.take_set_aside() {
+                            self.notice(format!(
+                                "A teammate's change needed {}; your own file there is now {}.",
+                                aside.path, aside.moved_to
+                            ));
                         }
                     }
                     ServerControl::Ack {
