@@ -357,7 +357,7 @@ export interface Applied {
   beside: string[];
   /** The stash the person's own edits went into, when they asked for it. */
   stashed: string | null;
-  /** Ignored files of theirs that were in the way, moved beside themselves. */
+  /** Ignored files of theirs that were in the way, moved under `.git/atlas-set-aside/` (absolute paths). */
   setAside: string[];
 }
 

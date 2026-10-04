@@ -43,8 +43,10 @@ pub struct Applied {
     pub beside: Vec<String>,
     /// The message the person's own edits were stashed under, if they were.
     pub stashed: Option<String>,
-    /// Ignored files of the person's that were in the way, moved beside
-    /// themselves (`<path>.atlas-mine`) since git cannot stash them by path.
+    /// Ignored files of the person's that were in the way — git cannot
+    /// stash them by path — moved under the repository's git directory
+    /// (`.git/atlas-set-aside/<time>/<path>`), where nothing is committed
+    /// from. Absolute paths.
     pub set_aside: Vec<String>,
 }
 
@@ -145,24 +147,39 @@ pub fn apply(
             None => return Err(ApplyError::Dirty(kept_dirty)),
             Some(message) => {
                 // What git sees goes into a stash; git does not stash an
-                // ignored file by path, so those are set aside beside
-                // themselves instead — moved, never overwritten.
+                // ignored file by path, so those are moved into the
+                // repository's git directory instead — never overwritten, and
+                // never beside themselves, where a name like `.env.atlas-mine`
+                // would escape the ignore rule that kept `.env` out of commits.
                 let visible: Vec<String> = git::dirty_among(checkout, &kept_dirty)?;
                 if !visible.is_empty() {
                     git::stash_paths(checkout, &visible, message)?;
                     applied.stashed = Some(message.to_string());
                 }
+                let aside_root = git::git_path(checkout, "atlas-set-aside")?.join(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis())
+                        .to_string(),
+                );
                 for rel in &kept_dirty {
                     if on_disk(checkout, rel)? == git::blob_at(checkout, &head, rel)? {
                         continue;
                     }
-                    let aside = aside_name(checkout, rel)?;
-                    fs::rename(path::resolve(checkout, rel)?, path::resolve(checkout, &aside)?)
-                        .map_err(|source| ApplyError::Io {
-                            path: checkout.join(rel),
+                    let to = aside_root.join(rel);
+                    if let Some(dir) = to.parent() {
+                        fs::create_dir_all(dir).map_err(|source| ApplyError::Io {
+                            path: dir.to_path_buf(),
                             source,
                         })?;
-                    applied.set_aside.push(aside);
+                    }
+                    fs::rename(path::resolve(checkout, rel)?, &to).map_err(|source| {
+                        ApplyError::Io {
+                            path: checkout.join(rel),
+                            source,
+                        }
+                    })?;
+                    applied.set_aside.push(to.to_string_lossy().into_owned());
                 }
                 // Anything still in the way stops Apply before it writes.
                 let mut left = Vec::new();
@@ -310,22 +327,6 @@ fn beside_name(checkout: &Path, rel: &str, bytes: &[u8]) -> Result<Option<String
         }
     }
     Ok(None)
-}
-
-/// A free name beside `rel` for the person's own copy: `<path>.atlas-mine`,
-/// or the first `<path>.atlas-mine-N` nothing holds.
-fn aside_name(checkout: &Path, rel: &str) -> Result<String, ApplyError> {
-    for n in 1..=100 {
-        let name = if n == 1 {
-            format!("{rel}.atlas-mine")
-        } else {
-            format!("{rel}.atlas-mine-{n}")
-        };
-        if path::is_valid(&name) && on_disk(checkout, &name)?.is_none() {
-            return Ok(name);
-        }
-    }
-    Err(ApplyError::Dirty(vec![rel.to_string()]))
 }
 
 /// Does `rel` in the checkout already hold what the thread has there — the

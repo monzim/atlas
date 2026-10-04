@@ -194,12 +194,18 @@ fn an_ignored_file_of_the_persons_is_never_overwritten() {
     }
     assert_eq!(read(&dir, "local/settings.json"), "{\"mine\": true}\n");
     // Stash and apply sets it aside too — git cannot stash an ignored file by
-    // path, so it is moved beside itself rather than written over.
+    // path, so it is moved under .git, never beside itself where it would no
+    // longer be ignored, and never written over.
     let applied = apply(&dir, &base, &changes, Some("atlas: set aside")).unwrap();
     assert_eq!(read(&dir, "local/settings.json"), "{\"thread\": true}\n");
-    assert_eq!(applied.set_aside, vec!["local/settings.json.atlas-mine".to_string()]);
-    assert_eq!(read(&dir, "local/settings.json.atlas-mine"), "{\"mine\": true}\n");
+    assert_eq!(applied.set_aside.len(), 1);
+    let kept = std::path::Path::new(&applied.set_aside[0]);
+    assert!(kept.starts_with(dir.join(".git")), "{kept:?}");
+    assert!(kept.ends_with("local/settings.json"));
+    assert_eq!(fs::read_to_string(kept).unwrap(), "{\"mine\": true}\n");
     assert_eq!(applied.stashed, None);
+    // Nothing new for git to see but the thread's file itself.
+    assert!(!status(&dir).contains("atlas-mine"));
 }
 
 #[test]

@@ -185,6 +185,18 @@ pub fn objects_dir(repo: &Path) -> Result<std::path::PathBuf, GitError> {
     ))
 }
 
+/// A path inside `repo`'s git directory (the common one, for a worktree):
+/// somewhere nothing is ever committed from.
+pub fn git_path(repo: &Path, name: &str) -> Result<std::path::PathBuf, GitError> {
+    let out = run(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-path", name],
+    )?;
+    Ok(std::path::PathBuf::from(
+        String::from_utf8_lossy(&out).trim().to_string(),
+    ))
+}
+
 /// Create a bare repository at `dir` if there is none.
 pub fn init_bare(dir: &Path) -> Result<(), GitError> {
     std::fs::create_dir_all(dir)?;

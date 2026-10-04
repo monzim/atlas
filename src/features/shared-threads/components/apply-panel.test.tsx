@@ -68,7 +68,7 @@ describe("ApplyPanel", () => {
         files: ["a.ts"],
         conflicted: ["util.ts"],
         beside: ["logo.png.atlas-thread"],
-        setAside: ["local/settings.json.atlas-mine"],
+        setAside: ["/repo/.git/atlas-set-aside/1/local/settings.json"],
         stashed: null,
       }),
     );
@@ -77,7 +77,7 @@ describe("ApplyPanel", () => {
     await waitFor(() => expect(screen.getByText("util.ts")).toBeTruthy());
     expect(screen.getByText(/conflict markers/)).toBeTruthy();
     expect(screen.getByText("logo.png.atlas-thread")).toBeTruthy();
-    expect(screen.getByText("local/settings.json.atlas-mine")).toBeTruthy();
+    expect(screen.getByText("/repo/.git/atlas-set-aside/1/local/settings.json")).toBeTruthy();
   });
 
   it("says where Apply writes when this machine joined without a checkout", () => {

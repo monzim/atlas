@@ -154,8 +154,9 @@ function Outcome({
       )}
       {outcome.setAside.length > 0 && (
         <span>
-          Your own copies of ignored files were in the way and are kept as{" "}
-          <span className="font-mono">{outcome.setAside.join(", ")}</span>.
+          Your own copies of ignored files were in the way. They are kept inside your
+          repository&apos;s .git folder, where nothing gets committed:{" "}
+          <span className="break-all font-mono">{outcome.setAside.join(", ")}</span>
         </span>
       )}
       {outcome.stashed && (
