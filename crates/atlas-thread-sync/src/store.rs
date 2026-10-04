@@ -136,6 +136,10 @@ impl FakeStore {
         self.lock().snapshots.insert(file_id, bytes);
     }
 
+    pub(crate) fn snapshot(&self, file_id: u64) -> Option<Vec<u8>> {
+        self.lock().snapshots.get(&file_id).cloned()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Objects> {
         self.objects.lock().expect("fake store")
     }

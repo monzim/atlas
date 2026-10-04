@@ -241,6 +241,14 @@ pub enum ClientControl {
         file_id: u64,
         blob: String,
     },
+    /// This replica's hash of each of its files at `seq` `at` (ATL-404): of a
+    /// text file's UTF-8 text, of a binary file's bytes (its blob's name).
+    #[serde(rename = "checksum", rename_all = "camelCase")]
+    Checksum {
+        client_seq: u64,
+        at: u64,
+        files: Vec<FileHash>,
+    },
     /// This replica lacks the Base: `have` lists the commits it holds, so a
     /// thin bundle can be built. Empty asks for a full one (ATL-402).
     #[serde(rename = "bundle.request", rename_all = "camelCase")]
@@ -286,6 +294,32 @@ pub enum ClientControl {
         run_id: String,
         files: Vec<MergeFile>,
     },
+}
+
+/// One file's hash in a `checksum`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHash {
+    pub file_id: u64,
+    pub hash: String,
+}
+
+/// What a `checksum` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksumStatus {
+    Match,
+    Mismatch,
+    /// `at` is past the head or behind a compaction: ask again.
+    Unavailable,
+}
+
+/// One file's compacted history to fetch, in a `snapshot` frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFile {
+    pub file_id: u64,
+    pub bytes: u64,
 }
 
 /// Why no bundle is coming.
@@ -413,6 +447,26 @@ pub enum ServerControl {
         run_id: String,
         version: u64,
         files: Vec<MergedFile>,
+    },
+    /// The replica's `since` is ahead of the thread: its state did not come
+    /// from here. Discard it and say hello again from `0` (ATL-397).
+    #[serde(rename = "resync-required")]
+    ResyncRequired { head: u64, reason: String },
+    /// The replica is behind a compacted range: fetch each file's snapshot
+    /// and apply it with the tail that follows. Tree frames come next.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        through: u64,
+        files: Vec<SnapshotFile>,
+    },
+    #[serde(rename = "checksum.result", rename_all = "camelCase")]
+    ChecksumResult {
+        client_seq: u64,
+        at: u64,
+        status: ChecksumStatus,
+        mismatched: Vec<u64>,
+        #[serde(default)]
+        unverifiable: Vec<u64>,
     },
     /// Somebody lacks the Base: build a bundle against `have`, upload it,
     /// and say `bundle.ready` (ATL-402).

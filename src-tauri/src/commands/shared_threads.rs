@@ -43,8 +43,8 @@ use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
-    Command as SyncCommand, ObjectStore, Replica, RunReport, RunSpec, SharePreview, SyncStatus,
-    ThreadEvent, ThreadRepo, ThreadSession, WsTransport,
+    Command as SyncCommand, Connector, ObjectStore, Replica, RunReport, RunSpec, SharePreview,
+    SyncStatus, ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -490,8 +490,9 @@ pub async fn shared_thread_leave(app: AppHandle, shared_thread_id: String) -> Re
 ///
 /// Best effort, and patient: the account session is restored after this runs,
 /// so the first attempts may have no token yet. A thread that still cannot
-/// reconnect stays in the registry and is tried again at the next launch;
-/// reconnecting mid-session is ATL-404's.
+/// connect stays in the registry and is tried again at the next launch. Once
+/// joined, a dropped socket is dialled again by the thread's own loop
+/// (ATL-404).
 pub fn install(app: &AppHandle) {
     app.manage(SharedThreadsState::default());
     let app = app.clone();
@@ -556,15 +557,17 @@ async fn start(
         None => Replica::without_base(&entry.base, &root),
     }
     .map_err(|e| SharedThreadError::new("replica_failed", e.to_string()))?;
-    let mut session = ThreadSession::open(transport, replica, &entry.client_id)
-        .await
-        .map_err(session_error)?;
-    session.set_store(Arc::new(HttpStore {
+    // With its object doors from the start: behind a compaction, catching up
+    // means fetching snapshots before the thread is synced.
+    let store = Arc::new(HttpStore {
         org_id: entry.org_id.clone(),
         workspace_id: entry.workspace_id.clone(),
         shared_thread_id: entry.shared_thread_id.clone(),
         app: app.clone(),
-    }));
+    });
+    let mut session = ThreadSession::connect(transport, replica, &entry.client_id, store)
+        .await
+        .map_err(session_error)?;
     session.set_thread_repo(thread_repo);
     session.set_serve_bundles(entry.serve_history);
     // Without the Base the replica can only watch; a bundle fixes that. Not
@@ -595,7 +598,13 @@ async fn start(
     let mut updates = status.clone();
     let (events, mut heard) = mpsc::unbounded_channel();
     session.set_events(events);
-    tauri::async_runtime::spawn(atlas_thread_sync::run(session, rx, status_tx));
+    let connector = WsConnector {
+        app: app.clone(),
+        url,
+    };
+    tauri::async_runtime::spawn(atlas_thread_sync::run_with(
+        session, rx, status_tx, connector,
+    ));
     {
         let forward = app.clone();
         let shared_thread_id = entry.shared_thread_id.clone();
@@ -880,6 +889,24 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
             };
             emit_delta(&app, &run.agent_id, &session_id, ended);
         });
+    }
+}
+
+/// Dials the thread socket again after a drop (ATL-404), with a token minted
+/// for that dial — the one the thread was joined with may have expired.
+struct WsConnector {
+    app: AppHandle,
+    url: String,
+}
+
+impl Connector for WsConnector {
+    type Transport = WsTransport;
+
+    async fn connect(&self) -> std::result::Result<WsTransport, TransportError> {
+        let token = token(&self.app)
+            .await
+            .map_err(|e| TransportError::Ws(e.message))?;
+        WsTransport::connect(&self.url, &token).await
     }
 }
 

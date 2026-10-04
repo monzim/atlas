@@ -153,6 +153,8 @@ pub enum LocalChange {
     /// Not something that syncs (a file that turned binary or grew past the
     /// text limit, or the worktree does not exist yet).
     Ignored,
+    /// Saved while the socket is down: read and sent when it is back.
+    Buffered,
 }
 
 /// One tracked file as a Run forked it.
@@ -184,6 +186,13 @@ pub struct Replica {
     by_path: HashMap<String, u64>,
     /// Files of the person's that remote changes moved aside.
     set_aside: Vec<SetAside>,
+    /// Rebuilding from the thread (ATL-404): remote changes go into the
+    /// documents only, and disk gets canonical state once at the end.
+    rebuilding: bool,
+    /// What this replica last knew of each path's bytes before a rebuild, so
+    /// its own (drifted) bytes are replaced rather than set aside as the
+    /// person's.
+    known_before: HashMap<String, Hash>,
 }
 
 impl Replica {
@@ -215,7 +224,61 @@ impl Replica {
             files: BTreeMap::new(),
             by_path: HashMap::new(),
             set_aside: Vec::new(),
+            rebuilding: false,
+            known_before: HashMap::new(),
         })
+    }
+
+    /// Forget every document, to build them again from the thread: this
+    /// replica's state can no longer be trusted (ATL-404).
+    pub fn begin_rebuild(&mut self) {
+        self.known_before = self
+            .files
+            .values()
+            .filter_map(|f| f.disk.map(|d| (f.path.clone(), d)))
+            .collect();
+        self.files.clear();
+        self.by_path.clear();
+        self.rebuilding = true;
+    }
+
+    /// The rebuild is done: write canonical state over the worktree. The
+    /// replica's own bytes lose — they are what drifted.
+    pub fn finish_rebuild(&mut self) -> Result<(), ReplicaError> {
+        self.rebuilding = false;
+        if !self.materialized {
+            return Ok(());
+        }
+        for rel in self.removed_paths() {
+            self.remove_on_disk(&rel)?;
+        }
+        let ids: Vec<u64> = self
+            .files
+            .iter()
+            .filter(|(_, f)| !f.deleted && f.kind == FileKind::Text)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.sync_disk(id)?;
+        }
+        Ok(())
+    }
+
+    /// Each live file's hash as this replica holds it — a text file's UTF-8
+    /// text, a binary file's blob — for a checksum (ATL-404).
+    pub fn hashes(&self) -> Vec<(u64, String)> {
+        self.files
+            .iter()
+            .filter(|(_, f)| !f.deleted)
+            .filter_map(|(id, f)| match f.kind {
+                FileKind::Text => Some((*id, hex(&hash(f.doc.content().as_bytes())))),
+                FileKind::Binary => f.blob.clone().map(|b| (*id, b)),
+            })
+            .collect()
+    }
+
+    pub fn path_of(&self, file_id: u64) -> Option<String> {
+        self.files.get(&file_id).map(|f| f.path.clone())
     }
 
     /// Files of the person's that remote changes moved out of the way, since
@@ -430,13 +493,14 @@ impl Replica {
         // on disk at this path is either the Base (equal to the seed) or the
         // person's own new file, which the next save or remote update folds in
         // before anything is written back. `disk: None` makes sure it is read.
+        let disk = self.known_before.remove(rel);
         self.files.insert(
             file_id,
             TrackedFile {
                 path: rel.to_string(),
                 kind,
                 doc,
-                disk: None,
+                disk,
                 held: None,
                 blob: None,
                 deleted: false,
@@ -713,7 +777,7 @@ impl Replica {
             .ok_or(ReplicaError::UnknownFile(file_id))?;
         // A deleted file's document still follows (a revival brings it back),
         // but nothing is written where it used to be.
-        if !self.materialized || file.deleted {
+        if !self.materialized || file.deleted || self.rebuilding {
             file.doc.apply(update)?;
             return Ok(None);
         }

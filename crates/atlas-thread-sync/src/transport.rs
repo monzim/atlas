@@ -43,7 +43,45 @@ pub trait Transport: Send {
         -> impl Future<Output = Result<(), TransportError>> + Send;
     /// The next message, or `None` once the socket has closed.
     fn recv(&mut self) -> impl Future<Output = Option<Message>> + Send;
+    /// The close code the server sent, once it closed us: 1008 when access
+    /// ended, 4403 or 4410 when the thread refuses us. `None` for a dropped
+    /// connection, which is worth dialling again.
+    fn close_code(&self) -> Option<u16> {
+        None
+    }
 }
+
+/// How the app's loop dials the thread again after a drop (ATL-404).
+pub trait Connector: Send + Sync {
+    type Transport: Transport;
+    fn connect(&self) -> impl Future<Output = Result<Self::Transport, TransportError>> + Send;
+    /// Whether a dropped socket is dialled again at all.
+    fn reconnects(&self) -> bool {
+        true
+    }
+}
+
+/// A connector that never dials: the loop ends when the socket closes.
+pub struct NoReconnect<T>(std::marker::PhantomData<fn() -> T>);
+
+impl<T> Default for NoReconnect<T> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T: Transport> Connector for NoReconnect<T> {
+    type Transport = T;
+    async fn connect(&self) -> Result<T, TransportError> {
+        Err(TransportError::Closed)
+    }
+    fn reconnects(&self) -> bool {
+        false
+    }
+}
+
+/// Close codes after which dialling again cannot help.
+pub const FINAL_CLOSE_CODES: &[u16] = &[1008, 4400, 4403, 4410];
 
 // ---------------------------------------------------------------------------
 // The real socket
@@ -123,6 +161,10 @@ impl Transport for WsTransport {
             }
         }
     }
+
+    fn close_code(&self) -> Option<u16> {
+        self.close_code
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +174,7 @@ impl Transport for WsTransport {
 struct Journaled {
     seq: u64,
     tree: Option<TreeEntry>,
+    /// `None` once compacted into a snapshot (or for a tree change).
     frame: Option<Frame>,
     author: String,
     client: String,
@@ -160,6 +203,14 @@ struct Hub {
     next_request: u64,
     /// The plan's touched-files limit (`threads.shared`), when one is set.
     touched_files: Option<usize>,
+    /// Everything up to here lives in snapshots, not the journal (ATL-397).
+    compacted_through: u64,
+    /// Users who cannot connect right now.
+    offline: std::collections::HashSet<String>,
+    /// Why the server closed each connection it closed.
+    closed: HashMap<u64, u16>,
+    /// The next canonical update relayed to this user is lost on the way.
+    lose_next_to: Option<String>,
 }
 
 struct FakeRun {
@@ -180,6 +231,30 @@ struct Conn {
 #[derive(Clone, Default)]
 pub struct FakeThreadServer {
     hub: Arc<Mutex<Hub>>,
+}
+
+/// Dials a [`FakeThreadServer`] as one user — refused while they are offline.
+#[derive(Clone)]
+pub struct FakeConnector {
+    server: FakeThreadServer,
+    user: String,
+}
+
+impl Connector for FakeConnector {
+    type Transport = FakeTransport;
+    async fn connect(&self) -> Result<FakeTransport, TransportError> {
+        let offline = self
+            .server
+            .hub
+            .lock()
+            .map_err(|_| TransportError::Closed)?
+            .offline
+            .contains(&self.user);
+        if offline {
+            return Err(TransportError::Ws("offline".into()));
+        }
+        Ok(self.server.connect(&self.user))
+    }
 }
 
 /// One connection to a [`FakeThreadServer`].
@@ -255,6 +330,99 @@ impl FakeThreadServer {
     /// Live Run frames relayed so far. None of them is ever journaled.
     pub fn run_frames_relayed(&self) -> u64 {
         self.hub.lock().expect("hub").run_frames_relayed
+    }
+
+    /// Drop every connection `user` holds, as a network drop would: no
+    /// close code, so their replicas dial again.
+    pub fn cut(&self, user: &str) {
+        let mut hub = self.hub.lock().expect("hub");
+        let conns: Vec<u64> = hub
+            .conns
+            .iter()
+            .filter(|(_, c)| c.user == user)
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in conns {
+            hub.disconnect(conn);
+        }
+    }
+
+    /// Close `user`'s connections with a code — 1008 when their access
+    /// ended, 4410 when the thread closed.
+    pub fn close(&self, user: &str, code: u16) {
+        let mut hub = self.hub.lock().expect("hub");
+        let conns: Vec<u64> = hub
+            .conns
+            .iter()
+            .filter(|(_, c)| c.user == user)
+            .map(|(id, _)| *id)
+            .collect();
+        for conn in conns {
+            hub.closed.insert(conn, code);
+            hub.disconnect(conn);
+        }
+    }
+
+    /// While offline, `user` cannot connect at all.
+    pub fn set_offline(&self, user: &str, offline: bool) {
+        let mut hub = self.hub.lock().expect("hub");
+        if offline {
+            hub.offline.insert(user.to_string());
+        } else {
+            hub.offline.remove(user);
+        }
+    }
+
+    /// A connector that dials this server as `user`.
+    pub fn connector(&self, user: &str) -> FakeConnector {
+        FakeConnector {
+            server: self.clone(),
+            user: user.to_string(),
+        }
+    }
+
+    /// Lose the next canonical update on its way to `user`: their replica
+    /// silently drifts, which only a checksum can tell.
+    pub fn lose_next_update_to(&self, user: &str) {
+        self.hub.lock().expect("hub").lose_next_to = Some(user.to_string());
+    }
+
+    /// Fold the whole journal into per-file snapshots, as the real server's
+    /// compaction does: a replica behind it is caught up by snapshot plus
+    /// tail.
+    pub fn compact(&self) {
+        let mut hub = self.hub.lock().expect("hub");
+        let through = hub.head();
+        let mut by_file: std::collections::BTreeMap<u64, Vec<Vec<u8>>> = Default::default();
+        let file_ids: Vec<u64> = hub.tree.iter().map(|e| e.file_id).collect();
+        for id in file_ids {
+            if let Some(snapshot) = hub.store.snapshot(id) {
+                by_file.entry(id).or_default().push(snapshot);
+            }
+        }
+        for j in hub.journal.iter_mut().filter(|j| j.seq <= through) {
+            if let Some(frame) = j.frame.take() {
+                by_file.entry(frame.file_id).or_default().push(frame.payload);
+            }
+        }
+        for (file_id, updates) in by_file {
+            let merged = yrs::merge_updates_v1(&updates).expect("journaled updates merge");
+            hub.store.put_snapshot(file_id, merged);
+        }
+        hub.compacted_through = through;
+    }
+
+    /// Forget everything after `seq`, as a restore from an older backup
+    /// would: a replica that saw more is now ahead of the thread.
+    pub fn forget_after(&self, seq: u64) {
+        let mut hub = self.hub.lock().expect("hub");
+        hub.journal.retain(|j| j.seq <= seq);
+        let live: std::collections::HashSet<u64> = hub
+            .journal
+            .iter()
+            .filter_map(|j| j.tree.as_ref().map(|t| t.file_id))
+            .collect();
+        hub.tree.retain(|e| live.contains(&e.file_id));
     }
 
     /// The thread's object doors: what replicas upload, and download.
@@ -428,6 +596,26 @@ impl Hub {
         );
     }
 
+    /// A file's hash at `seq` `at`, rebuilt the way every replica builds it:
+    /// its snapshot, then each journaled update up to `at`. Binary files are
+    /// their blob's name.
+    fn hash_at(&self, file_id: u64, at: u64) -> Option<String> {
+        let entry = self.tree.iter().find(|e| e.file_id == file_id)?;
+        if entry.kind == FileKind::Binary {
+            return entry.blob.clone();
+        }
+        let doc = crate::doc::FileDoc::new(crate::doc::random_client_id());
+        if let Some(snapshot) = self.store.snapshot(file_id) {
+            doc.apply(&snapshot).ok()?;
+        }
+        for j in self.journal.iter().filter(|j| j.seq <= at) {
+            if let Some(frame) = j.frame.as_ref().filter(|f| f.file_id == file_id) {
+                doc.apply(&frame.payload).ok()?;
+            }
+        }
+        Some(crate::bootstrap::sha256_hex(doc.content().as_bytes()))
+    }
+
     fn live(&self, path: &str) -> Option<&TreeEntry> {
         self.tree.iter().find(|e| e.path == path && !e.deleted)
     }
@@ -460,6 +648,18 @@ impl Hub {
                 Ok(ClientControl::Hello {
                     client_id, since, ..
                 }) => {
+                    if since > self.head() {
+                        if let Some(c) = self.conns.get_mut(&conn) {
+                            c.client = None;
+                        }
+                        return self.reply(
+                            conn,
+                            &ServerControl::ResyncRequired {
+                                head: self.head(),
+                                reason: "ahead".into(),
+                            },
+                        );
+                    }
                     let last = self
                         .journal
                         .iter()
@@ -480,7 +680,49 @@ impl Hub {
                         },
                     );
                     let tx = self.conns[&conn].tx.clone();
-                    for j in self.journal.iter().filter(|j| j.seq > since) {
+                    // Behind a compaction: the snapshots, the tree, then the tail.
+                    let mut from = since;
+                    if since < self.compacted_through {
+                        let files = self
+                            .tree
+                            .iter()
+                            .filter_map(|e| {
+                                self.store.snapshot(e.file_id).map(|s| wire::SnapshotFile {
+                                    file_id: e.file_id,
+                                    bytes: s.len() as u64,
+                                })
+                            })
+                            .collect();
+                        let _ = tx.send(Message::Text(
+                            serde_json::to_string(&ServerControl::Snapshot {
+                                through: self.compacted_through,
+                                files,
+                            })
+                            .expect("json"),
+                        ));
+                        let mut sent = std::collections::HashSet::new();
+                        for j in self.journal.iter().filter(|j| j.seq <= self.compacted_through) {
+                            let Some(entry) = &j.tree else { continue };
+                            if !sent.insert(entry.file_id) {
+                                continue;
+                            }
+                            let current = self
+                                .tree
+                                .iter()
+                                .find(|e| e.file_id == entry.file_id)
+                                .unwrap_or(entry)
+                                .clone();
+                            let _ = tx.send(Message::Text(
+                                serde_json::to_string(&ServerControl::Tree {
+                                    seq: j.seq,
+                                    entry: current,
+                                })
+                                .expect("json"),
+                            ));
+                        }
+                        from = self.compacted_through;
+                    }
+                    for j in self.journal.iter().filter(|j| j.seq > from) {
                         let message = match (&j.tree, &j.frame) {
                             (Some(entry), _) => Message::Text(
                                 serde_json::to_string(&ServerControl::Tree {
@@ -510,6 +752,44 @@ impl Hub {
                     if let Some(c) = self.conns.get_mut(&conn) {
                         c.client = Some(client_id);
                     }
+                }
+                Ok(ClientControl::Checksum {
+                    client_seq,
+                    at,
+                    files,
+                }) => {
+                    if at > self.head() || at < self.compacted_through {
+                        return self.reply(
+                            conn,
+                            &ServerControl::ChecksumResult {
+                                client_seq,
+                                at,
+                                status: wire::ChecksumStatus::Unavailable,
+                                mismatched: Vec::new(),
+                                unverifiable: Vec::new(),
+                            },
+                        );
+                    }
+                    let mismatched: Vec<u64> = files
+                        .iter()
+                        .filter(|f| self.hash_at(f.file_id, at).as_deref() != Some(f.hash.as_str()))
+                        .map(|f| f.file_id)
+                        .collect();
+                    let status = if mismatched.is_empty() {
+                        wire::ChecksumStatus::Match
+                    } else {
+                        wire::ChecksumStatus::Mismatch
+                    };
+                    self.reply(
+                        conn,
+                        &ServerControl::ChecksumResult {
+                            client_seq,
+                            at,
+                            status,
+                            mismatched,
+                            unverifiable: Vec::new(),
+                        },
+                    );
                 }
                 Ok(ClientControl::BundleRequest { client_seq, have }) => {
                     if client.is_none() {
@@ -1031,10 +1311,17 @@ impl Hub {
                         file_id: None,
                     },
                 );
-                self.relay(
-                    conn,
-                    Message::Binary(wire::encode(&stored).expect("encode")),
-                );
+                let bytes = wire::encode(&stored).expect("encode");
+                let lose = self.lose_next_to.take();
+                for (id, c) in &self.conns {
+                    if *id == conn || c.client.is_none() {
+                        continue;
+                    }
+                    if lose.as_deref() == Some(c.user.as_str()) {
+                        continue;
+                    }
+                    let _ = c.tx.send(Message::Binary(bytes.clone()));
+                }
             }
         }
     }
@@ -1052,6 +1339,10 @@ impl Transport for FakeTransport {
 
     async fn recv(&mut self) -> Option<Message> {
         self.rx.recv().await
+    }
+
+    fn close_code(&self) -> Option<u16> {
+        self.hub.lock().ok()?.closed.get(&self.conn).copied()
     }
 }
 

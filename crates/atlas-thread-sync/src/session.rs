@@ -24,8 +24,8 @@ use crate::share::{self, ShareKind};
 use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{
-    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergeFile, Role,
-    RunOutcome, ServerControl, ThreadRun,
+    self, BundleFailure, ChecksumStatus, ClientControl, FileHash, FileKind, FileVersion, Frame,
+    FrameKind, MergeFile, Role, RunOutcome, ServerControl, ThreadRun,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +108,9 @@ const MAX_WANTED: usize = 16;
 /// The least time between two bundles this replica builds.
 pub const BUNDLE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The most files one `checksum` names (the server's cap).
+const MAX_CHECKSUM_FILES: usize = 2000;
+
 /// How many times a rejected merge is recomputed before giving up.
 const MERGE_ATTEMPTS: u32 = 8;
 
@@ -129,6 +132,24 @@ enum Answer {
     Rejected {
         versions: Vec<FileVersion>,
     },
+    Checksum {
+        status: ChecksumStatus,
+        mismatched: Vec<u64>,
+    },
+}
+
+/// What checking this replica against the thread found (ATL-404).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// Every file matches canonical state.
+    Match,
+    /// These files had drifted; the replica rebuilt itself from the thread.
+    Repaired(Vec<String>),
+    /// Not checked now — offline, or changes still on their way — and why.
+    Skipped(&'static str),
+    /// The server could not check this point in history (compacted, or a
+    /// moment too new); ask again later.
+    Unavailable,
 }
 
 /// How long to wait for the server's answer to something we asked.
@@ -150,6 +171,18 @@ pub struct ShareReport {
 pub struct ThreadSession<T: Transport> {
     transport: T,
     replica: Replica,
+    /// This replica's stable id on the wire, said in every `hello`.
+    client_id: String,
+    /// Whether the socket is up. While it is down, saves wait in `offline`
+    /// and updates sent but not acknowledged wait in `unacked` (ATL-404).
+    connected: bool,
+    /// Canonical updates sent and not yet acknowledged, by `client_seq`, as
+    /// sent: resent after a reconnect, the server storing each once.
+    unacked: BTreeMap<u64, Vec<u8>>,
+    /// Paths saved while disconnected, handled once the socket is back.
+    offline: std::collections::BTreeSet<String>,
+    /// Files whose compacted history arrives as a snapshot (ATL-397).
+    pending_snapshots: HashSet<u64>,
     role: Option<Role>,
     head: u64,
     next_client_seq: u64,
@@ -201,24 +234,27 @@ impl<T: Transport> ThreadSession<T> {
     ///
     /// `client_id` should be stable for this replica across reconnects: the
     /// server's welcome then says which of our frames it already stored.
-    pub async fn open(
-        mut transport: T,
+    pub async fn open(transport: T, replica: Replica, client_id: &str) -> Result<Self, SessionError> {
+        Self::connect(transport, replica, client_id, Arc::new(NoStore)).await
+    }
+
+    /// [`ThreadSession::open`] with the thread's object doors from the start:
+    /// a thread behind a compaction hands a new replica snapshots to fetch
+    /// before it is synced (ATL-397).
+    pub async fn connect(
+        transport: T,
         replica: Replica,
         client_id: &str,
+        store: Arc<dyn ObjectStore>,
     ) -> Result<Self, SessionError> {
-        let hello = ClientControl::Hello {
-            protocol: wire::PROTOCOL_VERSION,
-            client_id: client_id.to_string(),
-            since: 0,
-        };
-        transport
-            .send(Message::Text(
-                serde_json::to_string(&hello).expect("hello is JSON"),
-            ))
-            .await?;
         let mut session = Self {
             transport,
             replica,
+            client_id: client_id.to_string(),
+            connected: true,
+            unacked: BTreeMap::new(),
+            offline: std::collections::BTreeSet::new(),
+            pending_snapshots: HashSet::new(),
             role: None,
             head: 0,
             next_client_seq: 1,
@@ -232,7 +268,7 @@ impl<T: Transport> ThreadSession<T> {
             awaiting: HashSet::new(),
             answers: HashMap::new(),
             events: None,
-            store: Arc::new(NoStore),
+            store,
             thread_repo: None,
             bundle_request: None,
             bundle_answer: None,
@@ -243,13 +279,173 @@ impl<T: Transport> ThreadSession<T> {
             watch_only: None,
             notices: Vec::new(),
         };
+        if session.greet(0).await? {
+            // Nothing can be ahead of a thread from 0.
+            return Err(SessionError::Refused {
+                code: "resync-required".into(),
+                message: "the thread asked a fresh replica to start over".into(),
+            });
+        }
+        Ok(session)
+    }
+
+    /// Say hello from `since` and handle the catch-up until `synced`. Answers
+    /// `true` when the server says this replica is ahead of it instead.
+    async fn greet(&mut self, since: u64) -> Result<bool, SessionError> {
+        let hello = ClientControl::Hello {
+            protocol: wire::PROTOCOL_VERSION,
+            client_id: self.client_id.clone(),
+            since,
+        };
+        self.send_control(&hello).await?;
         loop {
-            let message = tokio::time::timeout(ANSWER_TIMEOUT, session.transport.recv())
+            let message = tokio::time::timeout(ANSWER_TIMEOUT, self.transport.recv())
                 .await
                 .map_err(|_| SessionError::Timeout)?
                 .ok_or(SessionError::ClosedEarly)?;
-            if session.handle(message).await? == Handled::Synced {
-                return Ok(session);
+            match self.handle(message).await? {
+                Handled::Synced => return Ok(false),
+                Handled::Resync => return Ok(true),
+                Handled::Other => {}
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconnecting, offline saves, and repair (ATL-404)
+    // -----------------------------------------------------------------------
+
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// The socket dropped: from now on saves wait for [`Self::reconnect`].
+    pub fn mark_disconnected(&mut self) {
+        self.connected = false;
+    }
+
+    /// The close code the server sent, if it closed us.
+    pub fn close_code(&self) -> Option<u16> {
+        self.transport.close_code()
+    }
+
+    /// Saves made while disconnected, waiting to go.
+    pub fn offline_saves(&self) -> usize {
+        self.offline.len()
+    }
+
+    /// Carry on over a new socket: ask from the last `seq` this replica holds
+    /// and apply the tail — or snapshot plus tail, behind a compaction. Saves
+    /// the person made meanwhile are folded in as that arrives, updates the
+    /// server never acknowledged are resent (it stores each once), and saves
+    /// made while offline then go out. When the server says this replica is
+    /// ahead of it, the replica rebuilds itself from the thread.
+    pub async fn reconnect(&mut self, transport: T) -> Result<(), SessionError> {
+        self.transport = transport;
+        self.connected = true;
+        // Nothing asked on the old socket will be answered on this one.
+        self.awaiting.clear();
+        self.answers.clear();
+        self.pending_tree.clear();
+        self.bundle_request = None;
+        self.bundle_answer = None;
+        if self.greet(self.head).await? {
+            self.rebuild().await?;
+        }
+        let resend: Vec<Vec<u8>> = self.unacked.values().cloned().collect();
+        for bytes in resend {
+            self.transport.send(Message::Binary(bytes)).await?;
+        }
+        for path in std::mem::take(&mut self.offline) {
+            if let Err(e) = self.file_saved(&path).await {
+                tracing::warn!(target: "atlas_thread_sync", %path, "offline save: {e}");
+                self.offline.insert(path);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard this replica's documents and build them again from the
+    /// thread — snapshot plus tail from `seq` 0 — then write canonical state
+    /// over the replica worktree. Never touches the person's own checkout.
+    async fn rebuild(&mut self) -> Result<(), SessionError> {
+        self.replica.begin_rebuild();
+        self.head = 0;
+        self.versions.clear();
+        self.pending_snapshots.clear();
+        self.unacked.clear();
+        let result = self.greet(0).await;
+        self.replica.finish_rebuild()?;
+        if result? {
+            return Err(SessionError::Refused {
+                code: "resync-required".into(),
+                message: "the thread asked for a resync twice".into(),
+            });
+        }
+        for (file_id, sha) in self.replica.blobs_to_fetch() {
+            self.fetch_blob(file_id, sha).await?;
+        }
+        Ok(())
+    }
+
+    /// Check every file against canonical state at this replica's head, and
+    /// repair the replica if any has drifted — said in a notice. Run at each
+    /// Run's end and periodically by the app's loop.
+    pub async fn verify(&mut self) -> Result<Verification, SessionError> {
+        if !self.connected {
+            return Ok(Verification::Skipped("offline"));
+        }
+        // A save the watcher has not reported yet must go out before any
+        // repair could write canonical state over it.
+        if self.replica.is_materialized() && self.read_only().is_none() {
+            let paths: Vec<String> = self.replica.files().map(|(_, p)| p.to_string()).collect();
+            for path in paths {
+                self.file_saved(&path).await?;
+            }
+        }
+        if !self.unacked.is_empty() || !self.offline.is_empty() || !self.missing.is_empty() {
+            return Ok(Verification::Skipped("changes are still on their way"));
+        }
+        let files: Vec<FileHash> = self
+            .replica
+            .hashes()
+            .into_iter()
+            .take(MAX_CHECKSUM_FILES)
+            .map(|(file_id, hash)| FileHash { file_id, hash })
+            .collect();
+        if files.is_empty() {
+            return Ok(Verification::Match);
+        }
+        let client_seq = self.take_client_seq();
+        let check = ClientControl::Checksum {
+            client_seq,
+            at: self.head,
+            files,
+        };
+        let (status, mismatched) = match self.ask(client_seq, &check).await? {
+            Answer::Checksum { status, mismatched } => (status, mismatched),
+            Answer::Nack { code, message } => return Err(SessionError::Refused { code, message }),
+            other => return Err(unexpected(&other)),
+        };
+        match status {
+            ChecksumStatus::Match => Ok(Verification::Match),
+            ChecksumStatus::Unavailable => Ok(Verification::Unavailable),
+            ChecksumStatus::Mismatch => {
+                let mut paths: Vec<String> = mismatched
+                    .iter()
+                    .filter_map(|id| self.replica.path_of(*id))
+                    .collect();
+                paths.sort();
+                tracing::warn!(target: "atlas_thread_sync", ?paths, "replica drifted; rebuilding");
+                self.rebuild().await?;
+                self.notice(format!(
+                    "Repaired {} {} that had drifted from the thread: {}.",
+                    paths.len(),
+                    if paths.len() == 1 { "file" } else { "files" },
+                    paths.join(", ")
+                ));
+                Ok(Verification::Repaired(paths))
             }
         }
     }
@@ -783,7 +979,7 @@ impl<T: Transport> ThreadSession<T> {
                 Answer::Nack { code, message } => {
                     return Err(SessionError::Refused { code, message })
                 }
-                Answer::Ack => return Err(unexpected(&Answer::Ack)),
+                other @ (Answer::Ack | Answer::Checksum { .. }) => return Err(unexpected(&other)),
             }
         }
         self.end_run(&run.run_id, RunOutcome::Completed).await?;
@@ -928,6 +1124,25 @@ impl<T: Transport> ThreadSession<T> {
         if self.read_only().is_some() {
             return Ok(LocalChange::Ignored);
         }
+        // Disk is the buffer: the save is read when the socket is back.
+        if !self.connected {
+            self.offline.insert(rel.to_string());
+            return Ok(LocalChange::Buffered);
+        }
+        match self.save(rel).await {
+            // The socket went while this was on its way: whatever was sent
+            // and not acknowledged is resent, and the save is read again,
+            // once it is back.
+            Err(SessionError::Transport(_) | SessionError::ClosedEarly) => {
+                self.connected = false;
+                self.offline.insert(rel.to_string());
+                Ok(LocalChange::Buffered)
+            }
+            other => other,
+        }
+    }
+
+    async fn save(&mut self, rel: &str) -> Result<LocalChange, SessionError> {
         match self.replica.local_change(rel)? {
             LocalChange::Update { file_id, update } => {
                 self.send_update(file_id, update).await?;
@@ -1253,8 +1468,16 @@ impl<T: Transport> ThreadSession<T> {
         let client_seq = self.take_client_seq();
         let bytes =
             wire::encode(&Frame::update(file_id, client_seq, update)).expect("small numbers");
-        self.transport.send(Message::Binary(bytes)).await?;
+        // Kept until acknowledged: a drop before the ack means a resend, and
+        // the server stores it once.
+        self.unacked.insert(client_seq, bytes.clone());
         self.updates_sent += 1;
+        if self.connected {
+            if let Err(e) = self.transport.send(Message::Binary(bytes)).await {
+                self.connected = false;
+                return Err(e.into());
+            }
+        }
         Ok(())
     }
 
@@ -1291,6 +1514,8 @@ impl<T: Transport> ThreadSession<T> {
                         self.role = Some(role);
                         // Never reuse a client_seq the server already stored.
                         self.next_client_seq = self.next_client_seq.max(last_client_seq + 1);
+                        // What it stored needs no resend.
+                        self.unacked.retain(|seq, _| *seq > last_client_seq);
                     }
                     ServerControl::Tree { seq, entry } => {
                         self.saw_seq(seq);
@@ -1303,6 +1528,14 @@ impl<T: Transport> ThreadSession<T> {
                             // the next checkout; the change is not lost.
                             if let Err(e) = self.fetch_blob(entry.file_id, sha).await {
                                 tracing::warn!(target: "atlas_thread_sync", path = %entry.path, "blob fetch failed: {e}");
+                            }
+                        }
+                        // Behind a compaction, the file's history comes as a
+                        // snapshot, before the tail that builds on it.
+                        if self.pending_snapshots.remove(&entry.file_id) {
+                            let bytes = self.store.get_snapshot(entry.file_id).await?;
+                            if let Some(local) = self.replica.apply_remote(entry.file_id, &bytes)? {
+                                self.send_update(entry.file_id, local).await?;
                             }
                         }
                         for aside in self.replica.take_set_aside() {
@@ -1318,6 +1551,7 @@ impl<T: Transport> ThreadSession<T> {
                         file_id,
                     } => {
                         self.saw_seq(seq);
+                        self.unacked.remove(&client_seq);
                         self.answer(client_seq, Answer::Ack);
                         if let (Some((path, kind)), Some(file_id)) =
                             (self.pending_tree.remove(&client_seq), file_id)
@@ -1384,6 +1618,21 @@ impl<T: Transport> ThreadSession<T> {
                             view.files = paths;
                         }
                     }
+                    ServerControl::ResyncRequired { head, .. } => {
+                        tracing::warn!(target: "atlas_thread_sync", head, "the thread is behind this replica; rebuilding");
+                        return Ok(Handled::Resync);
+                    }
+                    ServerControl::Snapshot { through, files } => {
+                        self.pending_snapshots
+                            .extend(files.iter().map(|f| f.file_id));
+                        self.head = self.head.max(through);
+                    }
+                    ServerControl::ChecksumResult {
+                        client_seq,
+                        status,
+                        mismatched,
+                        ..
+                    } => self.answer(client_seq, Answer::Checksum { status, mismatched }),
                     ServerControl::BundleWanted { request_id, have } => {
                         // Waiting on the person's say-so, requests pile up;
                         // keep the newest few (the server forgets old ones).
@@ -1474,5 +1723,7 @@ fn unexpected(answer: &Answer) -> SessionError {
 #[derive(Debug, PartialEq, Eq)]
 enum Handled {
     Synced,
+    /// The server says this replica is ahead of it: rebuild.
+    Resync,
     Other,
 }

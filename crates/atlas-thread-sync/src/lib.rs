@@ -52,8 +52,10 @@ pub use session::{
 };
 pub use share::{SharePreview, ShareFile, ShareKind};
 pub use store::{FakeStore, ObjectStore, StoreError};
+pub use session::Verification;
 pub use transport::{
-    FakeThreadServer, FakeTransport, Message, Transport, TransportError, WsTransport,
+    Connector, FakeConnector, FakeThreadServer, FakeTransport, Message, NoReconnect, Transport,
+    TransportError, WsTransport,
 };
 
 /// What the app can ask a running thread to do.
@@ -126,14 +128,10 @@ pub struct SyncStatus {
     pub error: Option<String>,
 }
 
-fn status_of<T: Transport>(
-    session: &ThreadSession<T>,
-    connected: bool,
-    error: Option<String>,
-) -> SyncStatus {
+fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) -> SyncStatus {
     let replica = session.replica();
     SyncStatus {
-        connected,
+        connected: session.is_connected(),
         role: session.role().map(|r| r.as_str().to_string()),
         head: session.head(),
         materialized: replica.is_materialized(),
@@ -155,6 +153,34 @@ enum Event {
     Saved(String),
     /// Saves have been quiet: files still missing were deleted, not moved.
     Settle,
+    /// Time to dial the thread again (ATL-404).
+    Reconnect,
+    /// Time to check the replica against the thread.
+    Verify,
+}
+
+/// How long to wait before each attempt to reconnect; the last repeats.
+const RECONNECT_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(30),
+];
+
+/// How often a connected replica checks itself against the thread.
+const VERIFY_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Why the server closed the socket for good, for the person.
+fn closed_because(code: u16) -> String {
+    match code {
+        1008 => "Your access to this thread ended — you were removed from the organization or the project. Your replica is kept, but it no longer syncs.".into(),
+        4410 => "This thread was closed. Your replica is kept, but it no longer syncs.".into(),
+        4403 => "You can no longer open this thread. Your replica is kept, but it no longer syncs.".into(),
+        4400 => "This version of Atlas cannot talk to the thread. Update Atlas to keep syncing.".into(),
+        other => format!("The thread closed the connection ({other})."),
+    }
 }
 
 /// How long saves must be quiet before a missing file counts as deleted — a
@@ -170,9 +196,24 @@ const SETTLE_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 /// The command channel is unbounded because live Run frames arrive on it from
 /// the agent's emit path, which must never wait.
 pub async fn run<T: Transport>(
-    mut session: ThreadSession<T>,
+    session: ThreadSession<T>,
+    commands: mpsc::UnboundedReceiver<Command>,
+    status: tokio::sync::watch::Sender<SyncStatus>,
+) {
+    run_with(session, commands, status, NoReconnect::<T>::default()).await;
+}
+
+/// [`run`], dialling the thread again through `connector` whenever the socket
+/// drops (ATL-404): saves made meanwhile wait on disk and go out on
+/// reconnect, the replica catches up from its last `seq`, and it checks
+/// itself against the thread periodically and after each Run. A close the
+/// server meant — access revoked, thread closed — ends the loop, and the
+/// status says why.
+pub async fn run_with<C: Connector>(
+    mut session: ThreadSession<C::Transport>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     status: tokio::sync::watch::Sender<SyncStatus>,
+    connector: C,
 ) {
     let mut active: HashMap<String, (ActiveRun, RunWorktree)> = HashMap::new();
     let mut watcher = None;
@@ -183,12 +224,30 @@ pub async fn run<T: Transport>(
             saves = Some(rx);
         }
     }
-    let _ = status.send(status_of(&session, true, None));
+    let _ = status.send(status_of(&session, None));
     let mut settle_at: Option<tokio::time::Instant> = None;
+    let mut reconnect_at: Option<tokio::time::Instant> = None;
+    let mut attempts = 0usize;
+    let mut verify_at = tokio::time::Instant::now() + VERIFY_EVERY;
+    let mut final_error: Option<String> = None;
 
     loop {
+        let connected = session.is_connected();
         let event = tokio::select! {
-            message = session.next_message() => Event::Socket(message),
+            message = async {
+                if connected {
+                    session.next_message().await
+                } else {
+                    std::future::pending().await
+                }
+            } => Event::Socket(message),
+            () = async {
+                match reconnect_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => Event::Reconnect,
+            () = tokio::time::sleep_until(verify_at) => Event::Verify,
             command = commands.recv() => Event::Command(command),
             Some(path) = async {
                 match saves.as_mut() {
@@ -207,7 +266,40 @@ pub async fn run<T: Transport>(
             settle_at = Some(tokio::time::Instant::now() + SETTLE_AFTER);
         }
         let outcome = match event {
-            Event::Socket(None) => break,
+            Event::Socket(None) => {
+                let code = session.close_code();
+                if let Some(code) = code.filter(|c| transport::FINAL_CLOSE_CODES.contains(c)) {
+                    final_error = Some(closed_because(code));
+                    break;
+                }
+                if !connector.reconnects() {
+                    break;
+                }
+                session.mark_disconnected();
+                attempts = 0;
+                reconnect_at = Some(tokio::time::Instant::now() + RECONNECT_BACKOFF[0]);
+                Ok(())
+            }
+            Event::Reconnect => {
+                reconnect_at = None;
+                let dialled = match connector.connect().await {
+                    Ok(transport) => session.reconnect(transport).await,
+                    Err(e) => Err(e.into()),
+                };
+                if dialled.is_err() {
+                    session.mark_disconnected();
+                    attempts += 1;
+                    let wait = RECONNECT_BACKOFF[attempts.min(RECONNECT_BACKOFF.len() - 1)];
+                    reconnect_at = Some(tokio::time::Instant::now() + wait);
+                } else {
+                    attempts = 0;
+                }
+                dialled
+            }
+            Event::Verify => {
+                verify_at = tokio::time::Instant::now() + VERIFY_EVERY;
+                session.verify().await.map(|_| ())
+            }
             Event::Command(None) | Event::Command(Some(Command::Stop)) => {
                 for run_id in active.keys() {
                     let _ = session.interrupt_run(run_id).await;
@@ -268,7 +360,14 @@ pub async fn run<T: Transport>(
             Event::Command(Some(Command::FinishRun { run_id, reply })) => {
                 match active.remove(&run_id) {
                     Some((run, worktree)) => {
-                        let result = session.finish_run(&run, &worktree).await;
+                        let mut result = session.finish_run(&run, &worktree).await;
+                        // Each Run's end is a moment to check the replica.
+                        if result.is_ok() {
+                            if let Err(e) = session.verify().await {
+                                tracing::warn!(target: "atlas_thread_sync", "verify after a Run: {e}");
+                            }
+                        }
+                        let result = std::mem::replace(&mut result, Ok(RunReport::default()));
                         let text = result
                             .as_ref()
                             .map(Clone::clone)
@@ -330,8 +429,9 @@ pub async fn run<T: Transport>(
         if let Some(e) = &error {
             tracing::warn!(target: "atlas_thread_sync", "thread sync: {e}");
         }
-        let _ = status.send(status_of(&session, true, error));
+        let _ = status.send(status_of(&session, error));
     }
     drop(watcher);
-    let _ = status.send(status_of(&session, false, None));
+    session.mark_disconnected();
+    let _ = status.send(status_of(&session, final_error));
 }

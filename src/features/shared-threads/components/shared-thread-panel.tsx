@@ -355,6 +355,11 @@ function ThreadCard({
         </span>
         <span>{status.materialized ? "Checked out" : "Not checked out yet"}</span>
       </div>
+      {!status.connected && !status.error && (
+        <p className="text-[var(--muted-foreground)]">
+          Offline — reconnecting. Your saves are kept and sync when the connection is back.
+        </p>
+      )}
       {status.readOnly && (
         <p className="flex items-start gap-1.5 rounded bg-[var(--atlas-element-hover)] p-2 text-[var(--secondary-foreground)]">
           <Eye size={12} className="mt-px shrink-0" />

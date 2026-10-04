@@ -100,7 +100,12 @@ pub async fn open(
     user: &str,
 ) -> ThreadSession<FakeTransport> {
     let replica = Replica::new(repo, base, root).unwrap();
-    ThreadSession::open(server.connect(user), replica, &format!("{user}-replica-1"))
-        .await
-        .unwrap()
+    ThreadSession::connect(
+        server.connect(user),
+        replica,
+        &format!("{user}-replica-1"),
+        std::sync::Arc::new(server.store()),
+    )
+    .await
+    .unwrap()
 }
