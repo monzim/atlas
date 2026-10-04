@@ -80,7 +80,9 @@ export function PresenceBar({
             <span
               key={p.userId}
               title={`${nameOf(p.userId)} · ${p.surface === "web" ? "web" : "desktop"}${what ? ` · ${what}` : ""}`}
-              className="relative inline-flex size-6 items-center justify-center rounded-full text-[10px] font-medium text-white"
+              // ratchet-allow: white initials on a collaborator's own saturated hue — the one
+              // their caret uses — which is not a theme surface.
+              className="relative inline-flex size-6 items-center justify-center rounded-full text-3xs font-medium text-white"
               // ratchet-allow: a collaborator's own hue, the same one their caret uses.
               style={{ background: `hsl(${avatarHue(p.userId)} 55% 45%)` }}
             >

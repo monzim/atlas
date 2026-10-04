@@ -43,7 +43,6 @@ export const commentLinesField = StateField.define<DecorationSet>({
 const commentLinesTheme = EditorView.baseTheme({
   ".atlas-thread-comment-line": {
     backgroundColor: "color-mix(in srgb, var(--atlas-status-warning-foreground) 9%, transparent)",
-    boxShadow: "inset 2px 0 0 var(--atlas-status-warning-foreground)",
   },
 });
 
