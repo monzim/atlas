@@ -38,8 +38,8 @@ use atlas_agent_wire::{AgentId, DeltaSink, SessionDelta, SessionDeltaEnvelope};
 use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::{
-    BlobSink, Command as SyncCommand, Replica, RunSpec, SyncStatus, ThreadEvent, ThreadSession,
-    WsTransport,
+    BlobSink, Command as SyncCommand, Replica, RunReport, RunSpec, SyncStatus, ThreadEvent,
+    ThreadSession, WsTransport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -107,6 +107,34 @@ struct LiveRun {
     shared_thread_id: String,
     run_id: String,
     agent_id: AgentId,
+}
+
+impl LiveRun {
+    /// The `shared_run_ended` delta for this Run: merged, ended or
+    /// interrupted, with what the merge did or why it did not.
+    fn ended(&self, status: &str, result: std::result::Result<RunReport, String>) -> SessionDelta {
+        let (files, version, error) = match result {
+            Ok(report) => (
+                report.files,
+                report.version,
+                (!report.unuploaded.is_empty()).then(|| {
+                    format!(
+                        "Merged, but these files' Version copies did not upload: {}",
+                        report.unuploaded.join(", ")
+                    )
+                }),
+            ),
+            Err(error) => (Vec::new(), None, Some(error)),
+        };
+        SessionDelta::SharedRunEnded {
+            shared_thread_id: self.shared_thread_id.clone(),
+            run_id: self.run_id.clone(),
+            status: status.into(),
+            files,
+            version,
+            error,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -554,10 +582,18 @@ pub async fn begin_run(
     };
     {
         let state = app.state::<SharedThreadsState>();
-        let runs = state.runs.lock().map_err(|_| "poisoned".to_string())?;
+        let runs = state.runs.lock().map_err(|_| poisoned().message)?;
         if runs.contains_key(session_id) {
             // A follow-up sent mid-turn joins the Run already in flight.
             return Ok(());
+        }
+        // The Run worktree is one per thread on this machine: a second agent
+        // session starting a Run would reset it under the first one's agent.
+        if runs
+            .values()
+            .any(|r| r.shared_thread_id == shared_thread_id)
+        {
+            return Err("Another agent on this machine is already running in this thread. Wait for its turn to end, then send again.".into());
         }
     }
     let commands = commands_for(app, &shared_thread_id).map_err(|e| e.message)?;
@@ -581,7 +617,7 @@ pub async fn begin_run(
     tag_session(app, session_id, &shared_thread_id);
     {
         let state = app.state::<SharedThreadsState>();
-        let mut runs = state.runs.lock().map_err(|_| "poisoned".to_string())?;
+        let mut runs = state.runs.lock().map_err(|_| poisoned().message)?;
         runs.insert(
             session_id.to_string(),
             LiveRun {
@@ -707,18 +743,14 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
         let app = self.app.clone();
         let session_id = envelope.session_id.clone();
         tauri::async_runtime::spawn(async move {
+            // Tagging again at the turn's end: the local thread may not have
+            // existed yet when the Run began, on a session's first prompt.
+            tag_session(&app, &session_id, &run.shared_thread_id);
             let ended = if interrupted {
                 let _ = commands.send(SyncCommand::InterruptRun {
                     run_id: run.run_id.clone(),
                 });
-                SessionDelta::SharedRunEnded {
-                    shared_thread_id: run.shared_thread_id.clone(),
-                    run_id: run.run_id.clone(),
-                    status: "interrupted".into(),
-                    files: Vec::new(),
-                    version: None,
-                    error: None,
-                }
+                run.ended("interrupted", Ok(RunReport::default()))
             } else {
                 let (reply, answer) = oneshot::channel();
                 let _ = commands.send(SyncCommand::FinishRun {
@@ -728,34 +760,11 @@ impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
                 let result = answer
                     .await
                     .unwrap_or_else(|_| Err("the thread's connection closed".into()));
-                match result {
-                    Ok(report) => SessionDelta::SharedRunEnded {
-                        shared_thread_id: run.shared_thread_id.clone(),
-                        run_id: run.run_id.clone(),
-                        status: if report.version.is_some() {
-                            "merged"
-                        } else {
-                            "ended"
-                        }
-                        .into(),
-                        files: report.files,
-                        version: report.version,
-                        error: (!report.unuploaded.is_empty()).then(|| {
-                            format!(
-                                "Merged, but these files' Version copies did not upload: {}",
-                                report.unuploaded.join(", ")
-                            )
-                        }),
-                    },
-                    Err(error) => SessionDelta::SharedRunEnded {
-                        shared_thread_id: run.shared_thread_id.clone(),
-                        run_id: run.run_id.clone(),
-                        status: "ended".into(),
-                        files: Vec::new(),
-                        version: None,
-                        error: Some(error),
-                    },
-                }
+                let status = match &result {
+                    Ok(report) if report.version.is_some() => "merged",
+                    _ => "ended",
+                };
+                run.ended(status, result)
             };
             emit_delta(&app, &run.agent_id, &session_id, ended);
         });

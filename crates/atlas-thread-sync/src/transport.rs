@@ -151,6 +151,8 @@ struct Hub {
     merges: HashMap<(String, String, u64), ServerControl>,
     /// Live Run frames relayed, for tests that check nothing was stored.
     run_frames_relayed: u64,
+    /// Another Runner's merge to land just before the next submit is read.
+    racing_merge: Option<(u64, Vec<u8>)>,
 }
 
 struct FakeRun {
@@ -234,6 +236,13 @@ impl FakeThreadServer {
             .iter()
             .find(|e| e.file_id == file_id)
             .and_then(|e| e.merge_version)
+    }
+
+    /// Land a merge of `update` on `file_id` the moment the next
+    /// `merge.submit` arrives, ahead of it — the race a Runner loses when
+    /// another merge reaches the server while its own submit is on the way.
+    pub fn merge_before_next_submit(&self, file_id: u64, update: Vec<u8>) {
+        self.hub.lock().expect("hub").racing_merge = Some((file_id, update));
     }
 
     /// Live Run frames relayed so far. None of them is ever journaled.
@@ -322,6 +331,45 @@ impl Hub {
         for run in ended {
             self.broadcast(&ServerControl::Run { run });
         }
+    }
+
+    /// Journal `update` as somebody else's merge: advance the version, relay
+    /// it to every socket, and say `merged` — in that order, as the real
+    /// server does.
+    fn land_racing_merge(&mut self, file_id: u64, update: Vec<u8>) {
+        let seq = self.journal.len() as u64 + 1;
+        let frame = Frame {
+            seq,
+            ..Frame::update(file_id, 0, update)
+        };
+        self.journal.push(Journaled {
+            seq,
+            tree: None,
+            frame: Some(frame.clone()),
+            author: "racer".into(),
+            client: "racer#merge1".into(),
+            client_seq: 1,
+        });
+        let Some(entry) = self.tree.iter_mut().find(|e| e.file_id == file_id) else {
+            return;
+        };
+        let version = entry.merge_version.unwrap_or(0) + 1;
+        entry.merge_version = Some(version);
+        let bytes = wire::encode(&frame).expect("encode");
+        for c in self.conns.values() {
+            if c.client.is_some() {
+                let _ = c.tx.send(Message::Binary(bytes.clone()));
+            }
+        }
+        self.broadcast(&ServerControl::Merged {
+            run_id: "run-racer".into(),
+            version: seq,
+            files: vec![MergedFile {
+                file_id,
+                version,
+                blob: "0".repeat(64),
+            }],
+        });
     }
 
     fn run_mut(&mut self, run_id: &str) -> Option<&mut FakeRun> {
@@ -546,6 +594,9 @@ impl Hub {
                     files,
                 }) => {
                     let Some(client) = client else { return };
+                    if let Some((file_id, update)) = self.racing_merge.take() {
+                        self.land_racing_merge(file_id, update);
+                    }
                     let key = (user.clone(), client.clone(), client_seq);
                     if let Some(prior) = self.merges.get(&key) {
                         return self.reply(conn, &prior.clone());

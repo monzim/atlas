@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use atlas_thread_sync::doc::{random_client_id, FileDoc};
 use atlas_thread_sync::transport::FakeBlobs;
 use atlas_thread_sync::wire::FrameKind;
 use atlas_thread_sync::{
@@ -212,7 +213,7 @@ async fn two_runners_on_different_files_both_merge_and_the_next_fork_sees_it() {
 }
 
 #[tokio::test]
-async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
+async fn a_merge_that_already_arrived_is_merged_onto() {
     let Pair {
         w: _w,
         server,
@@ -247,18 +248,61 @@ async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
 
     joy.finish_run(&joy_run, &joy_runs, &blobs).await.unwrap();
     assert_eq!(server.merge_version(banner), Some(1));
-    // Monzim merged against version 0; the server says it is 1 now, and his
-    // merge is recomputed onto Joy's.
+    // Joy's merge had reached Monzim's socket before his turn ended, so his
+    // merge is planned onto it from the start and lands first time.
     let report = monzim
         .finish_run(&monzim_run, &monzim_runs, &blobs)
         .await
         .unwrap();
-    assert_eq!(report.retries, 1);
+    assert_eq!(report.retries, 0);
     assert_eq!(server.merge_version(banner), Some(2));
 
     let merged = ".hero {\n  color: green;\n}\n/* end */\n";
     joy.pump(QUIET).await.unwrap();
     assert_eq!(joy.replica().text("src/banner.css").unwrap(), merged);
+    assert_eq!(monzim.replica().text("src/banner.css").unwrap(), merged);
+    assert_eq!(monzim.merge_version(banner), 2);
+    assert!(blobs.get(&sha256_hex(merged)).is_some());
+}
+
+#[tokio::test]
+async fn a_rejected_submit_recomputes_against_the_newer_state_and_lands() {
+    let Pair {
+        w: _w,
+        server,
+        joy: _joy,
+        mut monzim,
+        joy_runs: _,
+        monzim_runs,
+    } = pair().await;
+    let blobs = FakeBlobs::default();
+    let banner = monzim.replica().file_id("src/banner.css").unwrap();
+    let run = monzim.start_run(&monzim_runs, spec("codex")).await.unwrap();
+    play(
+        &mut monzim,
+        &run,
+        &[Step::Write(
+            "src/banner.css",
+            ".banner {\n  color: green;\n}\n/* end */\n",
+        )],
+    )
+    .await;
+
+    // Somebody else's merge reaches the server while Monzim's submit is on
+    // its way: his submit names version 0, the file is at 1 by then.
+    let theirs = FileDoc::from_snapshot(
+        random_client_id(),
+        &monzim.replica().snapshot(banner).unwrap(),
+    )
+    .unwrap()
+    .set_content(".hero {\n  color: green;\n}\n")
+    .unwrap();
+    server.merge_before_next_submit(banner, theirs);
+
+    let report = monzim.finish_run(&run, &monzim_runs, &blobs).await.unwrap();
+    assert_eq!(report.retries, 1);
+    assert_eq!(server.merge_version(banner), Some(2));
+    let merged = ".hero {\n  color: green;\n}\n/* end */\n";
     assert_eq!(monzim.replica().text("src/banner.css").unwrap(), merged);
     assert_eq!(monzim.merge_version(banner), 2);
     assert!(blobs.get(&sha256_hex(merged)).is_some());
@@ -385,10 +429,10 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
     play(
         &mut monzim,
         &monzim_run,
-        &[Step::Write(
-            "src/banner.css",
-            ".banner {\n  color: navy;\n}\n",
-        )],
+        &[
+            Step::Write("src/banner.css", ".banner {\n  color: navy;\n}\n"),
+            Step::Write("src/brand-new.ts", "export {};\n"),
+        ],
     )
     .await;
 
@@ -401,6 +445,10 @@ async fn overlapping_hunks_fail_the_merge_visibly_and_change_nothing() {
         SessionError::Overlap(files) => assert_eq!(files[0].0, "src/banner.css"),
         other => panic!("expected an overlap, got {other}"),
     }
+    // A refused merge adds nothing to the thread, not even its new files.
+    joy.pump(QUIET).await.unwrap();
+    assert_eq!(joy.replica().file_id("src/brand-new.ts"), None);
+    assert_eq!(monzim.replica().file_id("src/brand-new.ts"), None);
     // His Run's own result is still in its worktree to recover.
     assert_eq!(
         read(&monzim_run.worktree, "src/banner.css"),

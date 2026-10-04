@@ -225,6 +225,11 @@ impl<T: Transport> ThreadSession<T> {
     // Runs (ADR-0022, ATL-405)
     // -----------------------------------------------------------------------
 
+    /// The Run worktree at `root`, of this replica's repository and Base.
+    pub fn run_worktree(&self, root: &Path) -> RunWorktree {
+        RunWorktree::new(self.replica.repo(), self.replica.base(), root)
+    }
+
     /// Reset the Run worktree to canonical state now, creating it if needed.
     /// A Run started later resets it again at its own fork.
     pub fn prepare_run(&self, worktree: &RunWorktree) -> Result<(), SessionError> {
@@ -314,24 +319,40 @@ impl<T: Transport> ThreadSession<T> {
         let changes = worktree.changes(&run.fork)?;
         let mut report = RunReport::default();
         for _ in 0..MERGE_ATTEMPTS {
+            // Plan on the newest state the socket has delivered: what already
+            // arrived is handled first, so an overlap with it is found before
+            // anything — a new file's tree entry included — reaches the thread.
+            self.drain_ready().await?;
             let mut planned = Vec::new();
             let mut overlaps = Vec::new();
             for change in &changes {
-                let (file_id, fork) = match change.file_id {
-                    Some(id) => (id, run.fork.files[&id].snapshot.clone()),
-                    // A file the Run created forks from its Base content (or
-                    // nothing) — even if somebody else created it meanwhile.
-                    None => (
-                        self.ensure_file(&change.path, true).await?,
-                        self.replica.seed_snapshot(&change.path)?,
-                    ),
+                // A file the Run created forks from its Base content (or
+                // nothing), even if somebody else created it meanwhile; it
+                // gets a tree entry only once the whole merge is known to go
+                // ahead, so a refused merge leaves the thread as it was.
+                let file_id = change
+                    .file_id
+                    .or_else(|| self.replica.file_id(&change.path));
+                let fork = match change.file_id {
+                    Some(id) => run.fork.files[&id].snapshot.clone(),
+                    None => self.replica.seed_snapshot(&change.path)?,
                 };
-                let canonical = self
-                    .replica
-                    .snapshot(file_id)
-                    .ok_or(ReplicaError::UnknownFile(file_id))?;
+                let canonical = match file_id {
+                    Some(id) => self
+                        .replica
+                        .snapshot(id)
+                        .ok_or(ReplicaError::UnknownFile(id))?,
+                    None => fork.clone(),
+                };
+                // The version this merge is computed against, read now: an
+                // answer handled later (an `ensure_file` below) may move it,
+                // and submitting the newer one would pass the compare-and-set
+                // with a merge computed against the older state.
+                let base_version = file_id.map_or(0, |id| self.merge_version(id));
                 match merge::three_way(&fork, &change.content, &canonical) {
-                    Ok(Some(merged)) => planned.push((file_id, change.path.clone(), merged)),
+                    Ok(Some(merged)) => {
+                        planned.push((file_id, base_version, change.path.clone(), merged))
+                    }
                     Ok(None) => {}
                     Err(MergeError::Overlap { lines }) => {
                         overlaps.push((change.path.clone(), lines))
@@ -347,11 +368,11 @@ impl<T: Transport> ThreadSession<T> {
                 self.end_run(&run.run_id, RunOutcome::Completed).await?;
                 return Ok(report);
             }
-            let total: usize = planned.iter().map(|(_, _, m)| m.update.len()).sum();
+            let total: usize = planned.iter().map(|(_, _, _, m)| m.update.len()).sum();
             if total > MAX_MERGE_BYTES
                 || planned
                     .iter()
-                    .any(|(_, _, m)| m.update.len() > wire::MAX_PAYLOAD_BYTES)
+                    .any(|(_, _, _, m)| m.update.len() > wire::MAX_PAYLOAD_BYTES)
             {
                 // Splitting a merge across submits is not this slice's.
                 self.end_run(&run.run_id, RunOutcome::Completed).await?;
@@ -362,11 +383,20 @@ impl<T: Transport> ThreadSession<T> {
                     ),
                 });
             }
+            let mut ready = Vec::with_capacity(planned.len());
+            for (file_id, base_version, path, merged) in planned {
+                let file_id = match file_id {
+                    Some(id) => id,
+                    None => self.ensure_file(&path, true).await?,
+                };
+                ready.push((file_id, base_version, path, merged));
+            }
+            let planned = ready;
             let files: Vec<MergeFile> = planned
                 .iter()
-                .map(|(file_id, _, m)| MergeFile {
+                .map(|(file_id, base_version, _, m)| MergeFile {
                     file_id: *file_id,
-                    base_version: self.merge_version(*file_id),
+                    base_version: *base_version,
                     update: base64::engine::general_purpose::STANDARD.encode(&m.update),
                     blob: sha256_hex(m.content.as_bytes()),
                 })
@@ -382,7 +412,7 @@ impl<T: Transport> ThreadSession<T> {
                     version,
                     files: landed,
                 } => {
-                    for (file_id, _, merged) in &planned {
+                    for (file_id, _, _, merged) in &planned {
                         // The server relays the merge to everybody else; this
                         // replica applies it itself. A save made meanwhile is
                         // folded in and goes out as its own change.
@@ -395,11 +425,11 @@ impl<T: Transport> ThreadSession<T> {
                     }
                     self.head = self.head.max(version);
                     report.version = Some(version);
-                    report.files = planned.iter().map(|(_, path, _)| path.clone()).collect();
+                    report.files = planned.iter().map(|(_, _, path, _)| path.clone()).collect();
                     if let Some(view) = self.runs.get_mut(&run.run_id) {
                         view.files.clone_from(&report.files);
                     }
-                    for ((_, path, merged), file) in planned.into_iter().zip(&files) {
+                    for ((_, _, path, merged), file) in planned.into_iter().zip(&files) {
                         if let Err(e) = blobs.put(&file.blob, merged.content.into_bytes()).await {
                             tracing::warn!(target: "atlas_thread_sync", %path, "Thread Version blob upload failed: {e}");
                             report.unuploaded.push(path);
@@ -474,6 +504,15 @@ impl<T: Transport> ThreadSession<T> {
         };
         self.awaiting.remove(&client_seq);
         answer
+    }
+
+    /// Handle every message that has already arrived, without waiting for more.
+    async fn drain_ready(&mut self) -> Result<(), SessionError> {
+        while let Ok(next) = tokio::time::timeout(Duration::ZERO, self.transport.recv()).await {
+            let message = next.ok_or(SessionError::ClosedEarly)?;
+            self.handle(message).await?;
+        }
+        Ok(())
     }
 
     async fn receive_one(&mut self) -> Result<(), SessionError> {

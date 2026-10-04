@@ -180,11 +180,7 @@ pub async fn run<T: Transport, B: BlobSink>(
                 Ok(())
             }
             Event::Command(Some(Command::PrepareRun { worktree, reply })) => {
-                let worktree = RunWorktree::new(
-                    session.replica().repo(),
-                    session.replica().base(),
-                    &worktree,
-                );
+                let worktree = session.run_worktree(&worktree);
                 let result = session.prepare_run(&worktree);
                 let _ = reply.send(
                     result
@@ -199,11 +195,7 @@ pub async fn run<T: Transport, B: BlobSink>(
                 spec,
                 reply,
             })) => {
-                let worktree = RunWorktree::new(
-                    session.replica().repo(),
-                    session.replica().base(),
-                    &worktree,
-                );
+                let worktree = session.run_worktree(&worktree);
                 let result = session.start_run(&worktree, spec).await;
                 let answer = result.as_ref().map(|run| RunStarted {
                     run_id: run.run_id.clone(),
