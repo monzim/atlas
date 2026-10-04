@@ -165,6 +165,16 @@ pub struct ForkFile {
     pub content: String,
 }
 
+/// A file's work the thread may not have, kept across a rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsyncedWork {
+    pub path: String,
+    /// The text the replica held for it: what the work was made against.
+    pub before: String,
+    /// The person's bytes now.
+    pub content: String,
+}
+
 /// What a remote change moved out of the way so it would not overwrite the
 /// person's own file: where the file was, and where it is now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,9 +252,10 @@ impl Replica {
         self.rebuilding = true;
     }
 
-    /// The rebuild is done: write canonical state over the worktree. The
-    /// replica's own bytes lose — they are what drifted.
-    pub fn finish_rebuild(&mut self) -> Result<(), ReplicaError> {
+    /// The rebuild is done: write canonical state over the worktree — except
+    /// at `keep`, where the person's own bytes stay, to be read as a save.
+    /// Anywhere else the replica's bytes lose: they are what drifted.
+    pub fn finish_rebuild(&mut self, keep: &std::collections::HashSet<String>) -> Result<(), ReplicaError> {
         self.rebuilding = false;
         if !self.materialized {
             return Ok(());
@@ -259,9 +270,75 @@ impl Replica {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
+            let file = self.files.get_mut(&id).expect("listed");
+            if keep.contains(&file.path) {
+                // Unknown, so the next read takes disk as the person's edit.
+                file.disk = None;
+                continue;
+            }
             self.sync_disk(id)?;
         }
         Ok(())
+    }
+
+    /// Text files carrying work of the person's the thread may not have:
+    /// whose bytes on disk are not what this replica last read or wrote, or
+    /// that have edits on their way (`in_flight`). Each with the text the
+    /// replica held for it — what that work was made against.
+    ///
+    /// With `everything`, every text file counts: after the thread lost
+    /// history, this replica's text is the only copy of it.
+    pub fn unsynced_work(
+        &self,
+        in_flight: &std::collections::HashSet<u64>,
+        everything: bool,
+    ) -> Vec<UnsyncedWork> {
+        if !self.materialized {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (id, f) in &self.files {
+            if f.deleted || f.kind != FileKind::Text {
+                continue;
+            }
+            let Ok(target) = path::resolve(&self.root, &f.path) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(&target) else {
+                continue;
+            };
+            let unread = f.disk != Some(hash(&bytes));
+            if (everything || unread || in_flight.contains(id) || f.held.is_some())
+                && looks_textual(&bytes)
+            {
+                out.push(UnsyncedWork {
+                    path: f.path.clone(),
+                    before: f.doc.content(),
+                    content: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Keep a copy of the person's `bytes` for `rel` beside it, under a name
+    /// that never syncs. Answers that name.
+    pub fn keep_copy(&mut self, rel: &str, bytes: &[u8]) -> Result<String, ReplicaError> {
+        let mut n = 0;
+        let name = loop {
+            let candidate = if n == 0 {
+                format!("{rel}{ASIDE_MARK}")
+            } else {
+                format!("{rel}{ASIDE_MARK}-{n}")
+            };
+            if !path::resolve(&self.root, &candidate)?.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        let target = path::resolve(&self.root, &name)?;
+        write_atomic(&target, bytes)?;
+        Ok(name)
     }
 
     /// Each live file's hash as this replica holds it — a text file's UTF-8

@@ -138,6 +138,16 @@ enum Answer {
     },
 }
 
+/// Why a replica rebuilds itself from the thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// The thread is behind this replica: it lost history this replica
+    /// holds, so every difference is the person's to keep.
+    Resync,
+    /// This replica drifted: only work not yet sent is the person's.
+    Repair,
+}
+
 /// What checking this replica against the thread found (ATL-404).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verification {
@@ -350,33 +360,66 @@ impl<T: Transport> ThreadSession<T> {
         self.bundle_request = None;
         self.bundle_answer = None;
         if self.greet(self.head).await? {
-            self.rebuild().await?;
+            self.rebuild(Rebuild::Resync).await?;
         }
         let resend: Vec<Vec<u8>> = self.unacked.values().cloned().collect();
         for bytes in resend {
             self.transport.send(Message::Binary(bytes)).await?;
         }
-        for path in std::mem::take(&mut self.offline) {
-            if let Err(e) = self.file_saved(&path).await {
-                tracing::warn!(target: "atlas_thread_sync", %path, "offline save: {e}");
-                self.offline.insert(path);
-                return Err(e);
-            }
-        }
-        Ok(())
+        self.flush_offline().await
     }
 
     /// Discard this replica's documents and build them again from the
     /// thread — snapshot plus tail from `seq` 0 — then write canonical state
     /// over the replica worktree. Never touches the person's own checkout.
-    async fn rebuild(&mut self) -> Result<(), SessionError> {
+    async fn rebuild(&mut self, why: Rebuild) -> Result<(), SessionError> {
+        // The person's work the thread may not have: saves not read yet
+        // (offline ones included) and edits sent but never acknowledged —
+        // and after a resync, everything: the thread lost history this
+        // replica holds. It must survive the rebuild, since canonical state
+        // is written over the worktree at its end.
+        let unacked_files: HashSet<u64> = self
+            .unacked
+            .values()
+            .filter_map(|bytes| wire::decode(bytes).map(|f| f.file_id))
+            .collect();
+        let mine = self
+            .replica
+            .unsynced_work(&unacked_files, why == Rebuild::Resync);
+
         self.replica.begin_rebuild();
         self.head = 0;
         self.versions.clear();
         self.pending_snapshots.clear();
         self.unacked.clear();
         let result = self.greet(0).await;
-        self.replica.finish_rebuild()?;
+
+        // Where the rebuilt file is what the person's edit was made against,
+        // their bytes stay and go out as a save; anywhere else they are kept
+        // beside it, and the person is told.
+        let mut keep = HashSet::new();
+        for work in &mine {
+            let canonical = self.replica.text(&work.path);
+            if canonical.as_deref() == Some(work.content.as_str()) {
+                continue;
+            }
+            if canonical.as_deref() == Some(work.before.as_str()) {
+                keep.insert(work.path.clone());
+            } else {
+                let aside = self.replica.keep_copy(&work.path, work.content.as_bytes())?;
+                self.notice(match why {
+                    Rebuild::Resync => format!(
+                        "The thread lost recent changes to {}; your copy is in {}.",
+                        work.path, aside
+                    ),
+                    Rebuild::Repair => format!(
+                        "{} changed in the thread while your edit to it was on its way; your version is in {}.",
+                        work.path, aside
+                    ),
+                });
+            }
+        }
+        self.replica.finish_rebuild(&keep)?;
         if result? {
             return Err(SessionError::Refused {
                 code: "resync-required".into(),
@@ -385,6 +428,22 @@ impl<T: Transport> ThreadSession<T> {
         }
         for (file_id, sha) in self.replica.blobs_to_fetch() {
             self.fetch_blob(file_id, sha).await?;
+        }
+        for path in keep {
+            self.offline.insert(path);
+        }
+        Ok(())
+    }
+
+    /// Read and send the saves waiting since the socket dropped (or a
+    /// rebuild kept).
+    async fn flush_offline(&mut self) -> Result<(), SessionError> {
+        for path in std::mem::take(&mut self.offline) {
+            if let Err(e) = self.file_saved(&path).await {
+                tracing::warn!(target: "atlas_thread_sync", %path, "offline save: {e}");
+                self.offline.insert(path);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -438,7 +497,8 @@ impl<T: Transport> ThreadSession<T> {
                     .collect();
                 paths.sort();
                 tracing::warn!(target: "atlas_thread_sync", ?paths, "replica drifted; rebuilding");
-                self.rebuild().await?;
+                self.rebuild(Rebuild::Repair).await?;
+                self.flush_offline().await?;
                 self.notice(format!(
                     "Repaired {} {} that had drifted from the thread: {}.",
                     paths.len(),

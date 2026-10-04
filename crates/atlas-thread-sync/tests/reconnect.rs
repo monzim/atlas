@@ -263,3 +263,62 @@ async fn a_revoked_member_stops_syncing_and_is_told_why() {
         .expect("the loop ends")
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_resync_keeps_the_persons_offline_saves_and_sends_them() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, mut monzim) = pair(&w, &server).await;
+    let joy_root = joy.replica().root().to_path_buf();
+    let monzim_root = monzim.replica().root().to_path_buf();
+    let kept = server.head();
+    write(&joy_root, "src/banner.css", ".banner {\n  color: black;\n}\n");
+    joy.file_saved("src/banner.css").await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+
+    // Offline, Monzim edits a file the lost history never touched.
+    server.cut("monzim");
+    monzim.mark_disconnected();
+    write(&monzim_root, "notes.md", "todo: kept through a resync\n");
+    monzim.file_saved("notes.md").await.unwrap();
+    server.forget_after(kept);
+    monzim.reconnect(server.connect("monzim")).await.unwrap();
+
+    // The lost change is gone from his replica; his own edit is not.
+    assert_eq!(read(&monzim_root, "src/banner.css"), GREEN);
+    assert_eq!(read(&monzim_root, "notes.md"), "todo: kept through a resync\n");
+    let mut late = open(&server, &w.monzim, &w.base, &w.replicas.join("late"), "late").await;
+    late.pump(QUIET).await.unwrap();
+    assert_eq!(
+        late.replica().text("notes.md").unwrap(),
+        "todo: kept through a resync\n"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_the_thread_lost_is_kept_beside_the_file_and_said() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (_joy, mut monzim) = pair(&w, &server).await;
+    let monzim_root = monzim.replica().root().to_path_buf();
+    let kept = server.head();
+
+    // Monzim's edit reached the thread — and then the thread lost it.
+    write(&monzim_root, "src/banner.css", ".banner {\n  color: violet;\n}\n");
+    monzim.file_saved("src/banner.css").await.unwrap();
+    monzim.pump(QUIET).await.unwrap();
+    server.forget_after(kept);
+    server.cut("monzim");
+    monzim.mark_disconnected();
+    monzim.reconnect(server.connect("monzim")).await.unwrap();
+
+    assert_eq!(read(&monzim_root, "src/banner.css"), GREEN);
+    assert_eq!(
+        read(&monzim_root, "src/banner.css.atlas-mine"),
+        ".banner {\n  color: violet;\n}\n"
+    );
+    assert!(monzim
+        .notices()
+        .iter()
+        .any(|n| n.contains("lost recent changes to src/banner.css")));
+}
