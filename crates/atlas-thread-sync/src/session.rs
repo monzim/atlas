@@ -1671,7 +1671,7 @@ impl<T: Transport> ThreadSession<T> {
         let text = match choice {
             Resolve::Canonical => canonical.clone(),
             Resolve::Run => run,
-            Resolve::Both => format!("{canonical}{run}"),
+            Resolve::Both => merge::join_hunks(&canonical, &run),
             Resolve::Edited(t) | Resolve::Agent(t) => t.clone(),
         };
         let snapshot = self

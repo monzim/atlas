@@ -228,14 +228,24 @@ pub fn region_after(before: &str, after: &str, region: Range<usize>) -> String {
 }
 
 /// The proposed result for a Conflict's hunk: one side when only it changed
-/// the base, both — canonical's first — when each did.
+/// the base, both — canonical's first, each on lines of its own — when each did.
 pub fn proposal(base: &str, canonical: &str, run: &str) -> String {
     if canonical == base {
         run.to_string()
     } else if run == base || run == canonical {
         canonical.to_string()
     } else {
+        join_hunks(canonical, run)
+    }
+}
+
+/// Both sides of a hunk, canonical's first, each on lines of its own (the
+/// web's `joinHunks`).
+pub fn join_hunks(canonical: &str, run: &str) -> String {
+    if canonical.is_empty() || canonical.ends_with('\n') {
         format!("{canonical}{run}")
+    } else {
+        format!("{canonical}\n{run}")
     }
 }
 
@@ -267,6 +277,14 @@ mod tests {
     }
 
     const BASE: &str = "one\ntwo\nthree\nfour\nfive\nsix\n";
+
+    #[test]
+    fn both_sides_keep_lines_of_their_own() {
+        assert_eq!(join_hunks("TWO\n", "2\n"), "TWO\n2\n");
+        assert_eq!(join_hunks("TWO", "2\n"), "TWO\n2\n");
+        assert_eq!(join_hunks("", "2\n"), "2\n");
+        assert_eq!(proposal("two\n", "TWO", "2\n"), "TWO\n2\n");
+    }
 
     #[test]
     fn far_apart_edits_both_survive_and_the_middle_is_untouched() {
