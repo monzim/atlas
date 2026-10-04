@@ -136,11 +136,18 @@ async fn approving_a_join_request_lets_the_joiner_in_and_declining_does_not() {
     // The owner hears the request.
     server.request_join("monzim");
     joy.pump(QUIET).await.unwrap();
-    assert_eq!(
-        heard.try_recv().unwrap(),
-        ThreadEvent::JoinRequested {
-            user_id: "monzim".into()
+    // Presence comes and goes too (ATL-407); the request is among it.
+    let mut requests = Vec::new();
+    while let Ok(event) = heard.try_recv() {
+        if !matches!(event, ThreadEvent::Presence(_)) {
+            requests.push(event);
         }
+    }
+    assert_eq!(
+        requests,
+        vec![ThreadEvent::JoinRequested {
+            user_id: "monzim".into()
+        }]
     );
 
     // Declined: he stays a viewer, and is no longer told he is waiting.

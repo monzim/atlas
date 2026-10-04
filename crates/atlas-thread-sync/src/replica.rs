@@ -174,8 +174,9 @@ pub enum LocalChange {
 pub enum EditorEdit {
     /// Applied; these updates (a save from another editor) go out first.
     Applied(Vec<Vec<u8>>),
-    /// Not applied, and why.
-    Refused(String),
+    /// Not applied, and why. A save from another editor read on the way
+    /// still goes out: `pending`.
+    Refused { why: String, pending: Vec<Vec<u8>> },
 }
 
 /// One file of the thread, for Apply.
@@ -949,43 +950,37 @@ impl Replica {
     /// replica that may only watch, a file held or outgrown, or an edit that
     /// would make the file look like it holds a secret or grow past 1 MiB.
     /// The editor then writes to disk instead, and the usual rules take over.
-    pub fn apply_editor(
-        &mut self,
-        file_id: u64,
-        update: &[u8],
-    ) -> Result<EditorEdit, ReplicaError> {
-        let file = self
-            .files
-            .get(&file_id)
-            .ok_or(ReplicaError::UnknownFile(file_id))?;
-        if self.read_only {
-            return Ok(EditorEdit::Refused("this replica may only watch".into()));
-        }
-        if file.kind != FileKind::Text
-            || file.deleted
-            || file.held.is_some()
-            || file.outgrown
-            || !self.materialized
+    pub fn apply_editor(&mut self, file_id: u64, update: &[u8]) -> Result<EditorEdit, ReplicaError> {
+        let refuse = |why: String, pending: Vec<Vec<u8>>| Ok(EditorEdit::Refused { why, pending });
         {
-            return Ok(EditorEdit::Refused(format!(
-                "{} is not syncing keystrokes",
-                file.path
-            )));
+            let file = self
+                .files
+                .get(&file_id)
+                .ok_or(ReplicaError::UnknownFile(file_id))?;
+            if self.read_only {
+                return refuse("this replica may only watch".into(), Vec::new());
+            }
+            if file.kind != FileKind::Text || file.deleted || !self.materialized {
+                return refuse(format!("{} is not syncing keystrokes", file.path), Vec::new());
+            }
+        }
+        // A save from another editor goes in first, through the checks every
+        // save gets; the edit is then judged on the text it would really make.
+        let pending = self.ingest_disk(file_id)?;
+        let file = &self.files[&file_id];
+        if file.held.is_some() || file.outgrown {
+            return refuse(format!("{} is not syncing keystrokes", file.path), pending);
         }
         let after = FileDoc::from_snapshot(random_client_id(), &file.doc.snapshot())?;
         after.apply(update)?;
         let content = after.content();
         if content.len() >= MAX_TEXT_BYTES {
-            return Ok(EditorEdit::Refused(format!("{} is past 1 MB", file.path)));
+            return refuse(format!("{} is past 1 MB", file.path), pending);
         }
         if secret_reason(&file.path, &content).is_some() {
-            return Ok(EditorEdit::Refused(format!(
-                "{} now looks like it holds a secret",
-                file.path
-            )));
+            return refuse(format!("{} now looks like it holds a secret", file.path), pending);
         }
-        let pending = self.ingest_disk(file_id)?;
-        self.files[&file_id].doc.apply(update)?;
+        file.doc.apply(update)?;
         self.sync_disk(file_id)?;
         Ok(EditorEdit::Applied(pending))
     }

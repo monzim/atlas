@@ -229,8 +229,11 @@ struct Hub {
     thread_closed: bool,
     /// Conflicts merges held back (ATL-410), with who resolved each and by
     /// which frame, for idempotent resends.
-    conflicts: Vec<(ThreadConflict, Option<(String, String, u64, ServerControl)>)>,
+    conflicts: Vec<(ThreadConflict, Option<Resolver>)>,
 }
+
+/// Who resolved a Conflict, by which frame, and what they were answered.
+type Resolver = (String, String, u64, ServerControl);
 
 struct FakeRun {
     run: ThreadRun,

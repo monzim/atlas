@@ -193,10 +193,13 @@ fn an_ignored_file_of_the_persons_is_never_overwritten() {
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert_eq!(read(&dir, "local/settings.json"), "{\"mine\": true}\n");
-    // Stash and apply sets it aside too, rather than writing over it.
-    apply(&dir, &base, &changes, Some("atlas: set aside")).unwrap();
+    // Stash and apply sets it aside too — git cannot stash an ignored file by
+    // path, so it is moved beside itself rather than written over.
+    let applied = apply(&dir, &base, &changes, Some("atlas: set aside")).unwrap();
     assert_eq!(read(&dir, "local/settings.json"), "{\"thread\": true}\n");
-    assert!(git(&dir, &["stash", "list"]).contains("atlas: set aside"));
+    assert_eq!(applied.set_aside, vec!["local/settings.json.atlas-mine".to_string()]);
+    assert_eq!(read(&dir, "local/settings.json.atlas-mine"), "{\"mine\": true}\n");
+    assert_eq!(applied.stashed, None);
 }
 
 #[test]

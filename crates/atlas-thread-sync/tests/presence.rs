@@ -133,6 +133,7 @@ async fn the_editor_is_refused_where_a_save_would_not_sync() {
     ));
 
     // A keystroke that makes the file look like it holds a secret.
+    let sent = joy.updates_sent();
     let opened = joy.open_doc("src/banner.css").unwrap();
     let (_, update) = edit(
         &opened.state,
@@ -143,11 +144,31 @@ async fn the_editor_is_refused_where_a_save_would_not_sync() {
         matches!(refused, Err(SessionError::ReadOnly(ref why)) if why.contains("secret")),
         "{refused:?}"
     );
-    assert_eq!(joy.updates_sent(), 0);
+    assert_eq!(joy.updates_sent(), sent);
     assert_eq!(
         read(joy.replica().root(), "src/banner.css"),
         ".banner {\n  color: green;\n}\n"
     );
+}
+
+#[tokio::test]
+async fn a_save_not_yet_read_is_judged_with_the_keystrokes_that_follow_it() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let (mut joy, _monzim) = pair(&server, &w).await;
+    let sent = joy.updates_sent();
+    let opened = joy.open_doc("src/banner.css").unwrap();
+    // Another editor saved a credential; the watcher has not told anyone yet.
+    write(
+        joy.replica().root(),
+        "src/banner.css",
+        ".banner {}\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+    );
+    let (_, update) = edit(&opened.state, ".banner {\n  color: green;\n}\n/* ok */\n");
+    let refused = joy.editor_update(opened.file_id, update).await;
+    assert!(matches!(refused, Err(SessionError::ReadOnly(_))), "{refused:?}");
+    assert_eq!(joy.updates_sent(), sent);
+    assert!(joy.replica().held_files().contains(&"src/banner.css".to_string()));
 }
 
 #[tokio::test]

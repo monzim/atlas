@@ -43,6 +43,9 @@ pub struct Applied {
     pub beside: Vec<String>,
     /// The message the person's own edits were stashed under, if they were.
     pub stashed: Option<String>,
+    /// Ignored files of the person's that were in the way, moved beside
+    /// themselves (`<path>.atlas-mine`) since git cannot stash them by path.
+    pub set_aside: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,18 +144,33 @@ pub fn apply(
         match stash {
             None => return Err(ApplyError::Dirty(kept_dirty)),
             Some(message) => {
-                git::stash_paths(checkout, &kept_dirty, message)?;
-                applied.stashed = Some(message.to_string());
-                // Anything a stash could not take is still in the way.
-                let left: Vec<String> = kept_dirty
-                    .into_iter()
-                    .filter(|rel| {
-                        !matches!(
-                            (on_disk(checkout, rel), git::blob_at(checkout, &head, rel)),
-                            (Ok(disk), Ok(commit)) if disk == commit
-                        )
-                    })
-                    .collect();
+                // What git sees goes into a stash; git does not stash an
+                // ignored file by path, so those are set aside beside
+                // themselves instead — moved, never overwritten.
+                let visible: Vec<String> = git::dirty_among(checkout, &kept_dirty)?;
+                if !visible.is_empty() {
+                    git::stash_paths(checkout, &visible, message)?;
+                    applied.stashed = Some(message.to_string());
+                }
+                for rel in &kept_dirty {
+                    if on_disk(checkout, rel)? == git::blob_at(checkout, &head, rel)? {
+                        continue;
+                    }
+                    let aside = aside_name(checkout, rel)?;
+                    fs::rename(path::resolve(checkout, rel)?, path::resolve(checkout, &aside)?)
+                        .map_err(|source| ApplyError::Io {
+                            path: checkout.join(rel),
+                            source,
+                        })?;
+                    applied.set_aside.push(aside);
+                }
+                // Anything still in the way stops Apply before it writes.
+                let mut left = Vec::new();
+                for rel in kept_dirty {
+                    if on_disk(checkout, &rel)? != git::blob_at(checkout, &head, &rel)? {
+                        left.push(rel);
+                    }
+                }
                 if !left.is_empty() {
                     return Err(ApplyError::Dirty(left));
                 }
@@ -180,28 +198,29 @@ pub fn apply(
                 }
             }
         }
+        // What the Base had at this path decides who changed it; a moved
+        // file's content merges against what the Base had where it came from.
+        let base_here = git::blob_at(checkout, base, &change.path)?;
         let from = change.origin.as_deref().unwrap_or(&change.path);
-        let base_bytes = git::blob_at(checkout, base, from)?;
+        let merge_base = git::blob_at(checkout, base, from)?;
         let head_bytes = git::blob_at(checkout, &head, &change.path)?;
         let theirs = change.content.as_ref();
 
-        if head_bytes.as_ref() == theirs
-            || theirs == base_bytes.as_ref() && head_bytes == base_bytes
-        {
+        if head_bytes.as_ref() == theirs {
             continue; // Already so.
         }
-        if head_bytes == base_bytes {
+        if head_bytes == base_here {
             writes.push((change.path.clone(), theirs.cloned()));
             applied.files.push(change.path.clone());
             continue;
         }
-        if theirs == base_bytes.as_ref() {
-            continue; // The thread left it as the Base had it.
+        if theirs == base_here.as_ref() {
+            continue; // The thread left this path as the Base had it.
         }
         // Both changed it since the Base.
         match (&head_bytes, theirs) {
             (Some(ours), Some(theirs)) if is_text(ours) && is_text(theirs) => {
-                let base_text = base_bytes.clone().unwrap_or_default();
+                let base_text = merge_base.clone().unwrap_or_default();
                 let (merged, conflicts) = git::merge_file(
                     checkout,
                     ours,
@@ -291,6 +310,22 @@ fn beside_name(checkout: &Path, rel: &str, bytes: &[u8]) -> Result<Option<String
         }
     }
     Ok(None)
+}
+
+/// A free name beside `rel` for the person's own copy: `<path>.atlas-mine`,
+/// or the first `<path>.atlas-mine-N` nothing holds.
+fn aside_name(checkout: &Path, rel: &str) -> Result<String, ApplyError> {
+    for n in 1..=100 {
+        let name = if n == 1 {
+            format!("{rel}.atlas-mine")
+        } else {
+            format!("{rel}.atlas-mine-{n}")
+        };
+        if path::is_valid(&name) && on_disk(checkout, &name)?.is_none() {
+            return Ok(name);
+        }
+    }
+    Err(ApplyError::Dirty(vec![rel.to_string()]))
 }
 
 /// Does `rel` in the checkout already hold what the thread has there — the

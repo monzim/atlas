@@ -47,8 +47,19 @@ export function activity(peer: SharedPeer): string | null {
  */
 export function PresenceBar({ peers }: { peers: SharedPeer[] }) {
   if (peers.length === 0) return null;
-  // One avatar per person, however many windows they have open.
-  const people = [...new Map(peers.map((p) => [p.userId, p])).values()];
+  // One avatar per person, however many windows they have open — doing
+  // whatever any of them is doing.
+  const byUser = new Map<string, SharedPeer>();
+  for (const p of peers) {
+    const seen = byUser.get(p.userId);
+    byUser.set(
+      p.userId,
+      seen
+        ? { ...seen, typing: seen.typing ?? p.typing, runs: [...seen.runs, ...p.runs] }
+        : p,
+    );
+  }
+  const people = [...byUser.values()];
   const doing = people
     .map((p) => ({ p, what: activity(p) }))
     .filter((x): x is { p: SharedPeer; what: string } => x.what !== null);

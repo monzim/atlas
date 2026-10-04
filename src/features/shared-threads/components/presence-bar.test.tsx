@@ -39,7 +39,7 @@ describe("presence (ATL-407)", () => {
   });
 
   it("draws one avatar per person and says who is typing where, and where Runs are", () => {
-    render(
+    const { container } = render(
       <PresenceBar
         peers={[
           peer({ typing: "src/app.ts" }),
@@ -49,8 +49,9 @@ describe("presence (ATL-407)", () => {
       />,
     );
     expect(screen.getAllByText(/^(MO|JO)$/)).toHaveLength(2);
-    expect(screen.getByText("is typing in src/app.ts", { exact: false })).toBeTruthy();
-    expect(screen.getByText("is running an agent in README.md", { exact: false })).toBeTruthy();
+    // His second window is idle; what the first is doing still shows.
+    expect(container.textContent).toContain("monzim is typing in src/app.ts");
+    expect(container.textContent).toContain("joy is running an agent in README.md");
   });
 
   it("names avatars and activity plainly", () => {

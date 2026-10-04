@@ -564,7 +564,14 @@ async fn the_run_loop_runs_streams_and_merges_on_command() {
     }
 
     monzim.pump(QUIET).await.unwrap();
-    assert!(matches!(heard.try_recv(), Ok(ThreadEvent::RunFrame { .. })));
+    // Among presence (ATL-407), the live Run frame arrived.
+    let mut frames = 0;
+    while let Ok(event) = heard.try_recv() {
+        if matches!(event, ThreadEvent::RunFrame { .. }) {
+            frames += 1;
+        }
+    }
+    assert!(frames > 0);
     assert_eq!(
         monzim.replica().text("README.md").unwrap(),
         "# Site\n\nFrom the loop.\n"

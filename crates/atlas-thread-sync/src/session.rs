@@ -1812,7 +1812,10 @@ impl<T: Transport> ThreadSession<T> {
             });
         }
         match self.replica.apply_editor(file_id, &update)? {
-            EditorEdit::Refused(why) => Err(SessionError::ReadOnly(why)),
+            EditorEdit::Refused { why, pending } => {
+                self.send_updates(file_id, pending).await?;
+                Err(SessionError::ReadOnly(why))
+            }
             EditorEdit::Applied(pending) => {
                 self.send_updates(file_id, pending).await?;
                 self.send_updates(file_id, vec![update]).await
@@ -1947,6 +1950,8 @@ impl<T: Transport> ThreadSession<T> {
             run_id: run_id.to_string(),
             outcome,
         };
+        // Its badge goes with it (ATL-407).
+        self.awareness.runs.retain(|r| r.run_id != run_id);
         match self.ask(client_seq, &end).await? {
             Answer::Ack => Ok(()),
             Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
