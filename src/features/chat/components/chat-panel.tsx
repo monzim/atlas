@@ -107,6 +107,7 @@ import { ChatHeader } from "./chat-header";
 import { openNewAgentChat } from "../lib/open-agent-session";
 import { forkSessionToNewTab } from "../lib/fork-session";
 import { projectPathForTab } from "../lib/tab-project";
+import type { ShareTarget } from "@/features/shared-threads/components/shared-thread-panel";
 import { useQueryClient } from "@tanstack/react-query";
 import { prefetchTextDiff } from "@/features/git/lib/git-diff-api";
 import { OPEN_TURN_DIFF_EVENT, type TurnDiffRequest } from "../lib/open-turn-diff";
@@ -374,6 +375,12 @@ export const ChatPanel = memo(function ChatPanel({ tabId }: ChatPanelProps) {
   );
 
   const acpSessionId = session?.acpSessionId ?? "";
+  // What the header's Share popover acts on (ATL-395). Memoised: the header is
+  // memo'd and re-rendered per streaming frame only if a prop changes.
+  const shareTarget = useMemo<ShareTarget>(
+    () => ({ sessionId: acpSessionId || null, projectPath: projectPathForTab(tabId), title: headerTitle }),
+    [acpSessionId, tabId, headerTitle],
+  );
   /** Handle on the bind effect's in-flight attempt — see `epoch` inside it.
    *  Null whenever no bind effect is mounted (tab already bound). */
   const bindControlRef = useRef<{
@@ -1424,6 +1431,7 @@ export const ChatPanel = memo(function ChatPanel({ tabId }: ChatPanelProps) {
                 plansPanelOpen={plansPanelOpen}
                 onTogglePlans={onTogglePlansStable}
                 commentCount={commentCount}
+                shareTarget={shareTarget}
                 commentsPanelOpen={commentsPanelOpen}
                 onToggleComments={onToggleCommentsStable}
                 // Zero-arg wrapper, NOT a bare reference: React would call

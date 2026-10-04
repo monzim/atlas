@@ -21,6 +21,7 @@ pub mod doc;
 pub mod git;
 pub mod path;
 pub mod replica;
+pub mod secrets;
 pub mod session;
 pub mod transport;
 pub mod watch;
@@ -32,7 +33,8 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
 pub use replica::{LocalChange, Replica, ReplicaError};
-pub use session::{SessionError, ThreadSession};
+pub use secrets::SecretReason;
+pub use session::{SessionError, ShareReport, ThreadSession};
 pub use transport::{
     FakeThreadServer, FakeTransport, Message, Transport, TransportError, WsTransport,
 };
@@ -133,7 +135,12 @@ pub async fn run<T: Transport>(
                         }
                     }
                 }
-                let _ = reply.send(result.as_ref().map(Clone::clone).map_err(|e| e.to_string()));
+                let _ = reply.send(
+                    result
+                        .as_ref()
+                        .map(Clone::clone)
+                        .map_err(std::string::ToString::to_string),
+                );
                 result.map(|_| ())
             }
         };

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::git;
 use crate::replica::{looks_textual, LocalChange, Replica, ReplicaError};
+use crate::secrets::{secret_reason, SecretReason};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{self, ClientControl, FileKind, Frame, FrameKind, Role, ServerControl};
 
@@ -30,6 +31,15 @@ pub enum SessionError {
 
 /// How long to wait for the server's answer to something we asked.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What sharing the sharer's working changes did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ShareReport {
+    /// Paths that became canonical changes.
+    pub shared: Vec<String>,
+    /// Paths held back because they look like secrets, and why.
+    pub blocked: Vec<(String, SecretReason)>,
+}
 
 pub struct ThreadSession<T: Transport> {
     transport: T,
@@ -155,6 +165,13 @@ impl<T: Transport> ThreadSession<T> {
                 })
             }
             LocalChange::NewFile { path } => {
+                // A credential created in the replica stays on this machine,
+                // for the same reason it is held back at share time.
+                let content = self.replica.read_disk(&path)?;
+                if let Some(reason) = secret_reason(&path, &content) {
+                    tracing::info!(target: "atlas_thread_sync", ?reason, "holding back a new file that looks secret");
+                    return Ok(LocalChange::Ignored);
+                }
                 let file_id = self.ensure_file(&path, true).await?;
                 if let LocalChange::Update { update, .. } = self.replica.local_change(&path)? {
                     self.send_update(file_id, update).await?;
@@ -167,13 +184,14 @@ impl<T: Transport> ThreadSession<T> {
 
     /// Make the sharer's uncommitted work the thread's first canonical changes:
     /// every modified, added or untracked text file in `checkout` (ignored
-    /// files never appear; binary and deleted ones wait for ATL-403). Answers
-    /// the paths shared. The person's checkout is only read.
+    /// files never appear; binary and deleted ones wait for ATL-403), except
+    /// files that look like secrets, which are held back and reported. The
+    /// person's checkout is only read.
     pub async fn share_working_changes(
         &mut self,
         checkout: &Path,
-    ) -> Result<Vec<String>, SessionError> {
-        let mut shared = Vec::new();
+    ) -> Result<ShareReport, SessionError> {
+        let mut report = ShareReport::default();
         for dirty in git::dirty_paths(checkout).map_err(ReplicaError::from)? {
             if dirty.deleted || !crate::path::is_valid(&dirty.path) {
                 continue;
@@ -187,16 +205,18 @@ impl<T: Transport> ThreadSession<T> {
             if !looks_textual(&bytes) {
                 continue;
             }
+            let content = String::from_utf8_lossy(&bytes);
+            if let Some(reason) = secret_reason(&dirty.path, &content) {
+                report.blocked.push((dirty.path, reason));
+                continue;
+            }
             let file_id = self.ensure_file(&dirty.path, true).await?;
-            if let Some(update) = self
-                .replica
-                .set_text(file_id, &String::from_utf8_lossy(&bytes))?
-            {
+            if let Some(update) = self.replica.set_text(file_id, &content)? {
                 self.send_update(file_id, update).await?;
             }
-            shared.push(dirty.path);
+            report.shared.push(dirty.path);
         }
-        Ok(shared)
+        Ok(report)
     }
 
     /// The file's id in this thread, asking the server for an entry if it has

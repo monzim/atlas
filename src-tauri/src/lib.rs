@@ -291,6 +291,8 @@ pub fn run() {
                 // manager that is not yet managed would miss the first one.
                 commands::comms::install(app.handle());
                 commands::artifacts_cloud::install(app.handle());
+                // Shared Threads (ATL-395): rejoin what this machine had joined.
+                commands::shared_threads::install(app.handle());
                 commands::auth::restore_on_launch(app.handle());
 
                 // Seed the Organisation every event is attributed to, from the
@@ -579,6 +581,11 @@ pub fn run() {
             commands::capture::capture_disable,
             commands::capture::capture_git_init,
             commands::capture::capture_git_available,
+            commands::shared_threads::shared_thread_share,
+            commands::shared_threads::shared_thread_join,
+            commands::shared_threads::shared_thread_open,
+            commands::shared_threads::shared_thread_list,
+            commands::shared_threads::shared_thread_leave,
             commands::artifacts_cloud::artifacts_cloud_retarget,
             commands::artifacts_cloud::artifacts_cloud_follow,
             commands::artifacts_cloud::artifacts_cloud_unfollow,

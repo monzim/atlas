@@ -49,6 +49,8 @@ pub enum ReplicaError {
     },
     #[error("this repository does not have the thread's Base commit {0}")]
     BaseMissing(String),
+    #[error("{0:?} is not a commit id")]
+    BadBase(String),
     #[error("no file {0} in this thread")]
     UnknownFile(u64),
 }
@@ -112,6 +114,9 @@ impl Replica {
     /// Refuses when the repository lacks the Base: bringing it over is a
     /// separate negotiation (ATL-402).
     pub fn new(repo: &Path, base: &str, root: &Path) -> Result<Self, ReplicaError> {
+        if !git::is_commit_sha(base) {
+            return Err(ReplicaError::BadBase(base.to_string()));
+        }
         if !git::has_commit(repo, base) {
             return Err(ReplicaError::BaseMissing(base.to_string()));
         }
@@ -190,6 +195,14 @@ impl Replica {
         );
         self.by_path.insert(rel.to_string(), file_id);
         Ok(true)
+    }
+
+    /// A worktree file's text as it is on disk now (lossy UTF-8), for checks
+    /// made before it is synced.
+    pub fn read_disk(&self, rel: &str) -> Result<String, ReplicaError> {
+        let target = path::resolve(&self.root, rel)?;
+        let bytes = fs::read(&target).map_err(io(&target))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Make a file's document hold `content` (the sharer's working copy, read
@@ -333,12 +346,24 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), ReplicaError> {
     fs::create_dir_all(dir).map_err(io(dir))?;
     let temp = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple()));
     let result = (|| {
-        let mut file = fs::File::create(&temp)?;
+        // Created owner-only, so the bytes are never readable by anybody the
+        // finished file would not be; the target's own mode is applied before
+        // the rename (an executable script stays one, a 0600 file stays 0600).
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        // Keep the mode the file already had (an executable script stays one).
-        if let Ok(meta) = fs::metadata(target) {
-            fs::set_permissions(&temp, meta.permissions())?;
+        match fs::metadata(target) {
+            Ok(meta) => fs::set_permissions(&temp, meta.permissions())?,
+            #[cfg(unix)]
+            Err(_) => {
+                fs::set_permissions(&temp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?
+            }
+            #[cfg(not(unix))]
+            Err(_) => {}
         }
         fs::rename(&temp, target)
     })();

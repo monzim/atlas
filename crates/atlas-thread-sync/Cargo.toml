@@ -9,6 +9,8 @@ name = "atlas_thread_sync"
 
 [dependencies]
 atlas-process = { path = "../atlas-process" }
+# The secret rules every other disclosure in Atlas uses (share blocking).
+atlas-redact = { path = "../atlas-redact" }
 # The Rust port of Yjs. The web viewer runs `yjs` itself, so the text type name
 # and the UTF-16 offset kind below are part of the contract, not a choice.
 yrs = "0.24"

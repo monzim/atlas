@@ -702,6 +702,7 @@ dependencies = [
  "atlas-terminal",
  "atlas-theme",
  "atlas-thread-metadata",
+ "atlas-thread-sync",
  "axum",
  "base64 0.21.7",
  "block2",
@@ -3410,6 +3411,7 @@ name = "atlas-thread-sync"
 version = "0.1.0"
 dependencies = [
  "atlas-process",
+ "atlas-redact",
  "futures-util",
  "notify",
  "serde",

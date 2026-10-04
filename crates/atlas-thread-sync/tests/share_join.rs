@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use atlas_thread_sync::{
     run, Command as SyncCommand, FakeThreadServer, FakeTransport, LocalChange, Replica,
-    ReplicaError, SyncStatus, ThreadSession,
+    ReplicaError, SecretReason, SyncStatus, ThreadSession,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -87,6 +87,7 @@ fn world() -> World {
     write(&joy, "src/banner.css", ".banner {\n  color: green;\n}\n");
     write(&joy, "notes.md", "todo: red?\n");
     write(&joy, "dist/bundle.js", "minified();\n");
+    write(&joy, ".env.local", "STRIPE_KEY=sk_live_not_really\n");
 
     let replicas = tmp.path().join("replicas");
     World {
@@ -117,11 +118,17 @@ async fn sharer_work_reaches_a_joiner_who_already_has_the_base() {
     let server = FakeThreadServer::new();
 
     let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
-    let mut shared = joy.share_working_changes(&w.joy).await.unwrap();
+    let report = joy.share_working_changes(&w.joy).await.unwrap();
+    let mut shared = report.shared.clone();
     shared.sort();
     assert_eq!(
         shared,
         vec!["notes.md".to_string(), "src/banner.css".to_string()]
+    );
+    // The credential file in Joy's working tree never left her machine.
+    assert_eq!(
+        report.blocked,
+        vec![(".env.local".to_string(), SecretReason::Name)]
     );
 
     let monzim_root = w.replicas.join("monzim");
@@ -144,6 +151,8 @@ async fn sharer_work_reaches_a_joiner_who_already_has_the_base() {
     assert_eq!(read(&root, "notes.md"), "todo: red?\n");
     assert_eq!(read(&root, "README.md"), "# Site\n");
     assert!(!root.join("dist/bundle.js").exists());
+    assert!(!root.join(".env.local").exists());
+    assert!(monzim.replica().text(".env.local").is_none());
 
     // The person's own checkouts were never touched.
     assert_eq!(
@@ -382,4 +391,34 @@ async fn the_run_loop_syncs_watched_saves_and_never_echoes() {
 
     joy_cmd.send(SyncCommand::Stop).await.unwrap();
     monzim_cmd.send(SyncCommand::Stop).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_base_that_is_not_a_commit_id_never_reaches_git() {
+    let w = world();
+    for base in ["--upload-pack=touch /tmp/pwned", "HEAD", "abc123", ""] {
+        assert!(matches!(
+            Replica::new(&w.joy, base, &w.replicas.join("x")),
+            Err(ReplicaError::BadBase(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_secret_created_in_the_replica_stays_local() {
+    let w = world();
+    let server = FakeThreadServer::new();
+    let mut joy = open(&server, &w.joy, &w.base, &w.replicas.join("joy"), "joy").await;
+    let root = joy.materialize().unwrap();
+    write(
+        &root,
+        "config/prod.env",
+        "DATABASE_URL=postgres://u:p@h/db\n",
+    );
+    let before = server.head();
+    assert_eq!(
+        joy.file_saved("config/prod.env").await.unwrap(),
+        LocalChange::Ignored
+    );
+    assert_eq!(server.head(), before);
 }

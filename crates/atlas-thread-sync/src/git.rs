@@ -31,6 +31,29 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     Ok(output.stdout)
 }
 
+/// Is `sha` a full commit name — 40 (SHA-1) or 64 (SHA-256) lower-case hex?
+///
+/// Every commit id that reaches a git argument passes this first. A Base comes
+/// from the server or a link, and a value starting with `-` would otherwise be
+/// read by git as an option.
+pub fn is_commit_sha(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64)
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn checked(sha: &str) -> Result<&str, GitError> {
+    if is_commit_sha(sha) {
+        Ok(sha)
+    } else {
+        Err(GitError::Failed {
+            args: "(refused)".into(),
+            stderr: format!("not a commit id: {sha:?}"),
+        })
+    }
+}
+
 /// The commit `HEAD` names — the Base a share starts from.
 pub fn head_commit(repo: &Path) -> Result<String, GitError> {
     let out = run(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
@@ -39,12 +62,12 @@ pub fn head_commit(repo: &Path) -> Result<String, GitError> {
 
 /// Does this repository already hold `sha` as a commit?
 pub fn has_commit(repo: &Path, sha: &str) -> bool {
-    run(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+    is_commit_sha(sha) && run(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
 }
 
 /// A file's bytes at `sha`, or `None` when the commit has no such file.
 pub fn blob_at(repo: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, GitError> {
-    let spec = format!("{sha}:{path}");
+    let spec = format!("{}:{path}", checked(sha)?);
     if run(repo, &["cat-file", "-e", &spec]).is_err() {
         return Ok(None);
     }
@@ -54,10 +77,11 @@ pub fn blob_at(repo: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Gi
 /// Check out `sha` into a new, detached worktree at `dest`, leaving the
 /// person's own checkout and branches untouched.
 pub fn add_worktree(repo: &Path, dest: &Path, sha: &str) -> Result<(), GitError> {
+    let sha = checked(sha)?;
     let dest = dest.to_string_lossy();
     run(
         repo,
-        &["worktree", "add", "--detach", "--quiet", &dest, sha],
+        &["worktree", "add", "--detach", "--quiet", "--", &dest, sha],
     )
     .map(|_| ())
 }
