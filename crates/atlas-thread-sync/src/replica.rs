@@ -120,6 +120,9 @@ struct TrackedFile {
     /// edit is made relative to this snapshot and merged, so changes the
     /// thread took meanwhile survive.
     held: Option<Vec<u8>>,
+    /// Held because this replica may not change the thread (a viewer, a
+    /// closed thread) rather than because of a secret (ATL-406).
+    held_read_only: bool,
     /// A binary file's canonical content: the hex SHA-256 of its blob.
     blob: Option<String>,
     /// Deleted in the thread. The entry and document stay, so a revival
@@ -149,7 +152,11 @@ pub enum LocalChange {
     /// same bytes turn up at a new path, which makes it a rename.
     Missing { file_id: u64 },
     /// The same bytes as a file that went missing, at a new path: a rename.
-    Renamed { file_id: u64, from: String, to: String },
+    Renamed {
+        file_id: u64,
+        from: String,
+        to: String,
+    },
     /// Not something that syncs (a file that turned binary or grew past the
     /// text limit, or the worktree does not exist yet).
     Ignored,
@@ -203,6 +210,9 @@ pub struct Replica {
     /// its own (drifted) bytes are replaced rather than set aside as the
     /// person's.
     known_before: HashMap<String, Hash>,
+    /// The person may not change the thread right now (ATL-406): their saves
+    /// are held on this machine, and merged in once they may.
+    read_only: bool,
 }
 
 impl Replica {
@@ -236,7 +246,25 @@ impl Replica {
             set_aside: Vec::new(),
             rebuilding: false,
             known_before: HashMap::new(),
+            read_only: false,
         })
+    }
+
+    /// Whether the person may change the thread from this replica. While they
+    /// may not, a save is held like a secret is — kept on disk, never sent —
+    /// and the next save once they may merges it with what the thread did
+    /// meanwhile.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// Files with saves held because this replica may not change the thread.
+    pub fn unsent_files(&self) -> Vec<String> {
+        self.files
+            .values()
+            .filter(|f| f.held.is_some() && f.held_read_only && !f.deleted)
+            .map(|f| f.path.clone())
+            .collect()
     }
 
     /// Forget every document, to build them again from the thread: this
@@ -255,7 +283,10 @@ impl Replica {
     /// The rebuild is done: write canonical state over the worktree — except
     /// at `keep`, where the person's own bytes stay, to be read as a save.
     /// Anywhere else the replica's bytes lose: they are what drifted.
-    pub fn finish_rebuild(&mut self, keep: &std::collections::HashSet<String>) -> Result<(), ReplicaError> {
+    pub fn finish_rebuild(
+        &mut self,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), ReplicaError> {
         self.rebuilding = false;
         if !self.materialized {
             return Ok(());
@@ -585,6 +616,7 @@ impl Replica {
                 doc,
                 disk,
                 held: None,
+                held_read_only: false,
                 blob: None,
                 deleted: false,
                 origin: rel.to_string(),
@@ -604,7 +636,10 @@ impl Replica {
             return Err(path::PathError::Invalid(entry.path.clone()).into());
         }
         if self.add_entry(id, &entry.path, entry.kind)? {
-            let file = self.files.get_mut(&id).ok_or(ReplicaError::UnknownFile(id))?;
+            let file = self
+                .files
+                .get_mut(&id)
+                .ok_or(ReplicaError::UnknownFile(id))?;
             if let Some(origin) = entry.origin.as_ref().filter(|o| path::is_valid(o)) {
                 file.origin.clone_from(origin);
             }
@@ -633,7 +668,11 @@ impl Replica {
             if self.materialized && !self.files[&id].deleted {
                 self.move_on_disk(&old_path, &entry.path)?;
             }
-            self.files.get_mut(&id).expect("known").path.clone_from(&entry.path);
+            self.files
+                .get_mut(&id)
+                .expect("known")
+                .path
+                .clone_from(&entry.path);
         }
         // Deleted, or back.
         let was_deleted = self.files[&id].deleted;
@@ -992,15 +1031,18 @@ impl Replica {
 
         // The same gate as sharing and new files, for every later save: a
         // credential pasted into a tracked file is held on this machine.
-        if secret_reason(&file.path, &content).is_some() {
+        let secret = secret_reason(&file.path, &content).is_some();
+        if secret || self.read_only {
             if file.held.is_none() {
-                tracing::info!(target: "atlas_thread_sync", path = %file.path, "holding a file that now looks secret");
+                tracing::info!(target: "atlas_thread_sync", path = %file.path, secret, "holding a save on this machine");
                 file.held = Some(file.doc.snapshot());
             }
+            file.held_read_only = !secret;
             return Ok(None);
         }
 
         file.disk = Some(seen);
+        file.held_read_only = false;
         match file.held.take() {
             None => Ok(file.doc.set_content(&content)),
             Some(snapshot) => {
@@ -1022,7 +1064,7 @@ impl Replica {
     pub fn held_files(&self) -> Vec<String> {
         self.files
             .values()
-            .filter(|f| f.held.is_some() && !f.deleted)
+            .filter(|f| f.held.is_some() && !f.held_read_only && !f.deleted)
             .map(|f| f.path.clone())
             .collect()
     }

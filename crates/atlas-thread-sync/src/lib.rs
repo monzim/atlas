@@ -47,12 +47,10 @@ pub use bootstrap::ThreadRepo;
 pub use replica::{LocalChange, Replica, ReplicaError};
 pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
-pub use session::{
-    Bootstrapped, RunView, SessionError, ShareReport, ThreadEvent, ThreadSession,
-};
-pub use share::{SharePreview, ShareFile, ShareKind};
-pub use store::{FakeStore, ObjectStore, StoreError};
 pub use session::Verification;
+pub use session::{Bootstrapped, RunView, SessionError, ShareReport, ThreadEvent, ThreadSession};
+pub use share::{ShareFile, ShareKind, SharePreview};
+pub use store::{FakeStore, ObjectStore, StoreError};
 pub use transport::{
     Connector, FakeConnector, FakeThreadServer, FakeTransport, Message, NoReconnect, Transport,
     TransportError, WsTransport,
@@ -125,6 +123,11 @@ pub struct SyncStatus {
     pub history_wanted: usize,
     /// Things done on the person's behalf they should hear about, newest last.
     pub notices: Vec<String>,
+    /// Saves kept on this machine because it may not change the thread (a
+    /// viewer, a closed thread); they go once it may (ATL-406).
+    pub unsent: Vec<String>,
+    /// The thread is closed.
+    pub closed: bool,
     pub error: Option<String>,
 }
 
@@ -143,6 +146,8 @@ fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) ->
         serves_history: session.serves_bundles(),
         history_wanted: session.bundles_wanted(),
         notices: session.notices().to_vec(),
+        unsent: session.unsent(),
+        closed: session.is_closed(),
         error,
     }
 }
@@ -422,6 +427,12 @@ pub async fn run_with<C: Connector>(
         };
         let mut error = outcome.err().map(|e| e.to_string());
         // Somebody lacks the Base and this replica may hold it (ATL-402).
+        // Promoted, or the thread reopened: what was held may go now.
+        if session.wants_flush() {
+            if let Err(e) = session.flush_unsent().await {
+                error.get_or_insert_with(|| e.to_string());
+            }
+        }
         let wants = session.take_bundle_wants();
         if let Err(e) = session.serve_bundles(wants).await {
             error.get_or_insert_with(|| format!("could not send the Base: {e}"));

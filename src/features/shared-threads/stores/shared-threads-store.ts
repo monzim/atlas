@@ -13,6 +13,7 @@ import { createSelectors } from "@/lib/create-selectors";
 
 import {
   listThreads,
+  onJoinRequested,
   onSharedRunFrame,
   onSharedThreadsChanged,
   type SharedRunFrame,
@@ -35,6 +36,8 @@ interface SharedThreadsState {
   lastResult: SharedThreadView | null;
   /** The tail of each live Run's text, from other people's Run frames. */
   live: Record<string, string>;
+  /** Bumped per thread whenever somebody asks to join, so the owner panel refetches. */
+  joinRequests: Record<string, number>;
   loaded: boolean;
   load: () => Promise<void>;
   apply: (threads: SharedThreadView[]) => void;
@@ -47,12 +50,21 @@ const useSharedThreadsStoreBase = create<SharedThreadsState>((set, get) => ({
   bySession: {},
   lastResult: null,
   live: {},
+  joinRequests: {},
   loaded: false,
   load: async () => {
     if (get().loaded) return;
     set({ loaded: true });
     void onSharedThreadsChanged((threads) => get().apply(threads));
     void onSharedRunFrame((frame) => get().heard(frame));
+    void onJoinRequested(({ sharedThreadId }) =>
+      set((state) => ({
+        joinRequests: {
+          ...state.joinRequests,
+          [sharedThreadId]: (state.joinRequests[sharedThreadId] ?? 0) + 1,
+        },
+      })),
+    );
     try {
       get().apply(await listThreads());
     } catch {
@@ -83,3 +95,23 @@ const useSharedThreadsStoreBase = create<SharedThreadsState>((set, get) => ({
 }));
 
 export const useSharedThreadsStore = createSelectors(useSharedThreadsStoreBase);
+
+/**
+ * Why an agent session working in `cwd` may not prompt (ATL-406): `cwd` is a
+ * Shared Thread's Run worktree and this person may not change that thread — a
+ * viewer, a closed thread, a replica without the Base. `null` when they may,
+ * or when `cwd` is no thread's.
+ */
+export function runLockFor(threads: SharedThreadView[], cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  const thread = threads.find((t) => t.runWorktree !== "" && t.runWorktree === cwd);
+  if (!thread) return null;
+  if (thread.status.readOnly) return thread.status.readOnly;
+  if (thread.role === "viewer") return "You are a viewer in this Shared Thread, so prompting here would not run.";
+  return null;
+}
+
+export function useRunLock(cwd: string | null | undefined): string | null {
+  const threads = useSharedThreadsStore.use.threads();
+  return runLockFor(threads, cwd);
+}

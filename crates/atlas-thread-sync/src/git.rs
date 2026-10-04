@@ -173,7 +173,12 @@ fn run_with_input(
 pub fn objects_dir(repo: &Path) -> Result<std::path::PathBuf, GitError> {
     let out = run(
         repo,
-        &["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
     )?;
     Ok(std::path::PathBuf::from(
         String::from_utf8_lossy(&out).trim().to_string(),
@@ -197,7 +202,16 @@ pub fn update_ref(repo: &Path, name: &str, sha: &str) -> Result<(), GitError> {
 
 /// The commit a ref names, if it exists.
 pub fn resolve_ref(repo: &Path, name: &str) -> Option<String> {
-    let out = run(repo, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]).ok()?;
+    let out = run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ],
+    )
+    .ok()?;
     Some(String::from_utf8_lossy(&out).trim().to_string())
 }
 

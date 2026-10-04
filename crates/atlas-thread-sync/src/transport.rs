@@ -19,8 +19,8 @@ use base64::Engine as _;
 
 use crate::store::FakeStore;
 use crate::wire::{
-    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergedFile,
-    Role, RunOutcome, ServerControl, ThreadRun, TreeEntry,
+    self, BundleFailure, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergedFile, Role,
+    RunOutcome, ServerControl, ThreadRun, TreeEntry,
 };
 
 /// One message on the socket.
@@ -211,6 +211,12 @@ struct Hub {
     closed: HashMap<u64, u16>,
     /// The next canonical update relayed to this user is lost on the way.
     lose_next_to: Option<String>,
+    /// Each person's role; a participant unless set (ATL-406).
+    roles: HashMap<String, Role>,
+    /// The thread's owner, who hears join requests.
+    owner: Option<String>,
+    /// Closed: every write is refused until it is reopened.
+    thread_closed: bool,
 }
 
 struct FakeRun {
@@ -363,6 +369,54 @@ impl FakeThreadServer {
         }
     }
 
+    /// Set somebody's role, and tell every socket — as the owner's `PUT
+    /// /participants/{user}` (approving is `participant`) or `DELETE` (a
+    /// decline, or a demotion) would.
+    pub fn set_role(&self, user: &str, role: Role) {
+        let mut hub = self.hub.lock().expect("hub");
+        hub.roles.insert(user.to_string(), role);
+        hub.broadcast(&ServerControl::RoleChanged {
+            user_id: user.to_string(),
+            role,
+        });
+    }
+
+    /// The thread's owner, who is sent join requests.
+    pub fn set_owner(&self, user: &str) {
+        let mut hub = self.hub.lock().expect("hub");
+        hub.owner = Some(user.to_string());
+        hub.roles.insert(user.to_string(), Role::Owner);
+    }
+
+    /// Somebody asked to join a thread that needs approval: the owner hears.
+    pub fn request_join(&self, user: &str) {
+        let hub = self.hub.lock().expect("hub");
+        let text = serde_json::to_string(&ServerControl::JoinRequested {
+            user_id: user.to_string(),
+        })
+        .expect("json");
+        for c in hub.conns.values() {
+            if c.client.is_some() && Some(&c.user) == hub.owner.as_ref() {
+                let _ = c.tx.send(Message::Text(text.clone()));
+            }
+        }
+    }
+
+    /// Close (or reopen) the thread, telling every socket.
+    pub fn set_closed(&self, closed: bool) {
+        let mut hub = self.hub.lock().expect("hub");
+        hub.thread_closed = closed;
+        hub.broadcast(&ServerControl::Status {
+            status: if closed {
+                wire::ThreadStatus::Closed
+            } else {
+                wire::ThreadStatus::Open
+            },
+            closed_at: closed.then_some(1),
+            purge_at: closed.then_some(2),
+        });
+    }
+
     /// While offline, `user` cannot connect at all.
     pub fn set_offline(&self, user: &str, offline: bool) {
         let mut hub = self.hub.lock().expect("hub");
@@ -402,7 +456,10 @@ impl FakeThreadServer {
         }
         for j in hub.journal.iter_mut().filter(|j| j.seq <= through) {
             if let Some(frame) = j.frame.take() {
-                by_file.entry(frame.file_id).or_default().push(frame.payload);
+                by_file
+                    .entry(frame.file_id)
+                    .or_default()
+                    .push(frame.payload);
             }
         }
         for (file_id, updates) in by_file {
@@ -616,6 +673,14 @@ impl Hub {
         Some(crate::bootstrap::sha256_hex(doc.content().as_bytes()))
     }
 
+    /// Why `user` may not write now, as the real server's `mayWrite` says.
+    fn write_refusal(&self, user: &str) -> Option<&'static str> {
+        if self.thread_closed {
+            return Some("thread_closed");
+        }
+        (self.roles.get(user) == Some(&Role::Viewer)).then_some("read_only")
+    }
+
     fn live(&self, path: &str) -> Option<&TreeEntry> {
         self.tree.iter().find(|e| e.path == path && !e.deleted)
     }
@@ -644,301 +709,332 @@ impl Hub {
         };
         let (user, client) = (c.user.clone(), c.client.clone());
         match message {
-            Message::Text(text) => match serde_json::from_str::<ClientControl>(&text) {
-                Ok(ClientControl::Hello {
-                    client_id, since, ..
-                }) => {
-                    if since > self.head() {
-                        if let Some(c) = self.conns.get_mut(&conn) {
-                            c.client = None;
+            Message::Text(text) => {
+                let parsed = serde_json::from_str::<ClientControl>(&text);
+                if let Ok(frame) = &parsed {
+                    let reads = matches!(
+                        frame,
+                        ClientControl::Hello { .. } | ClientControl::Checksum { .. }
+                    );
+                    if !reads && client.is_some() {
+                        if let Some(code) = self.write_refusal(&user) {
+                            return self.nack(conn, frame.client_seq(), code);
                         }
-                        return self.reply(
-                            conn,
-                            &ServerControl::ResyncRequired {
-                                head: self.head(),
-                                reason: "ahead".into(),
-                            },
-                        );
                     }
-                    let last = self
-                        .journal
-                        .iter()
-                        .filter(|j| j.author == user && j.client == client_id)
-                        .map(|j| j.client_seq)
-                        .max()
-                        .unwrap_or(0);
-                    self.reply(
+                }
+                self.control(conn, user, client, parsed);
+            }
+            Message::Binary(bytes) => self.binary(conn, user, client, bytes),
+        }
+    }
+
+    fn control(
+        &mut self,
+        conn: u64,
+        user: String,
+        client: Option<String>,
+        parsed: Result<ClientControl, serde_json::Error>,
+    ) {
+        match parsed {
+            Ok(ClientControl::Hello {
+                client_id, since, ..
+            }) => {
+                if since > self.head() {
+                    if let Some(c) = self.conns.get_mut(&conn) {
+                        c.client = None;
+                    }
+                    return self.reply(
                         conn,
-                        &ServerControl::Welcome {
-                            protocol: wire::PROTOCOL_VERSION,
-                            thread_id: "fake-thread".into(),
-                            workspace_id: "fake-workspace".into(),
-                            org_id: "fake-org".into(),
-                            role: Role::Participant,
-                            head: self.journal.len() as u64,
-                            last_client_seq: last,
+                        &ServerControl::ResyncRequired {
+                            head: self.head(),
+                            reason: "ahead".into(),
                         },
                     );
-                    let tx = self.conns[&conn].tx.clone();
-                    // Behind a compaction: the snapshots, the tree, then the tail.
-                    let mut from = since;
-                    if since < self.compacted_through {
-                        let files = self
-                            .tree
-                            .iter()
-                            .filter_map(|e| {
-                                self.store.snapshot(e.file_id).map(|s| wire::SnapshotFile {
-                                    file_id: e.file_id,
-                                    bytes: s.len() as u64,
-                                })
+                }
+                let last = self
+                    .journal
+                    .iter()
+                    .filter(|j| j.author == user && j.client == client_id)
+                    .map(|j| j.client_seq)
+                    .max()
+                    .unwrap_or(0);
+                self.reply(
+                    conn,
+                    &ServerControl::Welcome {
+                        protocol: wire::PROTOCOL_VERSION,
+                        thread_id: "fake-thread".into(),
+                        workspace_id: "fake-workspace".into(),
+                        org_id: "fake-org".into(),
+                        user_id: Some(user.clone()),
+                        role: self.roles.get(&user).copied().unwrap_or(Role::Participant),
+                        head: self.journal.len() as u64,
+                        last_client_seq: last,
+                    },
+                );
+                let tx = self.conns[&conn].tx.clone();
+                // Behind a compaction: the snapshots, the tree, then the tail.
+                let mut from = since;
+                if since < self.compacted_through {
+                    let files = self
+                        .tree
+                        .iter()
+                        .filter_map(|e| {
+                            self.store.snapshot(e.file_id).map(|s| wire::SnapshotFile {
+                                file_id: e.file_id,
+                                bytes: s.len() as u64,
                             })
-                            .collect();
-                        let _ = tx.send(Message::Text(
-                            serde_json::to_string(&ServerControl::Snapshot {
-                                through: self.compacted_through,
-                                files,
-                            })
-                            .expect("json"),
-                        ));
-                        let mut sent = std::collections::HashSet::new();
-                        for j in self.journal.iter().filter(|j| j.seq <= self.compacted_through) {
-                            let Some(entry) = &j.tree else { continue };
-                            if !sent.insert(entry.file_id) {
-                                continue;
-                            }
-                            let current = self
-                                .tree
-                                .iter()
-                                .find(|e| e.file_id == entry.file_id)
-                                .unwrap_or(entry)
-                                .clone();
-                            let _ = tx.send(Message::Text(
-                                serde_json::to_string(&ServerControl::Tree {
-                                    seq: j.seq,
-                                    entry: current,
-                                })
-                                .expect("json"),
-                            ));
-                        }
-                        from = self.compacted_through;
-                    }
-                    for j in self.journal.iter().filter(|j| j.seq > from) {
-                        let message = match (&j.tree, &j.frame) {
-                            (Some(entry), _) => Message::Text(
-                                serde_json::to_string(&ServerControl::Tree {
-                                    seq: j.seq,
-                                    entry: self
-                                        .tree
-                                        .iter()
-                                        .find(|e| e.file_id == entry.file_id)
-                                        .unwrap_or(entry)
-                                        .clone(),
-                                })
-                                .expect("json"),
-                            ),
-                            (None, Some(frame)) => {
-                                Message::Binary(wire::encode(frame).expect("encode"))
-                            }
-                            _ => continue,
-                        };
-                        let _ = tx.send(message);
-                    }
+                        })
+                        .collect();
                     let _ = tx.send(Message::Text(
-                        serde_json::to_string(&ServerControl::Synced {
-                            head: self.journal.len() as u64,
+                        serde_json::to_string(&ServerControl::Snapshot {
+                            through: self.compacted_through,
+                            files,
                         })
                         .expect("json"),
                     ));
-                    if let Some(c) = self.conns.get_mut(&conn) {
-                        c.client = Some(client_id);
-                    }
-                }
-                Ok(ClientControl::Checksum {
-                    client_seq,
-                    at,
-                    files,
-                }) => {
-                    if at > self.head() || at < self.compacted_through {
-                        return self.reply(
-                            conn,
-                            &ServerControl::ChecksumResult {
-                                client_seq,
-                                at,
-                                status: wire::ChecksumStatus::Unavailable,
-                                mismatched: Vec::new(),
-                                unverifiable: Vec::new(),
-                            },
-                        );
-                    }
-                    let mismatched: Vec<u64> = files
+                    let mut sent = std::collections::HashSet::new();
+                    for j in self
+                        .journal
                         .iter()
-                        .filter(|f| self.hash_at(f.file_id, at).as_deref() != Some(f.hash.as_str()))
-                        .map(|f| f.file_id)
-                        .collect();
-                    let status = if mismatched.is_empty() {
-                        wire::ChecksumStatus::Match
-                    } else {
-                        wire::ChecksumStatus::Mismatch
+                        .filter(|j| j.seq <= self.compacted_through)
+                    {
+                        let Some(entry) = &j.tree else { continue };
+                        if !sent.insert(entry.file_id) {
+                            continue;
+                        }
+                        let current = self
+                            .tree
+                            .iter()
+                            .find(|e| e.file_id == entry.file_id)
+                            .unwrap_or(entry)
+                            .clone();
+                        let _ = tx.send(Message::Text(
+                            serde_json::to_string(&ServerControl::Tree {
+                                seq: j.seq,
+                                entry: current,
+                            })
+                            .expect("json"),
+                        ));
+                    }
+                    from = self.compacted_through;
+                }
+                for j in self.journal.iter().filter(|j| j.seq > from) {
+                    let message = match (&j.tree, &j.frame) {
+                        (Some(entry), _) => Message::Text(
+                            serde_json::to_string(&ServerControl::Tree {
+                                seq: j.seq,
+                                entry: self
+                                    .tree
+                                    .iter()
+                                    .find(|e| e.file_id == entry.file_id)
+                                    .unwrap_or(entry)
+                                    .clone(),
+                            })
+                            .expect("json"),
+                        ),
+                        (None, Some(frame)) => {
+                            Message::Binary(wire::encode(frame).expect("encode"))
+                        }
+                        _ => continue,
                     };
-                    self.reply(
+                    let _ = tx.send(message);
+                }
+                let _ = tx.send(Message::Text(
+                    serde_json::to_string(&ServerControl::Synced {
+                        head: self.journal.len() as u64,
+                    })
+                    .expect("json"),
+                ));
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.client = Some(client_id);
+                }
+            }
+            Ok(ClientControl::Checksum {
+                client_seq,
+                at,
+                files,
+            }) => {
+                if at > self.head() || at < self.compacted_through {
+                    return self.reply(
                         conn,
                         &ServerControl::ChecksumResult {
                             client_seq,
                             at,
-                            status,
-                            mismatched,
+                            status: wire::ChecksumStatus::Unavailable,
+                            mismatched: Vec::new(),
                             unverifiable: Vec::new(),
                         },
                     );
                 }
-                Ok(ClientControl::BundleRequest { client_seq, have }) => {
-                    if client.is_none() {
-                        return;
-                    }
-                    self.next_request += 1;
-                    let request_id = format!("request-{}", self.next_request);
-                    self.reply(
-                        conn,
-                        &ServerControl::BundlePending {
-                            client_seq,
-                            request_id: request_id.clone(),
-                        },
-                    );
-                    let held: std::collections::HashSet<&String> = have.iter().collect();
-                    let cached = self
-                        .store
-                        .bundles()
-                        .into_iter()
-                        .find(|(_, b)| b.prerequisites.iter().all(|p| held.contains(p)));
-                    if let Some((sha, bundle)) = cached {
-                        return self.reply(
-                            conn,
-                            &ServerControl::BundleAvailable {
-                                request_id,
-                                sha,
-                                bytes: bundle.bytes.len() as u64,
-                            },
-                        );
-                    }
-                    let wanted = ServerControl::BundleWanted {
+                let mismatched: Vec<u64> = files
+                    .iter()
+                    .filter(|f| self.hash_at(f.file_id, at).as_deref() != Some(f.hash.as_str()))
+                    .map(|f| f.file_id)
+                    .collect();
+                let status = if mismatched.is_empty() {
+                    wire::ChecksumStatus::Match
+                } else {
+                    wire::ChecksumStatus::Mismatch
+                };
+                self.reply(
+                    conn,
+                    &ServerControl::ChecksumResult {
+                        client_seq,
+                        at,
+                        status,
+                        mismatched,
+                        unverifiable: Vec::new(),
+                    },
+                );
+            }
+            Ok(ClientControl::BundleRequest { client_seq, have }) => {
+                if client.is_none() {
+                    return;
+                }
+                self.next_request += 1;
+                let request_id = format!("request-{}", self.next_request);
+                self.reply(
+                    conn,
+                    &ServerControl::BundlePending {
+                        client_seq,
                         request_id: request_id.clone(),
-                        have,
-                    };
-                    let builders: Vec<u64> = self
-                        .conns
+                    },
+                );
+                let held: std::collections::HashSet<&String> = have.iter().collect();
+                let cached = self
+                    .store
+                    .bundles()
+                    .into_iter()
+                    .find(|(_, b)| b.prerequisites.iter().all(|p| held.contains(p)));
+                if let Some((sha, bundle)) = cached {
+                    return self.reply(
+                        conn,
+                        &ServerControl::BundleAvailable {
+                            request_id,
+                            sha,
+                            bytes: bundle.bytes.len() as u64,
+                        },
+                    );
+                }
+                let wanted = ServerControl::BundleWanted {
+                    request_id: request_id.clone(),
+                    have,
+                };
+                let builders: Vec<u64> = self
+                    .conns
+                    .iter()
+                    .filter(|(id, c)| **id != conn && c.client.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                if builders.is_empty() {
+                    return self.reply(
+                        conn,
+                        &ServerControl::BundleUnavailable {
+                            request_id,
+                            reason: BundleFailure::NoReplicaOnline,
+                            bytes: None,
+                        },
+                    );
+                }
+                self.bundle_requests.insert(request_id, conn);
+                for b in builders {
+                    self.reply(b, &wanted);
+                }
+            }
+            Ok(ClientControl::BundleReady {
+                client_seq,
+                request_id,
+                sha,
+            }) => {
+                let Some(bundle) = self.store.bundle(&sha) else {
+                    return self.nack(conn, client_seq, "blob_missing");
+                };
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq: self.head(),
+                        file_id: None,
+                    },
+                );
+                if let Some(asker) = self.bundle_requests.remove(&request_id) {
+                    self.reply(
+                        asker,
+                        &ServerControl::BundleAvailable {
+                            request_id,
+                            sha,
+                            bytes: bundle.bytes.len() as u64,
+                        },
+                    );
+                }
+            }
+            Ok(ClientControl::BundleFailed {
+                client_seq,
+                request_id,
+                reason,
+                bytes,
+            }) => {
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq: self.head(),
+                        file_id: None,
+                    },
+                );
+                if let Some(asker) = self.bundle_requests.remove(&request_id) {
+                    self.reply(
+                        asker,
+                        &ServerControl::BundleUnavailable {
+                            request_id,
+                            reason,
+                            bytes: Some(bytes),
+                        },
+                    );
+                }
+            }
+            Ok(ClientControl::TreeEnsure {
+                client_seq,
+                path,
+                kind,
+                ..
+            }) => {
+                let Some(client) = client else { return };
+                // A deleted file at this path comes back under its id.
+                if self.live(&path).is_none() {
+                    let gone = self
+                        .tree
                         .iter()
-                        .filter(|(id, c)| **id != conn && c.client.is_some())
-                        .map(|(id, _)| *id)
-                        .collect();
-                    if builders.is_empty() {
-                        return self.reply(
-                            conn,
-                            &ServerControl::BundleUnavailable {
-                                request_id,
-                                reason: BundleFailure::NoReplicaOnline,
-                                bytes: None,
-                            },
-                        );
-                    }
-                    self.bundle_requests.insert(request_id, conn);
-                    for b in builders {
-                        self.reply(b, &wanted);
-                    }
-                }
-                Ok(ClientControl::BundleReady {
-                    client_seq,
-                    request_id,
-                    sha,
-                }) => {
-                    let Some(bundle) = self.store.bundle(&sha) else {
-                        return self.nack(conn, client_seq, "blob_missing");
-                    };
-                    self.reply(
-                        conn,
-                        &ServerControl::Ack {
-                            client_seq,
-                            seq: self.head(),
-                            file_id: None,
-                        },
-                    );
-                    if let Some(asker) = self.bundle_requests.remove(&request_id) {
-                        self.reply(
-                            asker,
-                            &ServerControl::BundleAvailable {
-                                request_id,
-                                sha,
-                                bytes: bundle.bytes.len() as u64,
-                            },
-                        );
-                    }
-                }
-                Ok(ClientControl::BundleFailed {
-                    client_seq,
-                    request_id,
-                    reason,
-                    bytes,
-                }) => {
-                    self.reply(
-                        conn,
-                        &ServerControl::Ack {
-                            client_seq,
-                            seq: self.head(),
-                            file_id: None,
-                        },
-                    );
-                    if let Some(asker) = self.bundle_requests.remove(&request_id) {
-                        self.reply(
-                            asker,
-                            &ServerControl::BundleUnavailable {
-                                request_id,
-                                reason,
-                                bytes: Some(bytes),
-                            },
-                        );
-                    }
-                }
-                Ok(ClientControl::TreeEnsure {
-                    client_seq,
-                    path,
-                    kind,
-                    ..
-                }) => {
-                    let Some(client) = client else { return };
-                    // A deleted file at this path comes back under its id.
-                    if self.live(&path).is_none() {
-                        let gone = self
-                            .tree
-                            .iter()
-                            .rev()
-                            .find(|e| e.path == path && e.deleted && e.kind == kind)
-                            .map(|e| e.file_id);
-                        if let Some(file_id) = gone {
-                            self.tree_change(conn, user, client, client_seq, file_id, |e| {
-                                e.deleted = false;
-                            });
-                            return;
-                        }
-                    }
-                    if let Some(existing) = self.live(&path) {
-                        let seq = self
-                            .journal
-                            .iter()
-                            .find(|j| j.tree.as_ref() == Some(existing))
-                            .map_or(0, |j| j.seq);
-                        let file_id = existing.file_id;
-                        self.reply(
-                            conn,
-                            &ServerControl::Ack {
-                                client_seq,
-                                seq,
-                                file_id: Some(file_id),
-                            },
-                        );
+                        .rev()
+                        .find(|e| e.path == path && e.deleted && e.kind == kind)
+                        .map(|e| e.file_id);
+                    if let Some(file_id) = gone {
+                        self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                            e.deleted = false;
+                        });
                         return;
                     }
-                    if let Some(limit) = self.touched_files {
-                        if self.tree.len() >= limit {
-                            return self.reply(
+                }
+                if let Some(existing) = self.live(&path) {
+                    let seq = self
+                        .journal
+                        .iter()
+                        .find(|j| j.tree.as_ref() == Some(existing))
+                        .map_or(0, |j| j.seq);
+                    let file_id = existing.file_id;
+                    self.reply(
+                        conn,
+                        &ServerControl::Ack {
+                            client_seq,
+                            seq,
+                            file_id: Some(file_id),
+                        },
+                    );
+                    return;
+                }
+                if let Some(limit) = self.touched_files {
+                    if self.tree.len() >= limit {
+                        return self.reply(
                                 conn,
                                 &ServerControl::Nack {
                                     client_seq,
@@ -949,131 +1045,106 @@ impl Hub {
                                     ),
                                 },
                             );
-                        }
                     }
-                    let seq = self.journal.len() as u64 + 1;
-                    let entry = TreeEntry {
-                        file_id: self.tree.len() as u64 + 1,
-                        path,
-                        kind,
-                        merge_version: Some(0),
-                        blob: None,
-                        deleted: false,
-                        origin: None,
-                    };
-                    self.tree.push(entry.clone());
-                    self.journal.push(Journaled {
-                        seq,
-                        tree: Some(entry.clone()),
-                        frame: None,
-                        author: user,
-                        client,
-                        client_seq,
-                    });
-                    self.reply(
-                        conn,
-                        &ServerControl::Ack {
-                            client_seq,
-                            seq,
-                            file_id: Some(entry.file_id),
-                        },
-                    );
-                    let relayed = ServerControl::Tree { seq, entry };
-                    self.relay(
-                        conn,
-                        Message::Text(serde_json::to_string(&relayed).expect("json")),
-                    );
                 }
-                Ok(ClientControl::TreeRename {
-                    client_seq,
-                    file_id,
+                let seq = self.journal.len() as u64 + 1;
+                let entry = TreeEntry {
+                    file_id: self.tree.len() as u64 + 1,
                     path,
-                }) => {
-                    let Some(client) = client else { return };
-                    if self.live(&path).is_some_and(|e| e.file_id != file_id) {
-                        return self.nack(conn, client_seq, "path_taken");
-                    }
-                    if self.tree.iter().any(|e| e.file_id == file_id && e.deleted) {
-                        return self.nack(conn, client_seq, "unknown_file");
-                    }
-                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
-                        if e.origin.is_none() {
-                            e.origin = Some(e.path.clone());
-                        }
-                        e.path = path;
-                        if e.origin.as_deref() == Some(e.path.as_str()) {
-                            e.origin = None;
-                        }
-                    });
-                }
-                Ok(ClientControl::TreeDelete { client_seq, file_id }) => {
-                    let Some(client) = client else { return };
-                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
-                        e.deleted = true;
-                    });
-                }
-                Ok(ClientControl::BlobSet {
+                    kind,
+                    merge_version: Some(0),
+                    blob: None,
+                    deleted: false,
+                    origin: None,
+                };
+                self.tree.push(entry.clone());
+                self.journal.push(Journaled {
+                    seq,
+                    tree: Some(entry.clone()),
+                    frame: None,
+                    author: user,
+                    client,
                     client_seq,
-                    file_id,
-                    blob,
-                }) => {
-                    let Some(client) = client else { return };
-                    match self.tree.iter().find(|e| e.file_id == file_id) {
-                        Some(e) if e.kind != FileKind::Binary => {
-                            return self.nack(conn, client_seq, "unsupported_kind")
-                        }
-                        Some(e) if e.deleted => return self.nack(conn, client_seq, "unknown_file"),
-                        _ => {}
-                    }
-                    if self.store.blob(&blob).is_none() {
-                        return self.nack(conn, client_seq, "blob_missing");
-                    }
-                    self.tree_change(conn, user, client, client_seq, file_id, |e| {
-                        e.blob = Some(blob);
-                    });
+                });
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq,
+                        file_id: Some(entry.file_id),
+                    },
+                );
+                let relayed = ServerControl::Tree { seq, entry };
+                self.relay(
+                    conn,
+                    Message::Text(serde_json::to_string(&relayed).expect("json")),
+                );
+            }
+            Ok(ClientControl::TreeRename {
+                client_seq,
+                file_id,
+                path,
+            }) => {
+                let Some(client) = client else { return };
+                if self.live(&path).is_some_and(|e| e.file_id != file_id) {
+                    return self.nack(conn, client_seq, "path_taken");
                 }
-                Ok(ClientControl::RunStart {
-                    client_seq,
-                    run_id,
-                    agent,
-                    model,
-                    fork_seq,
-                    context_anchor,
-                }) => {
-                    let Some(client) = client else { return };
-                    if let Some(existing) = self.runs.iter().find(|r| r.run.run_id == run_id) {
-                        if existing.run.runner_id != user {
-                            return self.nack(conn, client_seq, "run_conflict");
-                        }
-                        let run = existing.run.clone();
-                        self.reply(
-                            conn,
-                            &ServerControl::Ack {
-                                client_seq,
-                                seq: self.head(),
-                                file_id: None,
-                            },
-                        );
-                        return self.reply(conn, &ServerControl::Run { run });
+                if self.tree.iter().any(|e| e.file_id == file_id && e.deleted) {
+                    return self.nack(conn, client_seq, "unknown_file");
+                }
+                self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                    if e.origin.is_none() {
+                        e.origin = Some(e.path.clone());
                     }
-                    let run = ThreadRun {
-                        run_id,
-                        run_no: self.runs.len() as u64 + 1,
-                        prompted_by: user.clone(),
-                        runner_id: user,
-                        agent,
-                        model,
-                        fork_seq,
-                        context_anchor,
-                        status: "running".into(),
-                        started_at: 1,
-                        ended_at: None,
-                        merged_version: None,
-                    };
-                    self.runs.push(FakeRun {
-                        run: run.clone(),
-                        runner_client: client,
-                    });
+                    e.path = path;
+                    if e.origin.as_deref() == Some(e.path.as_str()) {
+                        e.origin = None;
+                    }
+                });
+            }
+            Ok(ClientControl::TreeDelete {
+                client_seq,
+                file_id,
+            }) => {
+                let Some(client) = client else { return };
+                self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                    e.deleted = true;
+                });
+            }
+            Ok(ClientControl::BlobSet {
+                client_seq,
+                file_id,
+                blob,
+            }) => {
+                let Some(client) = client else { return };
+                match self.tree.iter().find(|e| e.file_id == file_id) {
+                    Some(e) if e.kind != FileKind::Binary => {
+                        return self.nack(conn, client_seq, "unsupported_kind")
+                    }
+                    Some(e) if e.deleted => return self.nack(conn, client_seq, "unknown_file"),
+                    _ => {}
+                }
+                if self.store.blob(&blob).is_none() {
+                    return self.nack(conn, client_seq, "blob_missing");
+                }
+                self.tree_change(conn, user, client, client_seq, file_id, |e| {
+                    e.blob = Some(blob);
+                });
+            }
+            Ok(ClientControl::RunStart {
+                client_seq,
+                run_id,
+                agent,
+                model,
+                fork_seq,
+                context_anchor,
+            }) => {
+                let Some(client) = client else { return };
+                if let Some(existing) = self.runs.iter().find(|r| r.run.run_id == run_id) {
+                    if existing.run.runner_id != user {
+                        return self.nack(conn, client_seq, "run_conflict");
+                    }
+                    let run = existing.run.clone();
                     self.reply(
                         conn,
                         &ServerControl::Ack {
@@ -1082,247 +1153,275 @@ impl Hub {
                             file_id: None,
                         },
                     );
-                    self.broadcast(&ServerControl::Run { run });
+                    return self.reply(conn, &ServerControl::Run { run });
                 }
-                Ok(ClientControl::RunEnd {
-                    client_seq,
+                let run = ThreadRun {
                     run_id,
-                    outcome,
-                }) => {
-                    let head = self.head();
-                    let Some(r) = self.run_mut(&run_id) else {
-                        return self.nack(conn, client_seq, "run_unknown");
-                    };
-                    if r.run.runner_id != user {
-                        return self.nack(conn, client_seq, "not_runner");
-                    }
-                    if r.run.status == "running" {
-                        r.run.status = match (outcome, r.run.merged_version) {
-                            (RunOutcome::Interrupted, _) => "interrupted",
-                            (RunOutcome::Completed, Some(_)) => "merged",
-                            (RunOutcome::Completed, None) => "ended",
-                        }
-                        .into();
-                        r.run.ended_at = Some(2);
-                    }
-                    let run = r.run.clone();
-                    self.reply(
-                        conn,
-                        &ServerControl::Ack {
-                            client_seq,
-                            seq: head,
-                            file_id: None,
-                        },
-                    );
-                    self.broadcast(&ServerControl::Run { run });
-                }
-                Ok(ClientControl::MergeSubmit {
-                    client_seq,
-                    run_id,
-                    files,
-                }) => {
-                    let Some(client) = client else { return };
-                    if let Some((file_id, update)) = self.racing_merge.take() {
-                        self.land_racing_merge(file_id, update);
-                    }
-                    let key = (user.clone(), client.clone(), client_seq);
-                    if let Some(prior) = self.merges.get(&key) {
-                        return self.reply(conn, &prior.clone());
-                    }
-                    match self.runs.iter().find(|r| r.run.run_id == run_id) {
-                        None => return self.nack(conn, client_seq, "run_unknown"),
-                        Some(r) if r.run.runner_id != user => {
-                            return self.nack(conn, client_seq, "not_runner")
-                        }
-                        Some(r) if r.run.status != "running" => {
-                            return self.nack(conn, client_seq, "run_unknown")
-                        }
-                        Some(_) => {}
-                    }
-                    let current = |id: u64| {
-                        self.tree
-                            .iter()
-                            .find(|e| e.file_id == id)
-                            .map(|e| e.merge_version.unwrap_or(0))
-                    };
-                    if files.iter().any(|f| current(f.file_id).is_none()) {
-                        return self.nack(conn, client_seq, "unknown_file");
-                    }
-                    if files
-                        .iter()
-                        .any(|f| current(f.file_id) != Some(f.base_version))
-                    {
-                        let versions = files
-                            .iter()
-                            .map(|f| FileVersion {
-                                file_id: f.file_id,
-                                version: current(f.file_id).unwrap_or(0),
-                            })
-                            .collect();
-                        return self.reply(
-                            conn,
-                            &ServerControl::MergeRejected {
-                                client_seq,
-                                run_id,
-                                versions,
-                            },
-                        );
-                    }
-                    let mut stored = Vec::new();
-                    let mut landed = Vec::new();
-                    let merge_client = format!("{client}#merge{client_seq}");
-                    for (i, f) in files.iter().enumerate() {
-                        let Ok(update) =
-                            base64::engine::general_purpose::STANDARD.decode(&f.update)
-                        else {
-                            return self.nack(conn, client_seq, "bad_frame");
-                        };
-                        let seq = self.journal.len() as u64 + 1;
-                        let frame = Frame {
-                            seq,
-                            ..Frame::update(f.file_id, 0, update)
-                        };
-                        self.journal.push(Journaled {
-                            seq,
-                            tree: None,
-                            frame: Some(frame.clone()),
-                            author: user.clone(),
-                            client: merge_client.clone(),
-                            client_seq: i as u64 + 1,
-                        });
-                        let entry = self
-                            .tree
-                            .iter_mut()
-                            .find(|e| e.file_id == f.file_id)
-                            .expect("checked above");
-                        let version = entry.merge_version.unwrap_or(0) + 1;
-                        entry.merge_version = Some(version);
-                        landed.push(FileVersion {
-                            file_id: f.file_id,
-                            version,
-                        });
-                        stored.push(frame);
-                    }
-                    let version = self.head();
-                    if let Some(r) = self.run_mut(&run_id) {
-                        r.run.merged_version = Some(version);
-                    }
-                    let accepted = ServerControl::MergeAccepted {
-                        client_seq,
-                        run_id: run_id.clone(),
-                        version,
-                        files: landed.clone(),
-                    };
-                    self.merges.insert(key, accepted.clone());
-                    self.reply(conn, &accepted);
-                    for frame in &stored {
-                        self.relay(conn, Message::Binary(wire::encode(frame).expect("encode")));
-                    }
-                    let merged = ServerControl::Merged {
-                        run_id,
-                        version,
-                        files: landed
-                            .iter()
-                            .zip(&files)
-                            .map(|(l, f)| MergedFile {
-                                file_id: l.file_id,
-                                version: l.version,
-                                blob: f.blob.clone(),
-                            })
-                            .collect(),
-                    };
-                    self.relay(
-                        conn,
-                        Message::Text(serde_json::to_string(&merged).expect("json")),
-                    );
-                }
-                Err(_) => {}
-            },
-            Message::Binary(bytes) => {
-                let Some(client) = client else { return };
-                let Some(frame) = wire::decode(&bytes) else {
-                    return;
+                    run_no: self.runs.len() as u64 + 1,
+                    prompted_by: user.clone(),
+                    runner_id: user,
+                    agent,
+                    model,
+                    fork_seq,
+                    context_anchor,
+                    status: "running".into(),
+                    started_at: 1,
+                    ended_at: None,
+                    merged_version: None,
                 };
-                if frame.kind == FrameKind::RunStream as u8
-                    || frame.kind == FrameKind::RunFile as u8
-                {
-                    let ours = self.runs.iter().any(|r| {
-                        r.run.run_no == frame.file_id
-                            && r.run.status == "running"
-                            && r.run.runner_id == user
-                            && r.runner_client == client
-                    });
-                    if !ours {
-                        return self.nack(conn, frame.client_seq, "run_unknown");
-                    }
-                    self.run_frames_relayed += 1;
-                    let relayed = Frame {
-                        seq: 0,
-                        client_seq: 0,
-                        ..frame
-                    };
-                    return self.relay(
-                        conn,
-                        Message::Binary(wire::encode(&relayed).expect("encode")),
-                    );
-                }
-                if frame.kind != FrameKind::CanonicalUpdate as u8 {
-                    return;
-                }
-                if self
-                    .tree
-                    .iter()
-                    .any(|e| e.file_id == frame.file_id && e.kind != FileKind::Text)
-                {
-                    return self.nack(conn, frame.client_seq, "unsupported_kind");
-                }
-                self.received_updates += 1;
-                if let Some(prior) = self.prior(&user, &client, frame.client_seq) {
-                    let seq = prior.seq;
-                    self.reply(
-                        conn,
-                        &ServerControl::Ack {
-                            client_seq: frame.client_seq,
-                            seq,
-                            file_id: None,
-                        },
-                    );
-                    return;
-                }
-                let seq = self.journal.len() as u64 + 1;
-                let stored = Frame {
-                    seq,
-                    client_seq: 0,
-                    ..frame.clone()
-                };
-                self.journal.push(Journaled {
-                    seq,
-                    tree: None,
-                    frame: Some(stored.clone()),
-                    author: user,
-                    client,
-                    client_seq: frame.client_seq,
+                self.runs.push(FakeRun {
+                    run: run.clone(),
+                    runner_client: client,
                 });
                 self.reply(
                     conn,
                     &ServerControl::Ack {
-                        client_seq: frame.client_seq,
-                        seq,
+                        client_seq,
+                        seq: self.head(),
                         file_id: None,
                     },
                 );
-                let bytes = wire::encode(&stored).expect("encode");
-                let lose = self.lose_next_to.take();
-                for (id, c) in &self.conns {
-                    if *id == conn || c.client.is_none() {
-                        continue;
-                    }
-                    if lose.as_deref() == Some(c.user.as_str()) {
-                        continue;
-                    }
-                    let _ = c.tx.send(Message::Binary(bytes.clone()));
-                }
+                self.broadcast(&ServerControl::Run { run });
             }
+            Ok(ClientControl::RunEnd {
+                client_seq,
+                run_id,
+                outcome,
+            }) => {
+                let head = self.head();
+                let Some(r) = self.run_mut(&run_id) else {
+                    return self.nack(conn, client_seq, "run_unknown");
+                };
+                if r.run.runner_id != user {
+                    return self.nack(conn, client_seq, "not_runner");
+                }
+                if r.run.status == "running" {
+                    r.run.status = match (outcome, r.run.merged_version) {
+                        (RunOutcome::Interrupted, _) => "interrupted",
+                        (RunOutcome::Completed, Some(_)) => "merged",
+                        (RunOutcome::Completed, None) => "ended",
+                    }
+                    .into();
+                    r.run.ended_at = Some(2);
+                }
+                let run = r.run.clone();
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq: head,
+                        file_id: None,
+                    },
+                );
+                self.broadcast(&ServerControl::Run { run });
+            }
+            Ok(ClientControl::MergeSubmit {
+                client_seq,
+                run_id,
+                files,
+            }) => {
+                let Some(client) = client else { return };
+                if let Some((file_id, update)) = self.racing_merge.take() {
+                    self.land_racing_merge(file_id, update);
+                }
+                let key = (user.clone(), client.clone(), client_seq);
+                if let Some(prior) = self.merges.get(&key) {
+                    return self.reply(conn, &prior.clone());
+                }
+                match self.runs.iter().find(|r| r.run.run_id == run_id) {
+                    None => return self.nack(conn, client_seq, "run_unknown"),
+                    Some(r) if r.run.runner_id != user => {
+                        return self.nack(conn, client_seq, "not_runner")
+                    }
+                    Some(r) if r.run.status != "running" => {
+                        return self.nack(conn, client_seq, "run_unknown")
+                    }
+                    Some(_) => {}
+                }
+                let current = |id: u64| {
+                    self.tree
+                        .iter()
+                        .find(|e| e.file_id == id)
+                        .map(|e| e.merge_version.unwrap_or(0))
+                };
+                if files.iter().any(|f| current(f.file_id).is_none()) {
+                    return self.nack(conn, client_seq, "unknown_file");
+                }
+                if files
+                    .iter()
+                    .any(|f| current(f.file_id) != Some(f.base_version))
+                {
+                    let versions = files
+                        .iter()
+                        .map(|f| FileVersion {
+                            file_id: f.file_id,
+                            version: current(f.file_id).unwrap_or(0),
+                        })
+                        .collect();
+                    return self.reply(
+                        conn,
+                        &ServerControl::MergeRejected {
+                            client_seq,
+                            run_id,
+                            versions,
+                        },
+                    );
+                }
+                let mut stored = Vec::new();
+                let mut landed = Vec::new();
+                let merge_client = format!("{client}#merge{client_seq}");
+                for (i, f) in files.iter().enumerate() {
+                    let Ok(update) = base64::engine::general_purpose::STANDARD.decode(&f.update)
+                    else {
+                        return self.nack(conn, client_seq, "bad_frame");
+                    };
+                    let seq = self.journal.len() as u64 + 1;
+                    let frame = Frame {
+                        seq,
+                        ..Frame::update(f.file_id, 0, update)
+                    };
+                    self.journal.push(Journaled {
+                        seq,
+                        tree: None,
+                        frame: Some(frame.clone()),
+                        author: user.clone(),
+                        client: merge_client.clone(),
+                        client_seq: i as u64 + 1,
+                    });
+                    let entry = self
+                        .tree
+                        .iter_mut()
+                        .find(|e| e.file_id == f.file_id)
+                        .expect("checked above");
+                    let version = entry.merge_version.unwrap_or(0) + 1;
+                    entry.merge_version = Some(version);
+                    landed.push(FileVersion {
+                        file_id: f.file_id,
+                        version,
+                    });
+                    stored.push(frame);
+                }
+                let version = self.head();
+                if let Some(r) = self.run_mut(&run_id) {
+                    r.run.merged_version = Some(version);
+                }
+                let accepted = ServerControl::MergeAccepted {
+                    client_seq,
+                    run_id: run_id.clone(),
+                    version,
+                    files: landed.clone(),
+                };
+                self.merges.insert(key, accepted.clone());
+                self.reply(conn, &accepted);
+                for frame in &stored {
+                    self.relay(conn, Message::Binary(wire::encode(frame).expect("encode")));
+                }
+                let merged = ServerControl::Merged {
+                    run_id,
+                    version,
+                    files: landed
+                        .iter()
+                        .zip(&files)
+                        .map(|(l, f)| MergedFile {
+                            file_id: l.file_id,
+                            version: l.version,
+                            blob: f.blob.clone(),
+                        })
+                        .collect(),
+                };
+                self.relay(
+                    conn,
+                    Message::Text(serde_json::to_string(&merged).expect("json")),
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn binary(&mut self, conn: u64, user: String, client: Option<String>, bytes: Vec<u8>) {
+        let Some(client) = client else { return };
+        let Some(frame) = wire::decode(&bytes) else {
+            return;
+        };
+        if frame.kind == FrameKind::RunStream as u8 || frame.kind == FrameKind::RunFile as u8 {
+            let ours = self.runs.iter().any(|r| {
+                r.run.run_no == frame.file_id
+                    && r.run.status == "running"
+                    && r.run.runner_id == user
+                    && r.runner_client == client
+            });
+            if !ours {
+                return self.nack(conn, frame.client_seq, "run_unknown");
+            }
+            self.run_frames_relayed += 1;
+            let relayed = Frame {
+                seq: 0,
+                client_seq: 0,
+                ..frame
+            };
+            return self.relay(
+                conn,
+                Message::Binary(wire::encode(&relayed).expect("encode")),
+            );
+        }
+        if frame.kind != FrameKind::CanonicalUpdate as u8 {
+            return;
+        }
+        if let Some(code) = self.write_refusal(&user) {
+            return self.nack(conn, frame.client_seq, code);
+        }
+        if self
+            .tree
+            .iter()
+            .any(|e| e.file_id == frame.file_id && e.kind != FileKind::Text)
+        {
+            return self.nack(conn, frame.client_seq, "unsupported_kind");
+        }
+        self.received_updates += 1;
+        if let Some(prior) = self.prior(&user, &client, frame.client_seq) {
+            let seq = prior.seq;
+            self.reply(
+                conn,
+                &ServerControl::Ack {
+                    client_seq: frame.client_seq,
+                    seq,
+                    file_id: None,
+                },
+            );
+            return;
+        }
+        let seq = self.journal.len() as u64 + 1;
+        let stored = Frame {
+            seq,
+            client_seq: 0,
+            ..frame.clone()
+        };
+        self.journal.push(Journaled {
+            seq,
+            tree: None,
+            frame: Some(stored.clone()),
+            author: user,
+            client,
+            client_seq: frame.client_seq,
+        });
+        self.reply(
+            conn,
+            &ServerControl::Ack {
+                client_seq: frame.client_seq,
+                seq,
+                file_id: None,
+            },
+        );
+        let bytes = wire::encode(&stored).expect("encode");
+        let lose = self.lose_next_to.take();
+        for (id, c) in &self.conns {
+            if *id == conn || c.client.is_none() {
+                continue;
+            }
+            if lose.as_deref() == Some(c.user.as_str()) {
+                continue;
+            }
+            let _ = c.tx.send(Message::Binary(bytes.clone()));
         }
     }
 }

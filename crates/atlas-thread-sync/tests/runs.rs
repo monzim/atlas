@@ -9,14 +9,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use atlas_thread_sync::doc::{random_client_id, FileDoc};
-use atlas_thread_sync::FakeStore;
-use std::sync::Arc;
 use atlas_thread_sync::wire::FrameKind;
+use atlas_thread_sync::FakeStore;
 use atlas_thread_sync::{
     run, ActiveRun, Command as SyncCommand, FakeThreadServer, FakeTransport, RunSpec, RunWorktree,
     SessionError, SyncStatus, ThreadEvent, ThreadSession,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod common;
@@ -143,10 +143,7 @@ async fn two_runners_on_different_files_both_merge_and_the_next_fork_sees_it() {
 
     let joy_report = joy.finish_run(&joy_run, &joy_runs).await.unwrap();
     assert_eq!(joy_report.files, vec!["README.md".to_string()]);
-    let monzim_report = monzim
-        .finish_run(&monzim_run, &monzim_runs)
-        .await
-        .unwrap();
+    let monzim_report = monzim.finish_run(&monzim_run, &monzim_runs).await.unwrap();
     let mut files = monzim_report.files.clone();
     files.sort();
     assert_eq!(
@@ -258,10 +255,7 @@ async fn a_merge_that_already_arrived_is_merged_onto() {
     assert_eq!(server.merge_version(banner), Some(1));
     // Joy's merge had reached Monzim's socket before his turn ended, so his
     // merge is planned onto it from the start and lands first time.
-    let report = monzim
-        .finish_run(&monzim_run, &monzim_runs)
-        .await
-        .unwrap();
+    let report = monzim.finish_run(&monzim_run, &monzim_runs).await.unwrap();
     assert_eq!(report.retries, 0);
     assert_eq!(server.merge_version(banner), Some(2));
 

@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use atlas_thread_sync::{
-    run, Command as SyncCommand, FakeThreadServer, FakeTransport,
-    LocalChange, Replica, ReplicaError, SecretReason, SyncStatus, ThreadSession,
+    run, Command as SyncCommand, FakeThreadServer, FakeTransport, LocalChange, Replica,
+    ReplicaError, SecretReason, SyncStatus, ThreadSession,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 

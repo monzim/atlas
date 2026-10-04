@@ -36,6 +36,7 @@ import {
   type SharedThreadView,
 } from "../lib/shared-threads-api";
 import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
+import { OwnerPanel } from "./owner-panel";
 import { SharePreviewList, uploads } from "./share-preview";
 
 /** What the chat pane knows about the thread it shows. */
@@ -344,6 +345,7 @@ function ThreadCard({
         <Badge variant={status.connected ? "success" : "outline"}>
           {status.connected ? "Live" : "Offline"}
         </Badge>
+        {status.closed && <Badge variant="outline">Closed</Badge>}
         <Badge variant="secondary" className="capitalize">
           {thread.role}
         </Badge>
@@ -369,6 +371,18 @@ function ThreadCard({
           </span>
         </p>
       )}
+      {status.unsent.length > 0 && (
+        <div className="flex flex-col gap-1 rounded bg-[var(--atlas-element-hover)] p-2 text-[var(--secondary-foreground)]">
+          <span className="font-medium text-[var(--foreground)]">Kept on this machine, not shared</span>
+          {status.unsent.map((path) => (
+            <span key={path} className="font-mono">
+              {path}
+            </span>
+          ))}
+          <span>They are sent, merged with the thread, once you can edit again.</span>
+        </div>
+      )}
+      {thread.role === "owner" && !compact && <OwnerPanel sharedThreadId={thread.sharedThreadId} />}
       {status.historyWanted > 0 && !status.servesHistory && (
         <div className="flex flex-col gap-1.5 rounded bg-warning-muted p-2">
           <span className="text-[var(--foreground)]">

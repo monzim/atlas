@@ -48,12 +48,20 @@ async fn edits_made_while_disconnected_land_after_reconnect_and_both_converge() 
     // Monzim's network drops. He keeps working; so does Joy.
     server.cut("monzim");
     monzim.mark_disconnected();
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: teal;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: teal;\n}\n",
+    );
     assert_eq!(
         monzim.file_saved("src/banner.css").await.unwrap(),
         LocalChange::Buffered
     );
-    write(&monzim_root, "src/offline.ts", "export const offline = true;\n");
+    write(
+        &monzim_root,
+        "src/offline.ts",
+        "export const offline = true;\n",
+    );
     monzim.file_saved("src/offline.ts").await.unwrap();
     write(&joy_root, "notes.md", "todo: red?\ntodo: ship it\n");
     joy.file_saved("notes.md").await.unwrap();
@@ -63,13 +71,26 @@ async fn edits_made_while_disconnected_land_after_reconnect_and_both_converge() 
     monzim.reconnect(server.connect("monzim")).await.unwrap();
     assert!(monzim.is_connected());
     assert_eq!(monzim.offline_saves(), 0);
-    assert_eq!(read(&monzim_root, "notes.md"), "todo: red?\ntodo: ship it\n");
+    assert_eq!(
+        read(&monzim_root, "notes.md"),
+        "todo: red?\ntodo: ship it\n"
+    );
 
     joy.pump(QUIET).await.unwrap();
-    assert_eq!(read(&joy_root, "src/banner.css"), ".banner {\n  color: teal;\n}\n");
-    assert_eq!(read(&joy_root, "src/offline.ts"), "export const offline = true;\n");
+    assert_eq!(
+        read(&joy_root, "src/banner.css"),
+        ".banner {\n  color: teal;\n}\n"
+    );
+    assert_eq!(
+        read(&joy_root, "src/offline.ts"),
+        "export const offline = true;\n"
+    );
     for path in ["src/banner.css", "notes.md", "src/offline.ts"] {
-        assert_eq!(joy.replica().text(path), monzim.replica().text(path), "{path}");
+        assert_eq!(
+            joy.replica().text(path),
+            monzim.replica().text(path),
+            "{path}"
+        );
     }
 }
 
@@ -83,7 +104,11 @@ async fn an_update_whose_send_failed_is_resent_and_stored_once() {
     // The socket is already gone when the save goes out; nobody has told the
     // session yet.
     server.cut("monzim");
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: lost;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: lost;\n}\n",
+    );
     assert_eq!(
         monzim.file_saved("src/banner.css").await.unwrap(),
         LocalChange::Buffered
@@ -112,7 +137,11 @@ async fn a_replica_behind_a_compacted_range_catches_up_via_snapshot_plus_tail() 
     server.cut("monzim");
     monzim.mark_disconnected();
     for color in ["red", "orange", "purple"] {
-        write(&joy_root, "src/banner.css", &format!(".banner {{\n  color: {color};\n}}\n"));
+        write(
+            &joy_root,
+            "src/banner.css",
+            &format!(".banner {{\n  color: {color};\n}}\n"),
+        );
         joy.file_saved("src/banner.css").await.unwrap();
     }
     // Everything so far is folded into snapshots; then one more edit, the tail.
@@ -125,10 +154,20 @@ async fn a_replica_behind_a_compacted_range_catches_up_via_snapshot_plus_tail() 
         read(&monzim_root, "src/banner.css"),
         ".banner {\n  color: purple;\n}\n"
     );
-    assert_eq!(read(&monzim_root, "notes.md"), "todo: after the compaction\n");
+    assert_eq!(
+        read(&monzim_root, "notes.md"),
+        "todo: after the compaction\n"
+    );
 
     // Somebody new joins after the compaction, from nothing.
-    let mut late = open(&server, &w.monzim, &w.base, &w.replicas.join("late"), "late").await;
+    let mut late = open(
+        &server,
+        &w.monzim,
+        &w.base,
+        &w.replicas.join("late"),
+        "late",
+    )
+    .await;
     assert_eq!(
         late.replica().text("src/banner.css").unwrap(),
         ".banner {\n  color: purple;\n}\n"
@@ -147,10 +186,17 @@ async fn a_replica_ahead_of_the_thread_rebuilds_from_it_without_touching_the_che
     let monzim_root = monzim.replica().root().to_path_buf();
     let kept = server.head();
 
-    write(&joy_root, "src/banner.css", ".banner {\n  color: black;\n}\n");
+    write(
+        &joy_root,
+        "src/banner.css",
+        ".banner {\n  color: black;\n}\n",
+    );
     joy.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
-    assert_eq!(read(&monzim_root, "src/banner.css"), ".banner {\n  color: black;\n}\n");
+    assert_eq!(
+        read(&monzim_root, "src/banner.css"),
+        ".banner {\n  color: black;\n}\n"
+    );
 
     // The thread is restored to before that edit: Monzim saw changes it no
     // longer has.
@@ -163,7 +209,10 @@ async fn a_replica_ahead_of_the_thread_rebuilds_from_it_without_touching_the_che
     assert_eq!(monzim.replica().text("src/banner.css").unwrap(), GREEN);
     assert_eq!(read(&monzim_root, "src/banner.css"), GREEN);
     // His own checkout was never part of it.
-    assert_eq!(read(&w.monzim, "src/banner.css"), ".banner {\n  color: blue;\n}\n");
+    assert_eq!(
+        read(&w.monzim, "src/banner.css"),
+        ".banner {\n  color: blue;\n}\n"
+    );
 }
 
 #[tokio::test]
@@ -177,9 +226,17 @@ async fn a_corrupted_replica_is_detected_and_repaired_and_says_so() {
 
     // One of Joy's edits never reaches Monzim, and nothing says so.
     server.lose_next_update_to("monzim");
-    write(&joy_root, "src/banner.css", ".banner {\n  color: navy;\n}\n");
+    write(
+        &joy_root,
+        "src/banner.css",
+        ".banner {\n  color: navy;\n}\n",
+    );
     joy.file_saved("src/banner.css").await.unwrap();
-    write(&joy_root, "src/banner.css", ".banner {\n  color: navy;\n  margin: 0;\n}\n");
+    write(
+        &joy_root,
+        "src/banner.css",
+        ".banner {\n  color: navy;\n  margin: 0;\n}\n",
+    );
     joy.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
     assert_ne!(
@@ -241,7 +298,10 @@ async fn the_loop_redials_by_itself_and_sends_what_was_saved_offline() {
         if joy.replica().text("notes.md").as_deref() == Some("todo: written on a plane\n") {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "the offline save never arrived");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the offline save never arrived"
+        );
     }
     drop(commands);
 }
@@ -272,7 +332,11 @@ async fn a_resync_keeps_the_persons_offline_saves_and_sends_them() {
     let joy_root = joy.replica().root().to_path_buf();
     let monzim_root = monzim.replica().root().to_path_buf();
     let kept = server.head();
-    write(&joy_root, "src/banner.css", ".banner {\n  color: black;\n}\n");
+    write(
+        &joy_root,
+        "src/banner.css",
+        ".banner {\n  color: black;\n}\n",
+    );
     joy.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
 
@@ -286,8 +350,18 @@ async fn a_resync_keeps_the_persons_offline_saves_and_sends_them() {
 
     // The lost change is gone from his replica; his own edit is not.
     assert_eq!(read(&monzim_root, "src/banner.css"), GREEN);
-    assert_eq!(read(&monzim_root, "notes.md"), "todo: kept through a resync\n");
-    let mut late = open(&server, &w.monzim, &w.base, &w.replicas.join("late"), "late").await;
+    assert_eq!(
+        read(&monzim_root, "notes.md"),
+        "todo: kept through a resync\n"
+    );
+    let mut late = open(
+        &server,
+        &w.monzim,
+        &w.base,
+        &w.replicas.join("late"),
+        "late",
+    )
+    .await;
     late.pump(QUIET).await.unwrap();
     assert_eq!(
         late.replica().text("notes.md").unwrap(),
@@ -304,7 +378,11 @@ async fn an_edit_the_thread_lost_is_kept_beside_the_file_and_said() {
     let kept = server.head();
 
     // Monzim's edit reached the thread — and then the thread lost it.
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: violet;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: violet;\n}\n",
+    );
     monzim.file_saved("src/banner.css").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
     server.forget_after(kept);

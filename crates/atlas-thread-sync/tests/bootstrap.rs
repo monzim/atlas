@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_thread_sync::{
-    git, run, share, Bootstrapped, Command as SyncCommand, Message, Transport, FakeStore, FakeThreadServer, FakeTransport, LocalChange,
-    Replica, SecretReason, ShareKind, SyncStatus, ThreadRepo, ThreadSession,
+    git, run, share, Bootstrapped, Command as SyncCommand, FakeStore, FakeThreadServer,
+    FakeTransport, LocalChange, Message, Replica, SecretReason, ShareKind, SyncStatus, ThreadRepo,
+    ThreadSession, Transport,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -42,7 +43,12 @@ fn unpushed() -> Unpushed {
     let alice = root.join("alice");
     git(
         &root,
-        &["clone", "--quiet", joy.to_str().unwrap(), alice.to_str().unwrap()],
+        &[
+            "clone",
+            "--quiet",
+            joy.to_str().unwrap(),
+            alice.to_str().unwrap(),
+        ],
     );
 
     write(&joy, "src/feature.ts", "export const feature = 1;\n");
@@ -246,7 +252,10 @@ async fn the_share_preview_lists_exactly_what_uploads_and_blocks_secrets() {
     let env = &preview.files[1];
     assert_eq!(env.blocked, Some(SecretReason::Name));
     assert_eq!(preview.files[2].kind, ShareKind::Binary);
-    assert!(preview.files.iter().all(|f| f.path == ".env.local" || f.blocked.is_none()));
+    assert!(preview
+        .files
+        .iter()
+        .all(|f| f.path == ".env.local" || f.blocked.is_none()));
 
     // `.env.local` stays home by default …
     let held: Vec<&str> = preview.held(&[]).map(|f| f.path.as_str()).collect();
@@ -294,7 +303,10 @@ async fn ignored_files_never_sync_from_a_share_or_a_replica() {
 
     let mut joy = open(&server, &w.joy, &base, &w.replicas.join("joy"), "joy").await;
     let report = joy.share_working_changes(&w.joy, &[]).await.unwrap();
-    assert!(!report.shared.iter().any(|p| p == "debug.log" || p.starts_with("dist/")));
+    assert!(!report
+        .shared
+        .iter()
+        .any(|p| p == "debug.log" || p.starts_with("dist/")));
 
     let root = joy.materialize().await.unwrap();
     write(&root, "dist/out.js", "built();\n");
@@ -314,7 +326,9 @@ async fn ignored_files_never_sync_from_a_share_or_a_replica() {
     ));
     let paths: Vec<String> = server.tree().into_iter().map(|e| e.path).collect();
     assert!(paths.contains(&"src/new.ts".to_string()));
-    assert!(!paths.iter().any(|p| p.ends_with(".log") || p.starts_with("dist/")));
+    assert!(!paths
+        .iter()
+        .any(|p| p.ends_with(".log") || p.starts_with("dist/")));
 }
 
 #[tokio::test]
@@ -330,7 +344,9 @@ async fn a_files_base_content_is_uploaded_when_it_enters_the_thread() {
     joy.share_working_changes(&w.joy, &[]).await.unwrap();
     let base = b".banner {\n  color: blue;\n}\n";
     assert_eq!(
-        store.blob(&atlas_thread_sync::bootstrap::sha256_hex(base)).as_deref(),
+        store
+            .blob(&atlas_thread_sync::bootstrap::sha256_hex(base))
+            .as_deref(),
         Some(&base[..])
     );
     // `notes.md` is new since the Base: nothing to upload for it.
@@ -358,9 +374,10 @@ async fn history_is_sent_only_once_the_sharer_agrees() {
         let base = w.base.clone();
         tokio::spawn(async move {
             let replica = Replica::without_base(&base, &root.join("replicas/alice")).unwrap();
-            let mut alice = ThreadSession::open(server.connect("alice"), replica, "alice-replica-1")
-                .await
-                .unwrap();
+            let mut alice =
+                ThreadSession::open(server.connect("alice"), replica, "alice-replica-1")
+                    .await
+                    .unwrap();
             alice.set_store(Arc::new(server.store()));
             alice.set_thread_repo(ThreadRepo::at(&root.join("threads/alice")));
             alice.bootstrap(None).await.unwrap()
@@ -409,7 +426,10 @@ async fn a_secret_in_a_files_base_content_never_leaves_with_it() {
         .journaled_payloads()
         .iter()
         .any(|p| p.windows(key.len()).any(|w| w == key.as_bytes())));
-    assert_eq!(joy.replica().text("config/aws.ini").unwrap(), "aws_profile = default\n");
+    assert_eq!(
+        joy.replica().text("config/aws.ini").unwrap(),
+        "aws_profile = default\n"
+    );
 }
 
 #[tokio::test]
@@ -423,7 +443,10 @@ async fn a_stream_of_bundle_requests_is_answered_by_one_build_at_a_time() {
 
     // Three joiners ask at once, each with a different history.
     let mut askers = Vec::new();
-    for (n, have) in [vec![], vec!["a".repeat(40)], vec!["b".repeat(40)]].into_iter().enumerate() {
+    for (n, have) in [vec![], vec!["a".repeat(40)], vec!["b".repeat(40)]]
+        .into_iter()
+        .enumerate()
+    {
         let mut t = server.connect(&format!("asker{n}"));
         t.send(Message::Text(format!(
             r#"{{"t":"hello","protocol":1,"clientId":"asker-replica-{n}","since":0}}"#
@@ -437,7 +460,9 @@ async fn a_stream_of_bundle_requests_is_answered_by_one_build_at_a_time() {
         .unwrap();
         askers.push(t);
     }
-    joy.pump(std::time::Duration::from_millis(50)).await.unwrap();
+    joy.pump(std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
 
     // All three are answered by one full bundle — nobody starved by newer
     // requests — and the next build waits out the cooldown.
@@ -471,6 +496,8 @@ async fn a_stream_of_bundle_requests_is_answered_by_one_build_at_a_time() {
     ))
     .await
     .unwrap();
-    joy.pump(std::time::Duration::from_millis(50)).await.unwrap();
+    joy.pump(std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
     assert!(joy.take_bundle_wants().is_empty());
 }

@@ -100,7 +100,8 @@ async fn a_lockfile_over_one_megabyte_syncs_as_a_blob_not_as_text() {
     let server = FakeThreadServer::new();
     let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
 
-    let line = "\"resolved\": \"https://registry.npmjs.org/some-package/-/some-package-1.0.0.tgz\",\n";
+    let line =
+        "\"resolved\": \"https://registry.npmjs.org/some-package/-/some-package-1.0.0.tgz\",\n";
     let lockfile = line.repeat(1024 * 1024 / line.len() + 10);
     assert!(lockfile.len() > 1024 * 1024);
     let updates_before = server.updates_received();
@@ -160,7 +161,14 @@ async fn moving_a_file_is_a_rename_with_the_same_id_on_the_other_replica() {
 
     // Somebody checking out later gets the moved file — and not the Base's
     // copy at the old path.
-    let mut late = open(&server, &w.monzim, &w.base, &w.replicas.join("late"), "late").await;
+    let mut late = open(
+        &server,
+        &w.monzim,
+        &w.base,
+        &w.replicas.join("late"),
+        "late",
+    )
+    .await;
     let late_root = late.materialize().await.unwrap();
     assert!(late_root.join("src/brand.css").exists());
     assert!(!late_root.join("src/banner.css").exists());
@@ -183,7 +191,12 @@ async fn a_removal_reported_before_the_new_path_is_still_a_rename() {
     ));
     assert!(joy.settle_removals().await.unwrap().is_empty());
     assert_eq!(
-        server.tree().into_iter().find(|e| e.file_id == id).unwrap().path,
+        server
+            .tree()
+            .into_iter()
+            .find(|e| e.file_id == id)
+            .unwrap()
+            .path,
         "docs-notes.md"
     );
 }
@@ -201,14 +214,21 @@ async fn a_concurrent_rename_and_edit_converge() {
     )
     .unwrap();
     joy.file_saved("src/brand.css").await.unwrap();
-    write(&monzim_root, "src/banner.css", ".banner {\n  color: gold;\n}\n");
+    write(
+        &monzim_root,
+        "src/banner.css",
+        ".banner {\n  color: gold;\n}\n",
+    );
     monzim.file_saved("src/banner.css").await.unwrap();
 
     monzim.pump(QUIET).await.unwrap();
     joy.pump(QUIET).await.unwrap();
 
     for root in [&joy_root, &monzim_root] {
-        assert_eq!(read(root, "src/brand.css"), ".banner {\n  color: gold;\n}\n");
+        assert_eq!(
+            read(root, "src/brand.css"),
+            ".banner {\n  color: gold;\n}\n"
+        );
         assert!(!root.join("src/banner.css").exists());
     }
     assert_eq!(
@@ -232,10 +252,7 @@ async fn a_deleted_file_is_deleted_everywhere_and_comes_back_under_its_id() {
     );
     monzim.pump(QUIET).await.unwrap();
     assert!(!monzim_root.join("notes.md").exists());
-    assert!(server
-        .tree()
-        .iter()
-        .any(|e| e.file_id == id && e.deleted));
+    assert!(server.tree().iter().any(|e| e.file_id == id && e.deleted));
 
     // Created again: the same file, history and all.
     write(&monzim_root, "notes.md", "todo: blue\n");
@@ -278,7 +295,11 @@ async fn a_move_onto_a_path_the_person_uses_keeps_their_file_and_never_sends_it(
     let server = FakeThreadServer::new();
     let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
     // Monzim has a file of his own at the path, not in the thread.
-    write(&monzim_root, "src/brand.css", "/* monzim's private notes */\n");
+    write(
+        &monzim_root,
+        "src/brand.css",
+        "/* monzim's private notes */\n",
+    );
 
     fs::rename(
         joy_root.join("src/banner.css"),
@@ -297,7 +318,10 @@ async fn a_move_onto_a_path_the_person_uses_keeps_their_file_and_never_sends_it(
         read(&monzim_root, "src/brand.css"),
         ".banner {\n  color: green;\n}\n"
     );
-    assert!(monzim.notices().iter().any(|n| n.contains("src/brand.css.atlas-mine")));
+    assert!(monzim
+        .notices()
+        .iter()
+        .any(|n| n.contains("src/brand.css.atlas-mine")));
     // And nothing of it reached the thread — not when the watcher reports
     // the file set aside, nor the path it left.
     let sent = monzim.updates_sent();
@@ -348,7 +372,11 @@ async fn a_teammates_new_file_never_folds_in_an_ignored_file_of_the_persons() {
     let server = FakeThreadServer::new();
     let (mut joy, mut monzim, joy_root, monzim_root) = both(&w, &server).await;
     // Monzim keeps build output in his replica; `dist/` is ignored.
-    write(&monzim_root, "dist/config.js", "window.KEY = 'monzim-only';\n");
+    write(
+        &monzim_root,
+        "dist/config.js",
+        "window.KEY = 'monzim-only';\n",
+    );
 
     // A teammate's client puts a file at that path in the thread.
     write(&joy_root, "dist/config.js", "window.KEY = 'shared';\n");
@@ -396,7 +424,10 @@ async fn a_rename_onto_the_persons_file_sets_it_aside_even_when_the_source_is_go
     joy.file_saved("todo.md").await.unwrap();
     monzim.pump(QUIET).await.unwrap();
 
-    assert_eq!(read(&monzim_root, "todo.md.atlas-mine"), "monzim's own list\n");
+    assert_eq!(
+        read(&monzim_root, "todo.md.atlas-mine"),
+        "monzim's own list\n"
+    );
     let sent = monzim.updates_sent();
     monzim.file_saved("todo.md").await.unwrap();
     assert!(!server

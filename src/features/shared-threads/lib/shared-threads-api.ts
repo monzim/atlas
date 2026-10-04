@@ -13,6 +13,9 @@ export const SHARED_THREADS_EVENT = "atlas:shared-threads";
 /** Pushed by Rust for every live frame of somebody else's Run (ATL-405). */
 export const SHARED_RUN_FRAME_EVENT = "atlas:shared-run-frame";
 
+/** Pushed by Rust to the owner when somebody asks to join (ATL-406). */
+export const SHARED_JOIN_REQUEST_EVENT = "atlas:shared-thread-join-requested";
+
 /**
  * A Run (ATL-405): one agent turn in the thread, run by a participant in their
  * own Run worktree and merged back when it ends.
@@ -69,6 +72,10 @@ export interface SharedThreadStatus {
    * teammate's change, a drifted replica repaired — newest last.
    */
   notices: string[];
+  /** Saves kept on this machine because it may not change the thread; they go once it may. */
+  unsent: string[];
+  /** The thread is closed: read-only on every replica until it is reopened. */
+  closed: boolean;
   error: string | null;
 }
 
@@ -114,6 +121,18 @@ export interface SharedThreadView {
   /** On a share: what was uploaded and what was held back. Empty otherwise. */
   sharedFiles: string[];
   blockedFiles: BlockedFile[];
+  /** This thread's Run worktree on this machine: a session there runs in the thread. */
+  runWorktree: string;
+}
+
+/** What the owner manages (ATL-406). */
+export interface OwnerView {
+  joinPolicy: "auto" | "approval" | (string & {});
+  status: "open" | "closed" | (string & {});
+  closedAt: number | null;
+  purgeAt: number | null;
+  participants: Array<{ userId: string; role: string; joinedAt: number }>;
+  requests: Array<{ userId: string; requestedAt: number }>;
 }
 
 /** A refusal Rust (or the server) explained. `code` is stable; branch on it. */
@@ -193,6 +212,39 @@ export function listThreads() {
 /** Stop syncing on this machine. The replica worktree stays on disk. */
 export function leaveThread(sharedThreadId: string) {
   return invoke<void>("shared_thread_leave", { sharedThreadId });
+}
+
+/** The owner's view: participants, join requests, join policy, open or closed. */
+export function ownerView(sharedThreadId: string) {
+  return invoke<OwnerView>("shared_thread_owner_view", { sharedThreadId });
+}
+
+/** Approve a join request or promote (`participant`), or take edit rights away (`viewer`). */
+export function setRole(sharedThreadId: string, userId: string, role: "participant" | "viewer") {
+  return invoke<OwnerView>("shared_thread_set_role", { sharedThreadId, userId, role });
+}
+
+/** Decline a join request: they stay a viewer. */
+export function declineJoin(sharedThreadId: string, userId: string) {
+  return invoke<OwnerView>("shared_thread_decline", { sharedThreadId, userId });
+}
+
+/** Turn "approval required" on or off. */
+export function setJoinPolicy(sharedThreadId: string, joinPolicy: "auto" | "approval") {
+  return invoke<OwnerView>("shared_thread_set_join_policy", { sharedThreadId, joinPolicy });
+}
+
+/** Close the thread (read-only everywhere) or reopen it. */
+export function setThreadOpen(sharedThreadId: string, open: boolean) {
+  return invoke<OwnerView>("shared_thread_set_open", { sharedThreadId, open });
+}
+
+export function onJoinRequested(
+  apply: (request: { sharedThreadId: string; userId: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ sharedThreadId: string; userId: string }>(SHARED_JOIN_REQUEST_EVENT, (event) =>
+    apply(event.payload),
+  );
 }
 
 export function onSharedRunFrame(apply: (frame: SharedRunFrame) => void): Promise<UnlistenFn> {

@@ -201,6 +201,14 @@ impl Role {
     }
 }
 
+/// Whether a thread takes changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadStatus {
+    Open,
+    Closed,
+}
+
 /// Control frames a client sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -322,6 +330,26 @@ pub struct SnapshotFile {
     pub bytes: u64,
 }
 
+impl ClientControl {
+    /// The frame's `clientSeq` — what a refusal names. `0` for `hello`.
+    pub fn client_seq(&self) -> u64 {
+        match self {
+            ClientControl::Hello { .. } => 0,
+            ClientControl::TreeEnsure { client_seq, .. }
+            | ClientControl::TreeRename { client_seq, .. }
+            | ClientControl::TreeDelete { client_seq, .. }
+            | ClientControl::BlobSet { client_seq, .. }
+            | ClientControl::Checksum { client_seq, .. }
+            | ClientControl::BundleRequest { client_seq, .. }
+            | ClientControl::BundleReady { client_seq, .. }
+            | ClientControl::BundleFailed { client_seq, .. }
+            | ClientControl::RunStart { client_seq, .. }
+            | ClientControl::RunEnd { client_seq, .. }
+            | ClientControl::MergeSubmit { client_seq, .. } => *client_seq,
+        }
+    }
+}
+
 /// Why no bundle is coming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,6 +429,10 @@ pub enum ServerControl {
         thread_id: String,
         workspace_id: String,
         org_id: String,
+        /// Who the server knows this socket as (ATL-406). Absent from
+        /// servers before it.
+        #[serde(default)]
+        user_id: Option<String>,
         role: Role,
         head: u64,
         last_client_seq: u64,
@@ -448,6 +480,21 @@ pub enum ServerControl {
         version: u64,
         files: Vec<MergedFile>,
     },
+    /// Somebody's role changed — possibly this replica's own (ATL-406).
+    #[serde(rename = "role", rename_all = "camelCase")]
+    RoleChanged { user_id: String, role: Role },
+    /// The thread was closed or reopened.
+    #[serde(rename = "status", rename_all = "camelCase")]
+    Status {
+        status: ThreadStatus,
+        #[serde(default)]
+        closed_at: Option<u64>,
+        #[serde(default)]
+        purge_at: Option<u64>,
+    },
+    /// Sent to the owner: somebody is waiting to join.
+    #[serde(rename = "join.requested", rename_all = "camelCase")]
+    JoinRequested { user_id: String },
     /// The replica's `since` is ahead of the thread: its state did not come
     /// from here. Discard it and say hello again from `0` (ATL-397).
     #[serde(rename = "resync-required")]
@@ -471,7 +518,10 @@ pub enum ServerControl {
     /// Somebody lacks the Base: build a bundle against `have`, upload it,
     /// and say `bundle.ready` (ATL-402).
     #[serde(rename = "bundle.wanted", rename_all = "camelCase")]
-    BundleWanted { request_id: String, have: Vec<String> },
+    BundleWanted {
+        request_id: String,
+        have: Vec<String>,
+    },
     /// The first answer to `bundle.request`; what follows names `request_id`.
     #[serde(rename = "bundle.pending", rename_all = "camelCase")]
     BundlePending { client_seq: u64, request_id: String },
@@ -678,7 +728,10 @@ mod tests {
             kind: FileKind::Text,
             base_blob: Some(None),
         };
-        assert_eq!(serde_json::to_value(&ensure).unwrap()["baseBlob"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::to_value(&ensure).unwrap()["baseBlob"],
+            serde_json::Value::Null
+        );
         let entry: TreeEntry = serde_json::from_str(
             r#"{"fileId":1,"path":"a.ts","kind":"text","baseBlob":null,"mergeVersion":2}"#,
         )

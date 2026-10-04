@@ -97,7 +97,12 @@ impl RunWorktree {
             match fs::remove_file(&target) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(ReplicaError::Io { path: target, source }),
+                Err(source) => {
+                    return Err(ReplicaError::Io {
+                        path: target,
+                        source,
+                    })
+                }
             }
         }
         for file in fork.files.values() {

@@ -58,6 +58,9 @@ pub const SHARED_THREADS_EVENT: &str = "atlas:shared-threads";
 /// The window event channel for other people's live Run frames.
 pub const SHARED_RUN_FRAME_EVENT: &str = "atlas:shared-run-frame";
 
+/// The window event channel for join requests, heard by the owner (ATL-406).
+pub const SHARED_JOIN_REQUEST_EVENT: &str = "atlas:shared-thread-join-requested";
+
 /// What the person sees about one Shared Thread this machine has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +102,10 @@ pub struct SharedThreadView {
     /// back because they look like secrets. Empty otherwise.
     pub shared_files: Vec<String>,
     pub blocked_files: Vec<BlockedFile>,
+    /// Where this thread's Run worktree is on this machine: an agent session
+    /// working there runs in the thread (ATL-405), and its prompt box follows
+    /// the person's role (ATL-406).
+    pub run_worktree: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -443,6 +450,193 @@ pub async fn shared_thread_serve_history(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The owner's panel (ATL-406)
+// ---------------------------------------------------------------------------
+
+/// What the owner manages: who is in and in what role, who is waiting, whether
+/// joining needs approval, and whether the thread is open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerView {
+    pub join_policy: String,
+    pub status: String,
+    pub closed_at: Option<u64>,
+    pub purge_at: Option<u64>,
+    pub participants: Vec<Participant>,
+    pub requests: Vec<JoinRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Participant {
+    pub user_id: String,
+    pub role: String,
+    pub joined_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinRequest {
+    pub user_id: String,
+    pub requested_at: u64,
+}
+
+#[derive(Deserialize)]
+struct ServerThreadState {
+    thread: ServerThreadSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerThreadSettings {
+    join_policy: String,
+    status: String,
+    closed_at: Option<u64>,
+    purge_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ServerParticipants {
+    participants: Vec<Participant>,
+    requests: Vec<JoinRequest>,
+}
+
+fn entry_of(app: &AppHandle, shared_thread_id: &str) -> Result<SharedThreadEntry> {
+    let state = app.state::<SharedThreadsState>();
+    let running = state.running.lock().map_err(|_| poisoned())?;
+    running
+        .get(shared_thread_id)
+        .map(|r| r.entry.clone())
+        .ok_or_else(|| {
+            SharedThreadError::new("not_joined", "This thread is not joined on this machine.")
+        })
+}
+
+async fn owner_view_of(entry: &SharedThreadEntry, token: &str) -> Result<OwnerView> {
+    let thread: ServerThreadState = get_json(&thread_url(entry, ""), token).await?;
+    let people: ServerParticipants = get_json(&thread_url(entry, "/participants"), token).await?;
+    Ok(OwnerView {
+        join_policy: thread.thread.join_policy,
+        status: thread.thread.status,
+        closed_at: thread.thread.closed_at,
+        purge_at: thread.thread.purge_at,
+        participants: people.participants,
+        requests: people.requests,
+    })
+}
+
+/// A request to one of the thread's doors; the server's refusal, if any.
+async fn send_to(request: reqwest::RequestBuilder, token: &str) -> Result<()> {
+    let res = request
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| SharedThreadError::new("network", e.to_string()))?;
+    if res.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(());
+    }
+    decode::<serde_json::Value>(res).await.map(|_| ())
+}
+
+/// The owner's view of a thread: participants, waiting requests, the join
+/// policy and whether it is open.
+#[tauri::command]
+pub async fn shared_thread_owner_view(
+    app: AppHandle,
+    shared_thread_id: String,
+) -> Result<OwnerView> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    owner_view_of(&entry, &token(&app).await?).await
+}
+
+/// Set somebody's role — `participant` approves a join request or promotes a
+/// viewer; `viewer` takes edit rights away.
+#[tauri::command]
+pub async fn shared_thread_set_role(
+    app: AppHandle,
+    shared_thread_id: String,
+    user_id: String,
+    role: String,
+) -> Result<OwnerView> {
+    if role != "participant" && role != "viewer" {
+        return Err(SharedThreadError::new(
+            "bad_request",
+            "A role is participant or viewer.",
+        ));
+    }
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let url = thread_url(&entry, &format!("/participants/{}", path_segment(&user_id)?));
+    send_to(client()?.put(url).json(&serde_json::json!({ "role": role })), &token).await?;
+    owner_view_of(&entry, &token).await
+}
+
+/// Decline a join request — the person stays a viewer.
+#[tauri::command]
+pub async fn shared_thread_decline(
+    app: AppHandle,
+    shared_thread_id: String,
+    user_id: String,
+) -> Result<OwnerView> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let url = thread_url(&entry, &format!("/participants/{}", path_segment(&user_id)?));
+    send_to(client()?.delete(url), &token).await?;
+    owner_view_of(&entry, &token).await
+}
+
+/// Turn "approval required" on (`approval`) or off (`auto`).
+#[tauri::command]
+pub async fn shared_thread_set_join_policy(
+    app: AppHandle,
+    shared_thread_id: String,
+    join_policy: String,
+) -> Result<OwnerView> {
+    if join_policy != "auto" && join_policy != "approval" {
+        return Err(SharedThreadError::new(
+            "bad_request",
+            "The join policy is auto or approval.",
+        ));
+    }
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let request = client()?
+        .patch(thread_url(&entry, ""))
+        .json(&serde_json::json!({ "joinPolicy": join_policy }));
+    send_to(request, &token).await?;
+    owner_view_of(&entry, &token).await
+}
+
+/// Close the thread — every replica turns read-only — or reopen it.
+#[tauri::command]
+pub async fn shared_thread_set_open(
+    app: AppHandle,
+    shared_thread_id: String,
+    open: bool,
+) -> Result<OwnerView> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let door = if open { "/reopen" } else { "/close" };
+    send_to(client()?.post(thread_url(&entry, door)), &token).await?;
+    owner_view_of(&entry, &token).await
+}
+
+/// A user id as one path segment. The server's ids never need escaping, and
+/// anything that would is refused rather than sent.
+fn path_segment(id: &str) -> Result<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        Ok(id)
+    } else {
+        Err(SharedThreadError::new("bad_request", "That is not a user id."))
+    }
+}
+
 /// Every Shared Thread this machine has joined, with its live status.
 #[tauri::command]
 pub fn shared_thread_list(app: AppHandle) -> Vec<SharedThreadView> {
@@ -458,6 +652,7 @@ pub fn shared_thread_list(app: AppHandle) -> Vec<SharedThreadView> {
             session_id: local_session(&app, &r.entry.shared_thread_id),
             shared_files: Vec::new(),
             blocked_files: Vec::new(),
+            run_worktree: run_worktree_of(&app, &r.entry.shared_thread_id),
         })
         .collect();
     views.sort_by(|a, b| a.entry.title.cmp(&b.entry.title));
@@ -570,6 +765,16 @@ async fn start(
         .map_err(session_error)?;
     session.set_thread_repo(thread_repo);
     session.set_serve_bundles(entry.serve_history);
+    // Under "approval required" a joiner waits as a viewer until the owner
+    // says yes (ATL-406). Asking is idempotent: it answers the role as it is.
+    if share.is_none() {
+        match post_json::<ServerJoin>(&thread_url(&entry, "/join"), &token, &serde_json::json!({})).await {
+            Ok(join) => session.set_awaiting_approval(join.pending),
+            // Over the participant limit, or the like: the socket admitted
+            // them as a viewer, and the status says so.
+            Err(e) => tracing::info!(target: "atlas_thread_sync", "join: {}", e.message),
+        }
+    }
     // Without the Base the replica can only watch; a bundle fixes that. Not
     // getting one is not a failure — the status says why it is read-only.
     if !session.replica().has_base() {
@@ -609,23 +814,35 @@ async fn start(
         let forward = app.clone();
         let shared_thread_id = entry.shared_thread_id.clone();
         tauri::async_runtime::spawn(async move {
-            while let Some(ThreadEvent::RunFrame {
-                run_no, payload, ..
-            }) = heard.recv().await
-            {
-                // A frame that is not JSON is somebody else's client's
-                // business; the renderer only draws deltas.
-                let Ok(delta) = serde_json::from_slice(&payload) else {
-                    continue;
-                };
-                let _ = forward.emit(
-                    SHARED_RUN_FRAME_EVENT,
-                    RunFrameEvent {
-                        shared_thread_id: shared_thread_id.clone(),
-                        run_no,
-                        delta,
-                    },
-                );
+            while let Some(event) = heard.recv().await {
+                match event {
+                    ThreadEvent::RunFrame {
+                        run_no, payload, ..
+                    } => {
+                        // A frame that is not JSON is somebody else's client's
+                        // business; the renderer only draws deltas.
+                        let Ok(delta) = serde_json::from_slice(&payload) else {
+                            continue;
+                        };
+                        let _ = forward.emit(
+                            SHARED_RUN_FRAME_EVENT,
+                            RunFrameEvent {
+                                shared_thread_id: shared_thread_id.clone(),
+                                run_no,
+                                delta,
+                            },
+                        );
+                    }
+                    ThreadEvent::JoinRequested { user_id } => {
+                        let _ = forward.emit(
+                            SHARED_JOIN_REQUEST_EVENT,
+                            serde_json::json!({
+                                "sharedThreadId": shared_thread_id,
+                                "userId": user_id,
+                            }),
+                        );
+                    }
+                }
             }
         });
     }
@@ -645,6 +862,7 @@ async fn start(
         session_id: local_session(app, &entry.shared_thread_id),
         shared_files,
         blocked_files,
+        run_worktree: run_worktree_of(app, &entry.shared_thread_id),
     };
     {
         let state = app.state::<SharedThreadsState>();
@@ -1032,6 +1250,7 @@ fn view_of(app: &AppHandle, shared_thread_id: &str) -> Option<SharedThreadView> 
         session_id: local_session(app, shared_thread_id),
         shared_files: Vec::new(),
         blocked_files: Vec::new(),
+        run_worktree: run_worktree_of(app, shared_thread_id),
     })
 }
 
@@ -1233,6 +1452,22 @@ struct ServerThreadSummary {
 }
 
 #[derive(Deserialize)]
+struct ServerJoin {
+    pending: bool,
+}
+
+/// `{ingest}/threads/{id}{rest}?org=&workspace=` for a joined thread.
+fn thread_url(entry: &SharedThreadEntry, rest: &str) -> String {
+    format!(
+        "{}/threads/{}{rest}?org={}&workspace={}",
+        atlas_artifacts::ingest_base(),
+        entry.shared_thread_id,
+        entry.org_id,
+        entry.workspace_id
+    )
+}
+
+#[derive(Deserialize)]
 struct ServerError {
     error: ServerErrorBody,
 }
@@ -1341,6 +1576,12 @@ fn replica_root(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
 /// The thread's Run worktree on this machine (ATL-405).
 fn run_root(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
     Ok(thread_dir(app, shared_thread_id)?.join("run"))
+}
+
+fn run_worktree_of(app: &AppHandle, shared_thread_id: &str) -> String {
+    run_root(app, shared_thread_id)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn thread_dir(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {

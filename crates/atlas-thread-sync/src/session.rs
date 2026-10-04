@@ -25,7 +25,7 @@ use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
 use crate::wire::{
     self, BundleFailure, ChecksumStatus, ClientControl, FileHash, FileKind, FileVersion, Frame,
-    FrameKind, MergeFile, Role, RunOutcome, ServerControl, ThreadRun,
+    FrameKind, MergeFile, Role, RunOutcome, ServerControl, ThreadRun, ThreadStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -76,13 +76,21 @@ pub struct BundleWant {
 /// The answer a `bundle.request` is waiting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BundleAnswer {
-    Available { sha: String },
-    Unavailable { reason: BundleFailure, bytes: Option<u64> },
+    Available {
+        sha: String,
+    },
+    Unavailable {
+        reason: BundleFailure,
+        bytes: Option<u64>,
+    },
 }
 
-/// What the app hears about besides status: other people's live Run frames.
+/// What the app hears about besides status: other people's live Run frames,
+/// and — for the owner — join requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadEvent {
+    /// Somebody is waiting for the owner's approval to join (ATL-406).
+    JoinRequested { user_id: String },
     /// A live Run frame — a `SessionDelta` (kind 3) or a Run file (kind 4).
     /// Never stored; the durable copy is the Runner's Session.
     RunFrame {
@@ -237,6 +245,15 @@ pub struct ThreadSession<T: Transport> {
     /// Things done on the person's behalf they should hear about — a file of
     /// theirs moved aside, a replica repaired — newest last.
     notices: Vec<String>,
+    /// Who the server knows this socket as (from `welcome`).
+    user_id: Option<String>,
+    /// The thread was closed: nothing changes until it is reopened (ATL-406).
+    closed: bool,
+    /// Joined under "approval required" and not approved yet.
+    awaiting_approval: bool,
+    /// New files saved while this replica could not change the thread, to
+    /// introduce once it can.
+    unsent_new: std::collections::BTreeSet<String>,
 }
 
 impl<T: Transport> ThreadSession<T> {
@@ -244,7 +261,11 @@ impl<T: Transport> ThreadSession<T> {
     ///
     /// `client_id` should be stable for this replica across reconnects: the
     /// server's welcome then says which of our frames it already stored.
-    pub async fn open(transport: T, replica: Replica, client_id: &str) -> Result<Self, SessionError> {
+    pub async fn open(
+        transport: T,
+        replica: Replica,
+        client_id: &str,
+    ) -> Result<Self, SessionError> {
         Self::connect(transport, replica, client_id, Arc::new(NoStore)).await
     }
 
@@ -288,6 +309,10 @@ impl<T: Transport> ThreadSession<T> {
             included: HashSet::new(),
             watch_only: None,
             notices: Vec::new(),
+            user_id: None,
+            closed: false,
+            awaiting_approval: false,
+            unsent_new: std::collections::BTreeSet::new(),
         };
         if session.greet(0).await? {
             // Nothing can be ahead of a thread from 0.
@@ -406,7 +431,9 @@ impl<T: Transport> ThreadSession<T> {
             if canonical.as_deref() == Some(work.before.as_str()) {
                 keep.insert(work.path.clone());
             } else {
-                let aside = self.replica.keep_copy(&work.path, work.content.as_bytes())?;
+                let aside = self
+                    .replica
+                    .keep_copy(&work.path, work.content.as_bytes())?;
                 self.notice(match why {
                     Rebuild::Resync => format!(
                         "The thread lost recent changes to {}; your copy is in {}.",
@@ -463,7 +490,11 @@ impl<T: Transport> ThreadSession<T> {
                 self.file_saved(&path).await?;
             }
         }
-        if !self.unacked.is_empty() || !self.offline.is_empty() || !self.missing.is_empty() {
+        if !self.unacked.is_empty()
+            || !self.offline.is_empty()
+            || !self.missing.is_empty()
+            || !self.unsent().is_empty()
+        {
             return Ok(Verification::Skipped("changes are still on their way"));
         }
         let files: Vec<FileHash> = self
@@ -574,7 +605,77 @@ impl<T: Transport> ThreadSession<T> {
         if !self.replica.has_base() {
             return Some("This machine does not have the thread's starting commit yet.".into());
         }
+        if self.closed {
+            return Some(
+                "This thread is closed: nothing changes until the owner reopens it. Your edits stay on this machine."
+                    .into(),
+            );
+        }
+        if self.role == Some(Role::Viewer) {
+            return Some(if self.awaiting_approval {
+                "Waiting for the owner to approve you. Until then you can watch; your edits stay on this machine and are sent once you are in.".into()
+            } else {
+                "You are a viewer in this thread: your edits stay on this machine and are not shared.".into()
+            });
+        }
         None
+    }
+
+    /// The person joined a thread that needs the owner's approval, and is
+    /// waiting for it (the app learns this from `POST /join`).
+    pub fn set_awaiting_approval(&mut self, waiting: bool) {
+        self.awaiting_approval = waiting;
+    }
+
+    /// Whether the thread is closed.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Who the server knows this replica's person as.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    /// Saves held on this machine because it may not change the thread:
+    /// edited files, and new ones.
+    pub fn unsent(&self) -> Vec<String> {
+        let mut all = self.replica.unsent_files();
+        all.extend(self.unsent_new.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// Tell the replica whether saves may go, after anything that changes it.
+    fn refresh_read_only(&mut self) {
+        let read_only = self.read_only().is_some();
+        self.replica.set_read_only(read_only);
+    }
+
+    /// Are there held saves that may go now?
+    pub fn wants_flush(&self) -> bool {
+        self.read_only().is_none()
+            && self.connected
+            && (!self.unsent_new.is_empty()
+                || !self.replica.unsent_files().is_empty()
+                || !self.missing.is_empty())
+    }
+
+    /// Send the saves held while this replica could not change the thread —
+    /// each merged with what the thread did meanwhile. The app's loop calls
+    /// this once it may (a viewer promoted, a thread reopened).
+    pub async fn flush_unsent(&mut self) -> Result<(), SessionError> {
+        if self.read_only().is_some() {
+            return Ok(());
+        }
+        let mut paths = self.replica.unsent_files();
+        paths.extend(std::mem::take(&mut self.unsent_new));
+        for path in paths {
+            self.file_saved(&path).await?;
+        }
+        self.settle_removals().await?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -590,7 +691,10 @@ impl<T: Transport> ThreadSession<T> {
     /// can come: nobody holding the Base is online, or the history is over
     /// the Organisation's bundle limit. The replica then follows the thread
     /// read-only and says why.
-    pub async fn bootstrap(&mut self, own_repo: Option<&Path>) -> Result<Bootstrapped, SessionError> {
+    pub async fn bootstrap(
+        &mut self,
+        own_repo: Option<&Path>,
+    ) -> Result<Bootstrapped, SessionError> {
         if self.replica.has_base() {
             return Ok(Bootstrapped::Ready);
         }
@@ -602,6 +706,7 @@ impl<T: Transport> ThreadSession<T> {
         if repo.has(self.replica.base()) {
             self.replica.attach_repo(repo.path())?;
             self.watch_only = None;
+            self.refresh_read_only();
             return Ok(Bootstrapped::Ready);
         }
         if self.role == Some(Role::Viewer) {
@@ -614,7 +719,9 @@ impl<T: Transport> ThreadSession<T> {
         self.bundle_request = Some((client_seq, None));
         self.bundle_answer = None;
         self.awaiting.insert(client_seq);
-        let sent = self.send_control(&ClientControl::BundleRequest { client_seq, have }).await;
+        let sent = self
+            .send_control(&ClientControl::BundleRequest { client_seq, have })
+            .await;
         let answer = match sent {
             Ok(()) => self.await_bundle(client_seq).await,
             Err(e) => Err(e),
@@ -653,17 +760,22 @@ impl<T: Transport> ThreadSession<T> {
         repo.install(&base, &sha, &bytes)?;
         self.replica.attach_repo(repo.path())?;
         self.watch_only = None;
+        self.refresh_read_only();
         Ok(Bootstrapped::Ready)
     }
 
     fn watch_only_because(&mut self, why: String) -> Bootstrapped {
         self.watch_only = Some(why.clone());
+        self.refresh_read_only();
         Bootstrapped::WatchOnly(why)
     }
 
     /// Handle messages until our bundle request is answered, or give up after
     /// [`BUNDLE_TIMEOUT`] (`None`).
-    async fn await_bundle(&mut self, client_seq: u64) -> Result<Option<BundleAnswer>, SessionError> {
+    async fn await_bundle(
+        &mut self,
+        client_seq: u64,
+    ) -> Result<Option<BundleAnswer>, SessionError> {
         let deadline = tokio::time::Instant::now() + BUNDLE_TIMEOUT;
         loop {
             if let Some(answer) = self.bundle_answer.take() {
@@ -737,8 +849,10 @@ impl<T: Transport> ThreadSession<T> {
         if wants.is_empty() {
             return Ok(());
         }
-        let (Some(own), Some(repo)) = (self.replica.repo().map(Path::to_path_buf), self.thread_repo.clone())
-        else {
+        let (Some(own), Some(repo)) = (
+            self.replica.repo().map(Path::to_path_buf),
+            self.thread_repo.clone(),
+        ) else {
             return Ok(());
         };
         repo.ensure(Some(&own))?;
@@ -1182,6 +1296,23 @@ impl<T: Transport> ThreadSession<T> {
     /// Answers what it amounted to; an [`LocalChange::Echo`] sent nothing.
     pub async fn file_saved(&mut self, rel: &str) -> Result<LocalChange, SessionError> {
         if self.read_only().is_some() {
+            // Kept on this machine, and said so: an edited file is held (its
+            // next save once the thread takes changes merges it); a new one
+            // waits to be introduced.
+            if self.replica.is_materialized() {
+                match self.replica.local_change(rel)? {
+                    LocalChange::NewFile { path } => {
+                        if !self.ignores(&path)? {
+                            self.unsent_new.insert(path);
+                        }
+                    }
+                    // Settled — sent as a deletion — once it may be.
+                    LocalChange::Missing { file_id } if !self.missing.contains(&file_id) => {
+                        self.missing.push(file_id);
+                    }
+                    _ => {}
+                }
+            }
             return Ok(LocalChange::Ignored);
         }
         // Disk is the buffer: the save is read when the socket is back.
@@ -1243,7 +1374,8 @@ impl<T: Transport> ThreadSession<T> {
                 // the file stays on this machine.
                 let secret = match self.replica.kind(file_id) {
                     Some(FileKind::Text) => {
-                        let content = String::from_utf8_lossy(&self.replica.read_bytes(&to)?).into_owned();
+                        let content =
+                            String::from_utf8_lossy(&self.replica.read_bytes(&to)?).into_owned();
                         secret_reason(&to, &content).is_some()
                     }
                     _ => secret_reason(&to, "").is_some(),
@@ -1287,7 +1419,9 @@ impl<T: Transport> ThreadSession<T> {
                 let file_id = self.ensure_file(&path, true, kind).await?;
                 match kind {
                     FileKind::Text => {
-                        if let LocalChange::Update { update, .. } = self.replica.local_change(&path)? {
+                        if let LocalChange::Update { update, .. } =
+                            self.replica.local_change(&path)?
+                        {
                             self.send_update(file_id, update).await?;
                         }
                     }
@@ -1308,6 +1442,10 @@ impl<T: Transport> ThreadSession<T> {
     /// moment, so a move — reported as a removal and a creation, in either
     /// order — is seen as the rename it is.
     pub async fn settle_removals(&mut self) -> Result<Vec<String>, SessionError> {
+        // Kept until this replica may change the thread again.
+        if self.read_only().is_some() {
+            return Ok(Vec::new());
+        }
         let mut deleted = Vec::new();
         for file_id in std::mem::take(&mut self.missing) {
             if !self.replica.is_missing(file_id) {
@@ -1319,8 +1457,14 @@ impl<T: Transport> ThreadSession<T> {
                 .find(|(id, _)| *id == file_id)
                 .map(|(_, p)| p.to_string());
             let client_seq = self.take_client_seq();
-            self.expect_ack(client_seq, &ClientControl::TreeDelete { client_seq, file_id })
-                .await?;
+            self.expect_ack(
+                client_seq,
+                &ClientControl::TreeDelete {
+                    client_seq,
+                    file_id,
+                },
+            )
+            .await?;
             self.replica.delete(file_id)?;
             deleted.extend(path);
         }
@@ -1333,7 +1477,12 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Upload a binary file's bytes and make them canonical (ATL-403).
-    async fn set_blob(&mut self, file_id: u64, sha: &str, bytes: Vec<u8>) -> Result<(), SessionError> {
+    async fn set_blob(
+        &mut self,
+        file_id: u64,
+        sha: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), SessionError> {
         self.store.put_blob(sha.to_string(), bytes).await?;
         let client_seq = self.take_client_seq();
         let set = ClientControl::BlobSet {
@@ -1346,7 +1495,11 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     /// Send a frame the server answers with a plain ack.
-    async fn expect_ack(&mut self, client_seq: u64, frame: &ClientControl) -> Result<(), SessionError> {
+    async fn expect_ack(
+        &mut self,
+        client_seq: u64,
+        frame: &ClientControl,
+    ) -> Result<(), SessionError> {
         match self.ask(client_seq, frame).await? {
             Answer::Ack => Ok(()),
             Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
@@ -1381,8 +1534,14 @@ impl<T: Transport> ThreadSession<T> {
                 };
                 let file_id = self.ensure_file(&file.path, true, kind_of(&base)).await?;
                 let client_seq = self.take_client_seq();
-                self.expect_ack(client_seq, &ClientControl::TreeDelete { client_seq, file_id })
-                    .await?;
+                self.expect_ack(
+                    client_seq,
+                    &ClientControl::TreeDelete {
+                        client_seq,
+                        file_id,
+                    },
+                )
+                .await?;
                 self.replica.delete(file_id)?;
                 report.shared.push(file.path.clone());
                 continue;
@@ -1414,8 +1573,12 @@ impl<T: Transport> ThreadSession<T> {
     /// replica worktree?
     fn ignores(&self, path: &str) -> Result<bool, SessionError> {
         let root = self.replica.root();
-        let ignored = git::ignored(root, &[path.to_string()], Some(&root.join(share::SHAREIGNORE)))
-            .map_err(ReplicaError::from)?;
+        let ignored = git::ignored(
+            root,
+            &[path.to_string()],
+            Some(&root.join(share::SHAREIGNORE)),
+        )
+        .map_err(ReplicaError::from)?;
         Ok(ignored.contains(path))
     }
 
@@ -1470,7 +1633,8 @@ impl<T: Transport> ThreadSession<T> {
             None
         };
         let client_seq = self.take_client_seq();
-        self.pending_tree.insert(client_seq, (path.to_string(), kind));
+        self.pending_tree
+            .insert(client_seq, (path.to_string(), kind));
         let ensure = ClientControl::TreeEnsure {
             client_seq,
             path: path.to_string(),
@@ -1569,9 +1733,17 @@ impl<T: Transport> ThreadSession<T> {
                     ServerControl::Welcome {
                         role,
                         last_client_seq,
+                        user_id,
                         ..
                     } => {
                         self.role = Some(role);
+                        if user_id.is_some() {
+                            self.user_id = user_id;
+                        }
+                        if role != Role::Viewer {
+                            self.awaiting_approval = false;
+                        }
+                        self.refresh_read_only();
                         // Never reuse a client_seq the server already stored.
                         self.next_client_seq = self.next_client_seq.max(last_client_seq + 1);
                         // What it stored needs no resend.
@@ -1676,6 +1848,24 @@ impl<T: Transport> ThreadSession<T> {
                         }
                         if let Some(view) = self.runs.get_mut(&run_id) {
                             view.files = paths;
+                        }
+                    }
+                    ServerControl::RoleChanged { user_id, role } => {
+                        if self.user_id.as_deref() == Some(user_id.as_str()) {
+                            self.role = Some(role);
+                            // The owner answered: approved (an editor's
+                            // role), or declined (still a viewer).
+                            self.awaiting_approval = false;
+                            self.refresh_read_only();
+                        }
+                    }
+                    ServerControl::Status { status, .. } => {
+                        self.closed = status == ThreadStatus::Closed;
+                        self.refresh_read_only();
+                    }
+                    ServerControl::JoinRequested { user_id } => {
+                        if let Some(events) = &self.events {
+                            let _ = events.send(ThreadEvent::JoinRequested { user_id });
                         }
                     }
                     ServerControl::ResyncRequired { head, .. } => {
