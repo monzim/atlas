@@ -122,3 +122,12 @@ pub fn dirty_paths(repo: &Path) -> Result<Vec<Dirty>, GitError> {
     }
     Ok(dirty)
 }
+
+/// Put an existing worktree back at `sha`: tracked files reset, untracked ones
+/// removed. **Ignored files survive** (`clean` without `-x`), so a Run
+/// worktree keeps its `node_modules` and build output warm across Runs.
+pub fn reset_worktree(root: &Path, sha: &str) -> Result<(), GitError> {
+    let sha = checked(sha)?;
+    run(root, &["reset", "--hard", "--quiet", sha])?;
+    run(root, &["clean", "-d", "--force", "--quiet"]).map(|_| ())
+}

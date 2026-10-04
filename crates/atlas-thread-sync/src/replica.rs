@@ -104,6 +104,14 @@ pub enum LocalChange {
     Ignored,
 }
 
+/// One tracked file as a Run forked it.
+#[derive(Debug, Clone)]
+pub struct ForkFile {
+    pub path: String,
+    pub snapshot: Vec<u8>,
+    pub content: String,
+}
+
 pub struct Replica {
     repo: PathBuf,
     base: String,
@@ -140,6 +148,43 @@ impl Replica {
 
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// The person's own repository the replica's worktrees come from.
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Every tracked file as it is now, to fork a Run from (ATL-405).
+    pub fn fork_files(&self) -> BTreeMap<u64, ForkFile> {
+        self.files
+            .iter()
+            .map(|(id, f)| {
+                (
+                    *id,
+                    ForkFile {
+                        path: f.path.clone(),
+                        snapshot: f.doc.snapshot(),
+                        content: f.doc.content(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// One file's document as a snapshot.
+    pub fn snapshot(&self, file_id: u64) -> Option<Vec<u8>> {
+        Some(self.files.get(&file_id)?.doc.snapshot())
+    }
+
+    /// The document a file starts from in this thread — its Base content, or
+    /// nothing — as a snapshot. A Run that creates a file forks from this.
+    pub fn seed_snapshot(&self, path: &str) -> Result<Vec<u8>, ReplicaError> {
+        let doc = FileDoc::new(random_client_id());
+        for update in self.seed_for(path)? {
+            doc.apply(&update)?;
+        }
+        Ok(doc.snapshot())
     }
 
     /// Where the worktree is (or will be).

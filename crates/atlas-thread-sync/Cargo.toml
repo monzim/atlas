@@ -22,6 +22,10 @@ tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 notify = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+# `merge.submit` carries each file's Yjs update as base64.
+base64 = { workspace = true }
+# Line hunks for a Run's three-way merge (ATL-405).
+similar = { workspace = true }
 serde_json = "1"
 sha2 = { workspace = true }
 thiserror = "2"

@@ -16,14 +16,31 @@
 //!   a joined thread is rejoined at launch.
 //! * Replicas are worktrees under `<app data>/shared-threads/<id>/replica`,
 //!   never inside the person's own checkout.
+//! * Each joined thread's Run worktree (ATL-405) is
+//!   `<app data>/shared-threads/<id>/run`: one per participant on this
+//!   machine, reused Run after Run so the agent session's `cwd` never changes.
+//!
+//! # Runs (ATL-405)
+//!
+//! A prompt sent in an agent session whose `cwd` is a thread's Run worktree is
+//! a Run: [`begin_run`] (called from `agents_send`) forks canonical state into
+//! the worktree and tells the thread, [`SharedRunMiddleware`] streams the
+//! session's deltas to the thread as live Run frames, and the turn's end
+//! merges the result back. Any ACP agent and the native one alike — they all
+//! reach here through the same delta pipeline.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1 as acp;
+use atlas_agent_wire::{AgentId, DeltaSink, SessionDelta, SessionDeltaEnvelope};
+use atlas_bus::OutboundMiddleware;
 use atlas_thread_metadata::SharedThreadLink;
-use atlas_thread_sync::{Command as SyncCommand, Replica, SyncStatus, ThreadSession, WsTransport};
+use atlas_thread_sync::{
+    BlobSink, Command as SyncCommand, Replica, RunSpec, SyncStatus, ThreadEvent, ThreadSession,
+    WsTransport,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -32,6 +49,9 @@ use crate::commands::agent_host::AgentHost;
 
 /// The window event channel for joined-thread status.
 pub const SHARED_THREADS_EVENT: &str = "atlas:shared-threads";
+
+/// The window event channel for other people's live Run frames.
+pub const SHARED_RUN_FRAME_EVENT: &str = "atlas:shared-run-frame";
 
 /// What the person sees about one Shared Thread this machine has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,13 +98,35 @@ pub struct BlockedFile {
 
 struct Running {
     entry: SharedThreadEntry,
-    commands: mpsc::Sender<SyncCommand>,
+    commands: mpsc::UnboundedSender<SyncCommand>,
     status: watch::Receiver<SyncStatus>,
+}
+
+/// A Run this machine is running, keyed by the agent session behind it.
+struct LiveRun {
+    shared_thread_id: String,
+    run_id: String,
+    agent_id: AgentId,
 }
 
 #[derive(Default)]
 pub struct SharedThreadsState {
     running: Mutex<HashMap<String, Running>>,
+    runs: Mutex<HashMap<String, LiveRun>>,
+}
+
+/// The delta sink, so a Run's start and end can be announced on the session
+/// it belongs to — through the whole pipeline, capture included.
+pub struct RunDeltaSink(pub Arc<dyn DeltaSink>);
+
+/// One live Run frame from somebody else's Run, for the renderer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunFrameEvent {
+    shared_thread_id: String,
+    run_no: u64,
+    /// The `SessionDelta` the Runner's agent emitted, as JSON.
+    delta: serde_json::Value,
 }
 
 /// An error the renderer can branch on: `code` is the server's where there is
@@ -247,26 +289,35 @@ pub async fn shared_thread_join(
 /// the first time the person opens one of the thread's files or prompts in it.
 #[tauri::command]
 pub async fn shared_thread_open(app: AppHandle, shared_thread_id: String) -> Result<String> {
-    let commands = {
-        let state = app.state::<SharedThreadsState>();
-        let running = state.running.lock().map_err(|_| poisoned())?;
-        running
-            .get(&shared_thread_id)
-            .map(|r| r.commands.clone())
-            .ok_or_else(|| {
-                SharedThreadError::new("not_joined", "This thread is not joined on this machine.")
-            })?
-    };
+    let commands = commands_for(&app, &shared_thread_id)?;
     let (reply, answer) = oneshot::channel();
     commands
         .send(SyncCommand::Materialize(reply))
-        .await
-        .map_err(|_| {
-            SharedThreadError::new("disconnected", "The thread's connection has closed.")
-        })?;
+        .map_err(|_| disconnected())?;
     let root = answer
         .await
-        .map_err(|_| SharedThreadError::new("disconnected", "The thread's connection has closed."))?
+        .map_err(|_| disconnected())?
+        .map_err(|e| SharedThreadError::new("checkout_failed", e))?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
+/// The thread's Run worktree on this machine, created if needed and holding
+/// canonical state now. Open the agent session for running in the thread
+/// here: every prompt sent in it is then a Run (ATL-405).
+#[tauri::command]
+pub async fn shared_thread_run_worktree(
+    app: AppHandle,
+    shared_thread_id: String,
+) -> Result<String> {
+    let commands = commands_for(&app, &shared_thread_id)?;
+    let worktree = run_root(&app, &shared_thread_id)?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::PrepareRun { worktree, reply })
+        .map_err(|_| disconnected())?;
+    let root = answer
+        .await
+        .map_err(|_| disconnected())?
         .map_err(|e| SharedThreadError::new("checkout_failed", e))?;
     Ok(root.to_string_lossy().into_owned())
 }
@@ -303,7 +354,7 @@ pub async fn shared_thread_leave(app: AppHandle, shared_thread_id: String) -> Re
         running.remove(&shared_thread_id)
     };
     if let Some(running) = removed {
-        let _ = running.commands.send(SyncCommand::Stop).await;
+        let _ = running.commands.send(SyncCommand::Stop);
     }
     forget(&app, &shared_thread_id)?;
     emit_all(&app);
@@ -393,10 +444,42 @@ async fn start(
             .collect();
     }
 
-    let (commands, rx) = mpsc::channel(16);
+    let (commands, rx) = mpsc::unbounded_channel();
     let (status_tx, status) = watch::channel(SyncStatus::default());
     let mut updates = status.clone();
-    tauri::async_runtime::spawn(atlas_thread_sync::run(session, rx, status_tx));
+    let (events, mut heard) = mpsc::unbounded_channel();
+    session.set_events(events);
+    let blobs = HttpBlobs {
+        org_id: entry.org_id.clone(),
+        workspace_id: entry.workspace_id.clone(),
+        shared_thread_id: entry.shared_thread_id.clone(),
+        app: app.clone(),
+    };
+    tauri::async_runtime::spawn(atlas_thread_sync::run(session, rx, status_tx, blobs));
+    {
+        let forward = app.clone();
+        let shared_thread_id = entry.shared_thread_id.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(ThreadEvent::RunFrame {
+                run_no, payload, ..
+            }) = heard.recv().await
+            {
+                // A frame that is not JSON is somebody else's client's
+                // business; the renderer only draws deltas.
+                let Ok(delta) = serde_json::from_slice(&payload) else {
+                    continue;
+                };
+                let _ = forward.emit(
+                    SHARED_RUN_FRAME_EVENT,
+                    RunFrameEvent {
+                        shared_thread_id: shared_thread_id.clone(),
+                        run_no,
+                        delta,
+                    },
+                );
+            }
+        });
+    }
     {
         let forward = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -428,6 +511,290 @@ async fn start(
     }
     emit_all(app);
     Ok(view)
+}
+
+fn commands_for(
+    app: &AppHandle,
+    shared_thread_id: &str,
+) -> Result<mpsc::UnboundedSender<SyncCommand>> {
+    let state = app.state::<SharedThreadsState>();
+    let running = state.running.lock().map_err(|_| poisoned())?;
+    running
+        .get(shared_thread_id)
+        .map(|r| r.commands.clone())
+        .ok_or_else(|| {
+            SharedThreadError::new("not_joined", "This thread is not joined on this machine.")
+        })
+}
+
+fn disconnected() -> SharedThreadError {
+    SharedThreadError::new("disconnected", "The thread's connection has closed.")
+}
+
+// ---------------------------------------------------------------------------
+// Runs (ATL-405)
+// ---------------------------------------------------------------------------
+
+/// Called by `agents_send` before a prompt reaches the agent. When the
+/// session works in a joined thread's Run worktree, the prompt is a Run: the
+/// worktree is reset to canonical state at the fork and the thread is told.
+/// Any other session is left alone. A refusal (the concurrent-Runs limit, a
+/// viewer, a closed thread) fails the send with the server's words, so the
+/// agent never works on a fork nobody will merge.
+pub async fn begin_run(
+    app: &AppHandle,
+    agent_id: &AgentId,
+    session_id: &str,
+    cwd: &str,
+    agent: &str,
+    model: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(shared_thread_id) = thread_for_run_worktree(app, cwd) else {
+        return Ok(());
+    };
+    {
+        let state = app.state::<SharedThreadsState>();
+        let runs = state.runs.lock().map_err(|_| "poisoned".to_string())?;
+        if runs.contains_key(session_id) {
+            // A follow-up sent mid-turn joins the Run already in flight.
+            return Ok(());
+        }
+    }
+    let commands = commands_for(app, &shared_thread_id).map_err(|e| e.message)?;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(SyncCommand::StartRun {
+            worktree: PathBuf::from(cwd),
+            spec: RunSpec {
+                run_id: RunSpec::new_id(),
+                agent: agent.to_string(),
+                model: model.unwrap_or("default").to_string(),
+                context_anchor: None,
+            },
+            reply,
+        })
+        .map_err(|_| disconnected().message)?;
+    let started = answer
+        .await
+        .map_err(|_| disconnected().message)?
+        .map_err(|e| format!("This Shared Thread refused the Run: {e}"))?;
+    tag_session(app, session_id, &shared_thread_id);
+    {
+        let state = app.state::<SharedThreadsState>();
+        let mut runs = state.runs.lock().map_err(|_| "poisoned".to_string())?;
+        runs.insert(
+            session_id.to_string(),
+            LiveRun {
+                shared_thread_id: shared_thread_id.clone(),
+                run_id: started.run_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        );
+    }
+    emit_delta(
+        app,
+        agent_id,
+        session_id,
+        SessionDelta::SharedRunStarted {
+            shared_thread_id,
+            run_id: started.run_id,
+            run_no: started.run_no,
+        },
+    );
+    Ok(())
+}
+
+/// The joined thread whose Run worktree is `cwd`, if any.
+fn thread_for_run_worktree(app: &AppHandle, cwd: &str) -> Option<String> {
+    let state = app.state::<SharedThreadsState>();
+    let running = state.running.lock().ok()?;
+    let cwd = Path::new(cwd);
+    running
+        .keys()
+        .find(|id| run_root(app, id).is_ok_and(|root| root == cwd))
+        .cloned()
+}
+
+/// Link the Runner's local thread to the Shared Thread, so its Session is
+/// tagged with the thread id on the normal drain.
+fn tag_session(app: &AppHandle, session_id: &str, shared_thread_id: &str) {
+    let Some(host) = app.try_state::<Arc<AgentHost>>() else {
+        return;
+    };
+    let Some(recorder) = host.history() else {
+        return;
+    };
+    let store = recorder.store();
+    let Some(thread) = store.thread_for_session(&acp::SessionId::new(session_id)) else {
+        return;
+    };
+    if thread
+        .shared
+        .as_ref()
+        .is_some_and(|s| s.shared_thread_id == shared_thread_id)
+    {
+        return;
+    }
+    let entry = {
+        let state = app.state::<SharedThreadsState>();
+        let running = state.running.lock().ok();
+        running.and_then(|r| r.get(shared_thread_id).map(|r| r.entry.clone()))
+    };
+    if let Some(entry) = entry {
+        store.set_shared_thread(
+            thread.thread_id,
+            Some(SharedThreadLink {
+                shared_thread_id: entry.shared_thread_id,
+                base: entry.base,
+                role: entry.role,
+            }),
+        );
+    }
+}
+
+fn emit_delta(app: &AppHandle, agent_id: &AgentId, session_id: &str, delta: SessionDelta) {
+    if let Some(sink) = app.try_state::<RunDeltaSink>() {
+        sink.0.emit(SessionDeltaEnvelope {
+            agent_id: agent_id.clone(),
+            session_id: session_id.to_string(),
+            delta,
+        });
+    }
+}
+
+/// Streams a Run's deltas to its thread, and merges the Run when its turn
+/// ends. A pipeline stage rather than a bus subscriber, like capture: the bus
+/// drops events for a slow subscriber, and the turn's end must never be
+/// missed. It only hands frames to the thread's loop, which never blocks here.
+pub struct SharedRunMiddleware {
+    pub app: AppHandle,
+}
+
+impl OutboundMiddleware<SessionDeltaEnvelope> for SharedRunMiddleware {
+    fn on_event(&self, envelope: &SessionDeltaEnvelope) {
+        if matches!(
+            envelope.delta,
+            SessionDelta::SharedRunStarted { .. } | SessionDelta::SharedRunEnded { .. }
+        ) {
+            return;
+        }
+        let state = self.app.state::<SharedThreadsState>();
+        let Ok(mut runs) = state.runs.lock() else {
+            return;
+        };
+        let Some(run) = runs.get(&envelope.session_id) else {
+            return;
+        };
+        let Ok(commands) = commands_for(&self.app, &run.shared_thread_id) else {
+            runs.remove(&envelope.session_id);
+            return;
+        };
+        if let Ok(payload) = serde_json::to_vec(&envelope.delta) {
+            let _ = commands.send(SyncCommand::RunFrame {
+                run_id: run.run_id.clone(),
+                payload,
+            });
+        }
+        let interrupted = match &envelope.delta {
+            SessionDelta::TurnFinished { .. } => false,
+            SessionDelta::TurnFailed { .. } | SessionDelta::AgentDisconnected { .. } => true,
+            _ => return,
+        };
+        let Some(run) = runs.remove(&envelope.session_id) else {
+            return;
+        };
+        drop(runs);
+        let app = self.app.clone();
+        let session_id = envelope.session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let ended = if interrupted {
+                let _ = commands.send(SyncCommand::InterruptRun {
+                    run_id: run.run_id.clone(),
+                });
+                SessionDelta::SharedRunEnded {
+                    shared_thread_id: run.shared_thread_id.clone(),
+                    run_id: run.run_id.clone(),
+                    status: "interrupted".into(),
+                    files: Vec::new(),
+                    version: None,
+                    error: None,
+                }
+            } else {
+                let (reply, answer) = oneshot::channel();
+                let _ = commands.send(SyncCommand::FinishRun {
+                    run_id: run.run_id.clone(),
+                    reply: Some(reply),
+                });
+                let result = answer
+                    .await
+                    .unwrap_or_else(|_| Err("the thread's connection closed".into()));
+                match result {
+                    Ok(report) => SessionDelta::SharedRunEnded {
+                        shared_thread_id: run.shared_thread_id.clone(),
+                        run_id: run.run_id.clone(),
+                        status: if report.version.is_some() {
+                            "merged"
+                        } else {
+                            "ended"
+                        }
+                        .into(),
+                        files: report.files,
+                        version: report.version,
+                        error: (!report.unuploaded.is_empty()).then(|| {
+                            format!(
+                                "Merged, but these files' Version copies did not upload: {}",
+                                report.unuploaded.join(", ")
+                            )
+                        }),
+                    },
+                    Err(error) => SessionDelta::SharedRunEnded {
+                        shared_thread_id: run.shared_thread_id.clone(),
+                        run_id: run.run_id.clone(),
+                        status: "ended".into(),
+                        files: Vec::new(),
+                        version: None,
+                        error: Some(error),
+                    },
+                }
+            };
+            emit_delta(&app, &run.agent_id, &session_id, ended);
+        });
+    }
+}
+
+/// The thread's blob door, for a Run's Thread Version content.
+struct HttpBlobs {
+    app: AppHandle,
+    org_id: String,
+    workspace_id: String,
+    shared_thread_id: String,
+}
+
+impl BlobSink for HttpBlobs {
+    async fn put(&self, sha256: &str, bytes: Vec<u8>) -> std::result::Result<(), String> {
+        let token = token(&self.app).await.map_err(|e| e.message)?;
+        let url = format!(
+            "{}/threads/{}/blobs/{sha256}?org={}&workspace={}",
+            atlas_artifacts::ingest_base(),
+            self.shared_thread_id,
+            self.org_id,
+            self.workspace_id,
+        );
+        let res = client()
+            .map_err(|e| e.message)?
+            .put(url)
+            .bearer_auth(token)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("blob upload answered {}", res.status()))
+        }
+    }
 }
 
 fn view_of(app: &AppHandle, shared_thread_id: &str) -> Option<SharedThreadView> {
@@ -742,6 +1109,15 @@ fn forget(app: &AppHandle, shared_thread_id: &str) -> Result<()> {
 }
 
 fn replica_root(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
+    Ok(thread_dir(app, shared_thread_id)?.join("replica"))
+}
+
+/// The thread's Run worktree on this machine (ATL-405).
+fn run_root(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
+    Ok(thread_dir(app, shared_thread_id)?.join("run"))
+}
+
+fn thread_dir(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
     // The id came from the server or a link; it is a path segment here, so it
     // is held to the server's own alphabet before it touches the filesystem.
     if shared_thread_id.is_empty()
@@ -758,10 +1134,7 @@ fn replica_root(app: &AppHandle, shared_thread_id: &str) -> Result<PathBuf> {
         .path()
         .app_data_dir()
         .map_err(|e| SharedThreadError::new("internal", e.to_string()))?;
-    Ok(data
-        .join("shared-threads")
-        .join(shared_thread_id)
-        .join("replica"))
+    Ok(data.join("shared-threads").join(shared_thread_id))
 }
 
 #[cfg(test)]

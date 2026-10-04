@@ -5,15 +5,25 @@
 //! ways. Every frame it sends carries the next `client_seq`, so a resend after
 //! a lost ack is recognised by the server and stored once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+
 use crate::git;
+use crate::merge::{self, MergeError};
 use crate::replica::{looks_textual, LocalChange, Replica, ReplicaError};
+use crate::runs::{ActiveRun, Fork, RunReport, RunSpec, RunWorktree};
 use crate::secrets::{secret_reason, SecretReason};
 use crate::transport::{Message, Transport, TransportError};
-use crate::wire::{self, ClientControl, FileKind, Frame, FrameKind, Role, ServerControl};
+use crate::wire::{
+    self, ClientControl, FileKind, FileVersion, Frame, FrameKind, MergeFile, Role, RunOutcome,
+    ServerControl, ThreadRun,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -27,6 +37,64 @@ pub enum SessionError {
     ClosedEarly,
     #[error("timed out waiting for the server")]
     Timeout,
+    /// The Run's changes overlap edits made since it forked. Nothing was
+    /// merged; the Run's result is still in its worktree (ATL-410 turns these
+    /// into Conflicts).
+    #[error("the Run's changes overlap edits made since it started: {}", .0.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", "))]
+    Overlap(Vec<(String, Vec<std::ops::Range<usize>>)>),
+    #[error("the merge was rejected {0} times in a row; try again")]
+    MergeStarved(u32),
+}
+
+/// Where a Run's resulting blobs go for its Thread Version: the thread's blob
+/// door (`PUT /threads/{id}/blobs/{sha256}`) in the app, a map in tests.
+pub trait BlobSink: Send + Sync {
+    fn put(&self, sha256: &str, bytes: Vec<u8>) -> impl Future<Output = Result<(), String>> + Send;
+}
+
+/// What the app hears about besides status: other people's live Run frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadEvent {
+    /// A live Run frame — a `SessionDelta` (kind 3) or a Run file (kind 4).
+    /// Never stored; the durable copy is the Runner's Session.
+    RunFrame {
+        run_no: u64,
+        kind: u8,
+        payload: Vec<u8>,
+    },
+}
+
+/// A Run as the app shows it: the server's view plus the files its merge
+/// changed, by path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunView {
+    #[serde(flatten)]
+    pub run: ThreadRun,
+    pub files: Vec<String>,
+}
+
+/// How many times a rejected merge is recomputed before giving up.
+const MERGE_ATTEMPTS: u32 = 8;
+
+/// Runs kept for display; the server has the full list.
+const RUNS_KEPT: usize = 50;
+
+/// What the server answered to one frame this session is waiting on.
+#[derive(Debug)]
+enum Answer {
+    Ack,
+    Nack {
+        code: String,
+        message: String,
+    },
+    Accepted {
+        version: u64,
+        files: Vec<FileVersion>,
+    },
+    Rejected {
+        versions: Vec<FileVersion>,
+    },
 }
 
 /// How long to wait for the server's answer to something we asked.
@@ -52,6 +120,13 @@ pub struct ThreadSession<T: Transport> {
     gaps: u64,
     updates_sent: u64,
     last_nack: Option<(String, String)>,
+    /// Each file's merge version, as last heard (ADR-0022).
+    versions: HashMap<u64, u64>,
+    runs: BTreeMap<String, RunView>,
+    /// `client_seq`s whose answer a caller is waiting for, and the answers.
+    awaiting: HashSet<u64>,
+    answers: HashMap<u64, Answer>,
+    events: Option<mpsc::UnboundedSender<ThreadEvent>>,
 }
 
 impl<T: Transport> ThreadSession<T> {
@@ -84,6 +159,11 @@ impl<T: Transport> ThreadSession<T> {
             gaps: 0,
             updates_sent: 0,
             last_nack: None,
+            versions: HashMap::new(),
+            runs: BTreeMap::new(),
+            awaiting: HashSet::new(),
+            answers: HashMap::new(),
+            events: None,
         };
         loop {
             let message = tokio::time::timeout(ANSWER_TIMEOUT, session.transport.recv())
@@ -122,6 +202,318 @@ impl<T: Transport> ThreadSession<T> {
 
     pub fn last_nack(&self) -> Option<&(String, String)> {
         self.last_nack.as_ref()
+    }
+
+    /// Where other people's live Run frames go.
+    pub fn set_events(&mut self, events: mpsc::UnboundedSender<ThreadEvent>) {
+        self.events = Some(events);
+    }
+
+    /// The Runs this session has heard of, newest first.
+    pub fn runs(&self) -> Vec<RunView> {
+        let mut runs: Vec<RunView> = self.runs.values().cloned().collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.run.run_no));
+        runs
+    }
+
+    /// A file's merge version as this session last heard it.
+    pub fn merge_version(&self, file_id: u64) -> u64 {
+        self.versions.get(&file_id).copied().unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Runs (ADR-0022, ATL-405)
+    // -----------------------------------------------------------------------
+
+    /// Reset the Run worktree to canonical state now, creating it if needed.
+    /// A Run started later resets it again at its own fork.
+    pub fn prepare_run(&self, worktree: &RunWorktree) -> Result<(), SessionError> {
+        let fork = Fork {
+            seq: self.head,
+            files: self.replica.fork_files(),
+        };
+        Ok(worktree.reset(&fork)?)
+    }
+
+    /// Start a Run: fork canonical state as this replica holds it now, reset
+    /// the Run worktree to it, and tell the thread. Refused by the server over
+    /// the concurrent-Runs limit, for a viewer, or on a closed thread.
+    pub async fn start_run(
+        &mut self,
+        worktree: &RunWorktree,
+        spec: RunSpec,
+    ) -> Result<ActiveRun, SessionError> {
+        let fork = Fork {
+            seq: self.head,
+            files: self.replica.fork_files(),
+        };
+        worktree.reset(&fork)?;
+        let client_seq = self.take_client_seq();
+        let start = ClientControl::RunStart {
+            client_seq,
+            run_id: spec.run_id.clone(),
+            agent: spec.agent,
+            model: spec.model,
+            fork_seq: fork.seq,
+            context_anchor: spec.context_anchor,
+        };
+        match self.ask(client_seq, &start).await? {
+            Answer::Ack => {}
+            Answer::Nack { code, message } => return Err(SessionError::Refused { code, message }),
+            other => return Err(unexpected(&other)),
+        }
+        // The `run` frame that names its number follows the ack.
+        let run_no = loop {
+            if let Some(view) = self.runs.get(&spec.run_id) {
+                break view.run.run_no;
+            }
+            self.receive_one().await?;
+        };
+        Ok(ActiveRun {
+            run_id: spec.run_id,
+            run_no,
+            fork,
+            worktree: worktree.root().to_path_buf(),
+        })
+    }
+
+    /// Stream one live Run frame (a serialized `SessionDelta`, say) to
+    /// everyone else. Live frames are a view, not a record: one too large for
+    /// a frame is dropped, since the Session drain carries the durable copy.
+    pub async fn stream_run(
+        &mut self,
+        run_no: u64,
+        kind: FrameKind,
+        payload: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if payload.len() > wire::MAX_PAYLOAD_BYTES {
+            tracing::debug!(target: "atlas_thread_sync", bytes = payload.len(), "live Run frame too large; skipped");
+            return Ok(());
+        }
+        let client_seq = self.take_client_seq();
+        let bytes =
+            wire::encode(&Frame::run(kind, run_no, client_seq, payload)).expect("small numbers");
+        self.transport.send(Message::Binary(bytes)).await?;
+        Ok(())
+    }
+
+    /// The turn is over: merge what the Run left in its worktree into
+    /// canonical state — three-way against the fork and canonical state now,
+    /// submitted with each file's merge version and recomputed whenever
+    /// another merge got there first — then upload the resulting blobs for the
+    /// Thread Version and end the Run.
+    ///
+    /// Overlapping hunks fail the merge with [`SessionError::Overlap`]; the
+    /// Run is ended unmerged and its result stays in the worktree.
+    pub async fn finish_run<B: BlobSink>(
+        &mut self,
+        run: &ActiveRun,
+        worktree: &RunWorktree,
+        blobs: &B,
+    ) -> Result<RunReport, SessionError> {
+        let changes = worktree.changes(&run.fork)?;
+        let mut report = RunReport::default();
+        for _ in 0..MERGE_ATTEMPTS {
+            let mut planned = Vec::new();
+            let mut overlaps = Vec::new();
+            for change in &changes {
+                let (file_id, fork) = match change.file_id {
+                    Some(id) => (id, run.fork.files[&id].snapshot.clone()),
+                    // A file the Run created forks from its Base content (or
+                    // nothing) — even if somebody else created it meanwhile.
+                    None => (
+                        self.ensure_file(&change.path, true).await?,
+                        self.replica.seed_snapshot(&change.path)?,
+                    ),
+                };
+                let canonical = self
+                    .replica
+                    .snapshot(file_id)
+                    .ok_or(ReplicaError::UnknownFile(file_id))?;
+                match merge::three_way(&fork, &change.content, &canonical) {
+                    Ok(Some(merged)) => planned.push((file_id, change.path.clone(), merged)),
+                    Ok(None) => {}
+                    Err(MergeError::Overlap { lines }) => {
+                        overlaps.push((change.path.clone(), lines))
+                    }
+                    Err(MergeError::Doc(e)) => return Err(ReplicaError::Doc(e).into()),
+                }
+            }
+            if !overlaps.is_empty() {
+                self.end_run(&run.run_id, RunOutcome::Completed).await?;
+                return Err(SessionError::Overlap(overlaps));
+            }
+            if planned.is_empty() {
+                self.end_run(&run.run_id, RunOutcome::Completed).await?;
+                return Ok(report);
+            }
+            let total: usize = planned.iter().map(|(_, _, m)| m.update.len()).sum();
+            if total > MAX_MERGE_BYTES
+                || planned
+                    .iter()
+                    .any(|(_, _, m)| m.update.len() > wire::MAX_PAYLOAD_BYTES)
+            {
+                // Splitting a merge across submits is not this slice's.
+                self.end_run(&run.run_id, RunOutcome::Completed).await?;
+                return Err(SessionError::Refused {
+                    code: "payload_too_large".into(),
+                    message: format!(
+                        "the Run's merge is {total} bytes of updates, over what one merge carries"
+                    ),
+                });
+            }
+            let files: Vec<MergeFile> = planned
+                .iter()
+                .map(|(file_id, _, m)| MergeFile {
+                    file_id: *file_id,
+                    base_version: self.merge_version(*file_id),
+                    update: base64::engine::general_purpose::STANDARD.encode(&m.update),
+                    blob: sha256_hex(m.content.as_bytes()),
+                })
+                .collect();
+            let client_seq = self.take_client_seq();
+            let submit = ClientControl::MergeSubmit {
+                client_seq,
+                run_id: run.run_id.clone(),
+                files: files.clone(),
+            };
+            match self.ask(client_seq, &submit).await? {
+                Answer::Accepted {
+                    version,
+                    files: landed,
+                } => {
+                    for (file_id, _, merged) in &planned {
+                        // The server relays the merge to everybody else; this
+                        // replica applies it itself. A save made meanwhile is
+                        // folded in and goes out as its own change.
+                        if let Some(local) = self.replica.apply_remote(*file_id, &merged.update)? {
+                            self.send_update(*file_id, local).await?;
+                        }
+                    }
+                    for v in landed {
+                        self.versions.insert(v.file_id, v.version);
+                    }
+                    self.head = self.head.max(version);
+                    report.version = Some(version);
+                    report.files = planned.iter().map(|(_, path, _)| path.clone()).collect();
+                    if let Some(view) = self.runs.get_mut(&run.run_id) {
+                        view.files.clone_from(&report.files);
+                    }
+                    for ((_, path, merged), file) in planned.into_iter().zip(&files) {
+                        if let Err(e) = blobs.put(&file.blob, merged.content.into_bytes()).await {
+                            tracing::warn!(target: "atlas_thread_sync", %path, "Thread Version blob upload failed: {e}");
+                            report.unuploaded.push(path);
+                        }
+                    }
+                    self.end_run(&run.run_id, RunOutcome::Completed).await?;
+                    return Ok(report);
+                }
+                Answer::Rejected { versions } => {
+                    // Another merge landed on one of these files; its changes
+                    // arrived ahead of this answer, so recomputing against
+                    // the replica now merges onto them.
+                    for v in versions {
+                        self.versions.insert(v.file_id, v.version);
+                    }
+                    report.retries += 1;
+                }
+                Answer::Nack { code, message } => {
+                    return Err(SessionError::Refused { code, message })
+                }
+                Answer::Ack => return Err(unexpected(&Answer::Ack)),
+            }
+        }
+        self.end_run(&run.run_id, RunOutcome::Completed).await?;
+        Err(SessionError::MergeStarved(MERGE_ATTEMPTS))
+    }
+
+    /// The Run will not finish (the agent failed or was cancelled): mark it
+    /// interrupted, merging nothing.
+    pub async fn interrupt_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        self.end_run(run_id, RunOutcome::Interrupted).await
+    }
+
+    async fn end_run(&mut self, run_id: &str, outcome: RunOutcome) -> Result<(), SessionError> {
+        let client_seq = self.take_client_seq();
+        let end = ClientControl::RunEnd {
+            client_seq,
+            run_id: run_id.to_string(),
+            outcome,
+        };
+        match self.ask(client_seq, &end).await? {
+            Answer::Ack => Ok(()),
+            Answer::Nack { code, message } => Err(SessionError::Refused { code, message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Send a control frame and handle whatever arrives until it is answered.
+    async fn ask(
+        &mut self,
+        client_seq: u64,
+        frame: &ClientControl,
+    ) -> Result<Answer, SessionError> {
+        self.awaiting.insert(client_seq);
+        let sent = self
+            .transport
+            .send(Message::Text(
+                serde_json::to_string(frame).expect("control frames are JSON"),
+            ))
+            .await;
+        if let Err(e) = sent {
+            self.awaiting.remove(&client_seq);
+            return Err(e.into());
+        }
+        let answer = loop {
+            if let Some(answer) = self.answers.remove(&client_seq) {
+                break Ok(answer);
+            }
+            if let Err(e) = self.receive_one().await {
+                break Err(e);
+            }
+        };
+        self.awaiting.remove(&client_seq);
+        answer
+    }
+
+    async fn receive_one(&mut self) -> Result<(), SessionError> {
+        let message = tokio::time::timeout(ANSWER_TIMEOUT, self.transport.recv())
+            .await
+            .map_err(|_| SessionError::Timeout)?
+            .ok_or(SessionError::ClosedEarly)?;
+        self.handle(message).await.map(|_| ())
+    }
+
+    fn answer(&mut self, client_seq: u64, answer: Answer) {
+        if self.awaiting.contains(&client_seq) {
+            self.answers.insert(client_seq, answer);
+        }
+    }
+
+    fn note_run(&mut self, run: ThreadRun) {
+        match self.runs.get_mut(&run.run_id) {
+            Some(view) => view.run = run,
+            None => {
+                self.runs.insert(
+                    run.run_id.clone(),
+                    RunView {
+                        run,
+                        files: Vec::new(),
+                    },
+                );
+            }
+        }
+        while self.runs.len() > RUNS_KEPT {
+            let oldest = self
+                .runs
+                .iter()
+                .min_by_key(|(_, v)| v.run.run_no)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => self.runs.remove(&k),
+                None => break,
+            };
+        }
     }
 
     /// Check the worktree out (lazily, once) and write the canonical state on
@@ -312,6 +704,9 @@ impl<T: Transport> ThreadSession<T> {
                     }
                     ServerControl::Tree { seq, entry } => {
                         self.saw_seq(seq);
+                        if let Some(version) = entry.merge_version {
+                            self.versions.insert(entry.file_id, version);
+                        }
                         self.replica.add_entry(entry.file_id, &entry.path)?;
                     }
                     ServerControl::Ack {
@@ -320,6 +715,7 @@ impl<T: Transport> ThreadSession<T> {
                         file_id,
                     } => {
                         self.saw_seq(seq);
+                        self.answer(client_seq, Answer::Ack);
                         if let (Some(path), Some(file_id)) =
                             (self.pending_tree.remove(&client_seq), file_id)
                         {
@@ -333,6 +729,13 @@ impl<T: Transport> ThreadSession<T> {
                     } => {
                         tracing::warn!(target: "atlas_thread_sync", %code, "frame refused");
                         self.pending_tree.remove(&client_seq);
+                        self.answer(
+                            client_seq,
+                            Answer::Nack {
+                                code: code.clone(),
+                                message: message.clone(),
+                            },
+                        );
                         self.last_nack = Some((code, message));
                     }
                     ServerControl::Synced { head } => {
@@ -342,6 +745,40 @@ impl<T: Transport> ThreadSession<T> {
                     ServerControl::Error { code, message } => {
                         return Err(SessionError::Refused { code, message });
                     }
+                    ServerControl::Run { run } => self.note_run(run),
+                    ServerControl::MergeAccepted {
+                        client_seq,
+                        version,
+                        files,
+                        ..
+                    } => self.answer(client_seq, Answer::Accepted { version, files }),
+                    ServerControl::MergeRejected {
+                        client_seq,
+                        versions,
+                        ..
+                    } => self.answer(client_seq, Answer::Rejected { versions }),
+                    ServerControl::Merged {
+                        run_id,
+                        version,
+                        files,
+                    } => {
+                        // The merge's updates arrived ahead of this, in `seq`
+                        // order; here is only where each file now stands.
+                        self.head = self.head.max(version);
+                        let mut paths = Vec::new();
+                        for f in files {
+                            self.versions.insert(f.file_id, f.version);
+                            if let Some((_, path)) =
+                                self.replica.files().find(|(id, _)| *id == f.file_id)
+                            {
+                                paths.push(path.to_string());
+                            }
+                        }
+                        if let Some(view) = self.runs.get_mut(&run_id) {
+                            view.files = paths;
+                        }
+                    }
+                    ServerControl::Other => {}
                 }
             }
             Message::Binary(bytes) => {
@@ -349,6 +786,18 @@ impl<T: Transport> ThreadSession<T> {
                     tracing::warn!(target: "atlas_thread_sync", "unreadable binary frame");
                     return Ok(Handled::Other);
                 };
+                if frame.kind == FrameKind::RunStream as u8
+                    || frame.kind == FrameKind::RunFile as u8
+                {
+                    if let Some(events) = &self.events {
+                        let _ = events.send(ThreadEvent::RunFrame {
+                            run_no: frame.file_id,
+                            kind: frame.kind,
+                            payload: frame.payload,
+                        });
+                    }
+                    return Ok(Handled::Other);
+                }
                 if frame.kind != FrameKind::CanonicalUpdate as u8 {
                     return Ok(Handled::Other);
                 }
@@ -361,6 +810,24 @@ impl<T: Transport> ThreadSession<T> {
             }
         }
         Ok(Handled::Other)
+    }
+}
+
+/// Largest total of updates one `merge.submit` may carry (the server's
+/// `THREAD_MAX_MERGE_BYTES`).
+const MAX_MERGE_BYTES: usize = 768 * 1024;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn unexpected(answer: &Answer) -> SessionError {
+    SessionError::Refused {
+        code: "unexpected_answer".into(),
+        message: format!("the server answered {answer:?}"),
     }
 }
 

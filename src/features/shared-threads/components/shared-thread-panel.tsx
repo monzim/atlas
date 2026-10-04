@@ -1,21 +1,36 @@
 import { useEffect, useState } from "react";
-import { Check, Copy, FolderOpen, Link2, LogOut, ShieldAlert, Users } from "lucide-react";
+import {
+  Bot,
+  Check,
+  Copy,
+  FolderOpen,
+  Link2,
+  LogOut,
+  Play,
+  ShieldAlert,
+  Users,
+} from "lucide-react";
 
 import { Badge } from "@/ui/badge";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { cn } from "@/lib/utils";
+import { agents, ensureAgent } from "@/features/chat/lib/agents-api";
+import { openAgentSession } from "@/features/chat/lib/open-agent-session";
+import { pluginIdForAgent, type AgentType } from "@/types/agent";
 
 import {
   joinThread,
   leaveThread,
   openThread,
+  runWorktree,
   shareThread,
   sharedThreadError,
   type SharedThreadError,
+  type SharedThreadRun,
   type SharedThreadView,
 } from "../lib/shared-threads-api";
-import { useSharedThreadsStore } from "../stores/shared-threads-store";
+import { runKey, useSharedThreadsStore } from "../stores/shared-threads-store";
 
 /** What the chat pane knows about the thread it shows. */
 export interface ShareTarget {
@@ -23,6 +38,8 @@ export interface ShareTarget {
   sessionId: string | null;
   projectPath: string | null;
   title: string;
+  /** The agent the chat runs, offered for running in a joined thread. */
+  agentType?: AgentType;
 }
 
 /**
@@ -93,7 +110,11 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
   return (
     <div className="flex w-[340px] flex-col gap-3 p-3 text-xs">
       {current ? (
-        <ThreadCard thread={current} result={lastResult?.sharedThreadId === current.sharedThreadId ? lastResult : null} />
+        <ThreadCard
+          thread={current}
+          result={lastResult?.sharedThreadId === current.sharedThreadId ? lastResult : null}
+          agentType={target.agentType}
+        />
       ) : (
         <section className="flex flex-col gap-2">
           <div className="flex items-center gap-2 text-[var(--foreground)]">
@@ -101,10 +122,12 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
             <span className="font-medium">Share this thread</span>
           </div>
           <p className="leading-relaxed text-[var(--muted-foreground)]">
-            Teammates on this project can work in it with you, live. Your checked-out commit becomes the starting
-            point and your uncommitted changes are uploaded as its first changes.{" "}
-            <span className="text-[var(--secondary-foreground)]">Your repository is not uploaded</span>, and files that
-            look like secrets stay on this machine.
+            Teammates on this project can work in it with you, live. Your checked-out commit becomes
+            the starting point and your uncommitted changes are uploaded as its first changes.{" "}
+            <span className="text-[var(--secondary-foreground)]">
+              Your repository is not uploaded
+            </span>
+            , and files that look like secrets stay on this machine.
           </p>
           <Button
             size="sm"
@@ -114,7 +137,9 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
             {busy === "share" ? "Sharing…" : "Share thread"}
           </Button>
           {!target.sessionId && (
-            <p className="text-[var(--muted-foreground)]">Send a message first — a draft has nothing to share yet.</p>
+            <p className="text-[var(--muted-foreground)]">
+              Send a message first — a draft has nothing to share yet.
+            </p>
           )}
         </section>
       )}
@@ -142,7 +167,12 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
             onChange={(e) => setLink(e.target.value)}
             className="min-w-0 flex-1 font-mono"
           />
-          <Button size="sm" variant="secondary" type="submit" disabled={busy !== null || !link.trim()}>
+          <Button
+            size="sm"
+            variant="secondary"
+            type="submit"
+            disabled={busy !== null || !link.trim()}
+          >
             {busy === "join" ? "Joining…" : "Join"}
           </Button>
         </form>
@@ -150,9 +180,17 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
 
       {others.length > 0 && (
         <section className="flex flex-col gap-2">
-          <span className="text-2xs uppercase tracking-wide text-[var(--muted-foreground)]">Joined on this machine</span>
+          <span className="text-2xs uppercase tracking-wide text-[var(--muted-foreground)]">
+            Joined on this machine
+          </span>
           {others.map((t) => (
-            <ThreadCard key={t.sharedThreadId} thread={t} result={null} compact />
+            <ThreadCard
+              key={t.sharedThreadId}
+              thread={t}
+              result={null}
+              agentType={target.agentType}
+              compact
+            />
           ))}
         </section>
       )}
@@ -163,14 +201,17 @@ export function SharedThreadPanel({ target }: { target: ShareTarget }) {
 function ThreadCard({
   thread,
   result,
+  agentType,
   compact = false,
 }: {
   thread: SharedThreadView;
   result: SharedThreadView | null;
+  agentType?: AgentType;
   compact?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState<SharedThreadError | null>(null);
   const [worktree, setWorktree] = useState<string | null>(null);
   const { status } = thread;
@@ -193,6 +234,33 @@ function ThreadCard({
     }
   }
 
+  /**
+   * Open an agent chat in this thread's Run worktree: every prompt sent there
+   * is a Run — forked from canonical state, streamed live to the thread, and
+   * merged back when the turn ends (ATL-405).
+   */
+  async function runHere() {
+    setStarting(true);
+    setError(null);
+    try {
+      const cwd = await runWorktree(thread.sharedThreadId);
+      const agent = await ensureAgent(pluginIdForAgent(agentType));
+      const { key } = await agents.newSession(agent.agent_id, cwd);
+      await openAgentSession({
+        acpSessionId: key.session_id,
+        title: `${thread.title} · Runs`,
+        cwd,
+        agentType,
+      });
+    } catch (e) {
+      setError(sharedThreadError(e));
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  const mayRun = thread.role !== "viewer";
+
   return (
     <div
       className={cn(
@@ -201,8 +269,12 @@ function ThreadCard({
       )}
     >
       <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 truncate font-medium text-[var(--foreground)]">{thread.title}</span>
-        <Badge variant={status.connected ? "success" : "outline"}>{status.connected ? "Live" : "Offline"}</Badge>
+        <span className="min-w-0 flex-1 truncate font-medium text-[var(--foreground)]">
+          {thread.title}
+        </span>
+        <Badge variant={status.connected ? "success" : "outline"}>
+          {status.connected ? "Live" : "Offline"}
+        </Badge>
         <Badge variant="secondary" className="capitalize">
           {thread.role}
         </Badge>
@@ -225,7 +297,9 @@ function ThreadCard({
               {path}
             </span>
           ))}
-          <span className="text-[var(--secondary-foreground)]">Remove it and save; your edits merge with the team's.</span>
+          <span className="text-[var(--secondary-foreground)]">
+            Remove it and save; your edits merge with the team's.
+          </span>
         </div>
       )}
 
@@ -243,11 +317,25 @@ function ThreadCard({
       )}
       {result && result.sharedFiles.length > 0 && (
         <p className="text-[var(--muted-foreground)]">
-          Uploaded {result.sharedFiles.length} changed {result.sharedFiles.length === 1 ? "file" : "files"}.
+          Uploaded {result.sharedFiles.length} changed{" "}
+          {result.sharedFiles.length === 1 ? "file" : "files"}.
         </p>
       )}
 
+      {status.runs.length > 0 && <RunList threadId={thread.sharedThreadId} runs={status.runs} />}
+
       <div className="flex flex-wrap gap-1.5">
+        {mayRun && (
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={() => void runHere()}
+            disabled={starting || !status.connected}
+          >
+            <Play size={11} />
+            {starting ? "Preparing…" : "Run an agent here"}
+          </Button>
+        )}
         <Button size="xs" variant="outline" onClick={() => void copyLink()}>
           {copied ? <Check size={11} /> : <Copy size={11} />}
           {copied ? "Copied" : "Copy link"}
@@ -259,19 +347,83 @@ function ThreadCard({
         <Button
           size="xs"
           variant="ghost"
-          onClick={() => void leaveThread(thread.sharedThreadId).catch((e) => setError(sharedThreadError(e)))}
+          onClick={() =>
+            void leaveThread(thread.sharedThreadId).catch((e) => setError(sharedThreadError(e)))
+          }
         >
           <LogOut size={11} />
           Stop syncing
         </Button>
       </div>
       {worktree && (
-        <p className="break-all font-mono text-[var(--muted-foreground)]" title="Your replica — separate from your own checkout">
+        <p
+          className="break-all font-mono text-[var(--muted-foreground)]"
+          title="Your replica — separate from your own checkout"
+        >
           {worktree}
         </p>
       )}
       {error && <ErrorNote error={error} />}
     </div>
+  );
+}
+
+const RUN_STATUS: Record<
+  string,
+  { label: string; variant: "success" | "secondary" | "outline" | "warning" }
+> = {
+  running: { label: "Running", variant: "secondary" },
+  merged: { label: "Merged", variant: "success" },
+  ended: { label: "Ended", variant: "outline" },
+  interrupted: { label: "Interrupted", variant: "warning" },
+  declined: { label: "Declined", variant: "outline" },
+};
+
+/** The thread's recent Runs as chips: who prompted, who ran, agent, model and files changed. */
+function RunList({ threadId, runs }: { threadId: string; runs: SharedThreadRun[] }) {
+  const live = useSharedThreadsStore.use.live();
+  return (
+    <section className="flex flex-col gap-1.5">
+      <span className="text-2xs uppercase tracking-wide text-[var(--muted-foreground)]">Runs</span>
+      {runs.slice(0, 5).map((run) => {
+        const status = RUN_STATUS[run.status] ?? { label: run.status, variant: "outline" as const };
+        const tail = run.status === "running" ? live[runKey(threadId, run.runNo)] : undefined;
+        return (
+          <div
+            key={run.runId}
+            className="flex flex-col gap-1 rounded border border-[var(--atlas-border-subtle)] px-2 py-1.5"
+          >
+            <div className="flex items-center gap-1.5">
+              <Bot size={11} className="shrink-0 text-[var(--muted-foreground)]" />
+              <span className="tabular-nums text-[var(--muted-foreground)]">#{run.runNo}</span>
+              <span className="min-w-0 flex-1 truncate text-[var(--foreground)]">
+                {run.agent} · <span className="font-mono">{run.model}</span>
+              </span>
+              <Badge variant={status.variant}>{status.label}</Badge>
+            </div>
+            <span className="truncate text-[var(--muted-foreground)]">
+              {run.promptedBy === run.runnerId
+                ? `Prompted and run by ${run.runnerId}`
+                : `Prompted by ${run.promptedBy}, run by ${run.runnerId}`}
+            </span>
+            {run.files.length > 0 && (
+              <span
+                className="truncate font-mono text-[var(--secondary-foreground)]"
+                title={run.files.join("\n")}
+              >
+                {run.files.length} {run.files.length === 1 ? "file" : "files"}:{" "}
+                {run.files.join(", ")}
+              </span>
+            )}
+            {tail && (
+              <p className="line-clamp-3 whitespace-pre-wrap text-[var(--secondary-foreground)]">
+                {tail}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 

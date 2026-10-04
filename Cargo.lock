@@ -3412,11 +3412,13 @@ version = "0.1.0"
 dependencies = [
  "atlas-process",
  "atlas-redact",
+ "base64 0.22.1",
  "futures-util",
  "notify",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "similar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

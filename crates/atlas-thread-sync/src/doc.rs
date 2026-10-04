@@ -152,6 +152,49 @@ impl FileDoc {
     }
 }
 
+impl FileDoc {
+    /// Replace whole lines of the text, hunk by hunk, and answer the update —
+    /// or `None` for no hunks. The text must currently be `old`.
+    ///
+    /// One edit per hunk rather than [`FileDoc::set_content`]'s single span:
+    /// a Run's result is merged into a canonical state that moved since the
+    /// fork, and a span covering two far-apart hunks would delete (and
+    /// re-insert) everything between them, undoing what others did there.
+    pub fn replace_lines(
+        &self,
+        old: &str,
+        hunks: &[crate::merge::Hunk],
+        new: &str,
+    ) -> Option<Vec<u8>> {
+        if hunks.is_empty() {
+            return None;
+        }
+        let old_lines = crate::merge::lines(old);
+        let new_lines = crate::merge::lines(new);
+        let mut offsets = Vec::with_capacity(old_lines.len() + 1);
+        let mut at = 0u32;
+        offsets.push(at);
+        for line in &old_lines {
+            at += line.encode_utf16().count() as u32;
+            offsets.push(at);
+        }
+        let mut txn = self.doc.transact_mut();
+        // Back to front, so each hunk's offsets are still the fork's.
+        for hunk in hunks.iter().rev() {
+            let start = offsets[hunk.old.start];
+            let removed = offsets[hunk.old.end] - start;
+            if removed > 0 {
+                self.text.remove_range(&mut txn, start, removed);
+            }
+            let inserted: String = new_lines[hunk.new.clone()].concat();
+            if !inserted.is_empty() {
+                self.text.insert(&mut txn, start, &inserted);
+            }
+        }
+        Some(txn.encode_update_v1())
+    }
+}
+
 fn is_high_surrogate(unit: u16) -> bool {
     (0xd800..0xdc00).contains(&unit)
 }

@@ -377,9 +377,15 @@ export const ChatPanel = memo(function ChatPanel({ tabId }: ChatPanelProps) {
   const acpSessionId = session?.acpSessionId ?? "";
   // What the header's Share popover acts on (ATL-395). Memoised: the header is
   // memo'd and re-rendered per streaming frame only if a prop changes.
+  const sessionAgentType = useChatStore((s) => s.sessions[tabId]?.agentType);
   const shareTarget = useMemo<ShareTarget>(
-    () => ({ sessionId: acpSessionId || null, projectPath: projectPathForTab(tabId), title: headerTitle }),
-    [acpSessionId, tabId, headerTitle],
+    () => ({
+      sessionId: acpSessionId || null,
+      projectPath: projectPathForTab(tabId),
+      title: headerTitle,
+      agentType: sessionAgentType,
+    }),
+    [acpSessionId, tabId, headerTitle, sessionAgentType],
   );
   /** Handle on the bind effect's in-flight attempt — see `epoch` inside it.
    *  Null whenever no bind effect is mounted (tab already bound). */

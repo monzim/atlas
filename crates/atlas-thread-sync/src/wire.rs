@@ -24,8 +24,8 @@ pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 /// JS number, so anything above it would not survive the round trip.
 const MAX_SAFE: u64 = (1 << 53) - 1;
 
-/// Binary frame kinds. Only [`FrameKind::CanonicalUpdate`] is accepted by the
-/// server today; the others arrive with presence and Runs.
+/// Binary frame kinds. Canonical updates are journaled; the rest are relayed
+/// live and never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
@@ -60,6 +60,19 @@ impl Frame {
             kind: FrameKind::CanonicalUpdate as u8,
             seq: 0,
             file_id,
+            client_seq,
+            payload,
+        }
+    }
+
+    /// A live Run frame (ATL-405): the header's `file_id` slot carries the
+    /// Run's `runNo`, and the server relays it with `seq` 0, never storing it.
+    pub fn run(kind: FrameKind, run_no: u64, client_seq: u64, payload: Vec<u8>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            kind: kind as u8,
+            seq: 0,
+            file_id: run_no,
             client_seq,
             payload,
         }
@@ -136,6 +149,10 @@ pub struct TreeEntry {
     pub file_id: u64,
     pub path: String,
     pub kind: FileKind,
+    /// Advanced by every accepted merge, never by keystrokes (ADR-0022): what
+    /// `merge.submit` compares. Absent from servers before ATL-398.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +207,91 @@ pub enum ClientControl {
         path: String,
         kind: FileKind,
     },
+    /// A Run begins (ADR-0022). This replica is its Runner.
+    #[serde(rename = "run.start", rename_all = "camelCase")]
+    RunStart {
+        client_seq: u64,
+        run_id: String,
+        agent: String,
+        model: String,
+        fork_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_anchor: Option<String>,
+    },
+    /// The Run's turn is over.
+    #[serde(rename = "run.end", rename_all = "camelCase")]
+    RunEnd {
+        client_seq: u64,
+        run_id: String,
+        outcome: RunOutcome,
+    },
+    /// The Run's hunks, one Yjs update per file computed against the merge
+    /// version the Runner merged with.
+    #[serde(rename = "merge.submit", rename_all = "camelCase")]
+    MergeSubmit {
+        client_seq: u64,
+        run_id: String,
+        files: Vec<MergeFile>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOutcome {
+    Completed,
+    Interrupted,
+}
+
+/// One file of a `merge.submit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeFile {
+    pub file_id: u64,
+    pub base_version: u64,
+    /// The Yjs update, base64.
+    pub update: String,
+    /// SHA-256 hex of the file's content after the merge, uploaded under the
+    /// thread for its Thread Version.
+    pub blob: String,
+}
+
+/// A file at a merge version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersion {
+    pub file_id: u64,
+    pub version: u64,
+}
+
+/// A file another Runner's merge moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedFile {
+    pub file_id: u64,
+    pub version: u64,
+    pub blob: String,
+}
+
+/// A Run as the server describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRun {
+    pub run_id: String,
+    pub run_no: u64,
+    pub prompted_by: String,
+    pub runner_id: String,
+    pub agent: String,
+    pub model: String,
+    pub fork_seq: u64,
+    #[serde(default)]
+    pub context_anchor: Option<String>,
+    /// `running`, `merged`, `ended`, `interrupted` or `declined`.
+    pub status: String,
+    pub started_at: u64,
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+    #[serde(default)]
+    pub merged_version: Option<u64>,
 }
 
 /// Control frames the server sends.
@@ -225,6 +327,34 @@ pub enum ServerControl {
     Synced { head: u64 },
     #[serde(rename = "error")]
     Error { code: String, message: String },
+    /// A Run started, merged, ended or was interrupted. Sent to every socket.
+    #[serde(rename = "run")]
+    Run { run: ThreadRun },
+    #[serde(rename = "merge.accepted", rename_all = "camelCase")]
+    MergeAccepted {
+        client_seq: u64,
+        run_id: String,
+        version: u64,
+        files: Vec<FileVersion>,
+    },
+    /// Some file moved past its `baseVersion`: recompute and resubmit.
+    #[serde(rename = "merge.rejected", rename_all = "camelCase")]
+    MergeRejected {
+        client_seq: u64,
+        run_id: String,
+        versions: Vec<FileVersion>,
+    },
+    /// Another Runner's merge landed.
+    #[serde(rename = "merged", rename_all = "camelCase")]
+    Merged {
+        run_id: String,
+        version: u64,
+        files: Vec<MergedFile>,
+    },
+    /// Any frame this client does not act on yet (presence, bundles, roles…):
+    /// read and ignored rather than reported as unreadable.
+    #[serde(other)]
+    Other,
 }
 
 #[cfg(test)]
@@ -336,6 +466,69 @@ mod tests {
                 ..
             }
         ));
+        let start = ClientControl::RunStart {
+            client_seq: 4,
+            run_id: "run-0001".into(),
+            agent: "claude-code".into(),
+            model: "opus".into(),
+            fork_seq: 7,
+            context_anchor: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&start).unwrap(),
+            serde_json::json!({ "t": "run.start", "clientSeq": 4, "runId": "run-0001",
+                "agent": "claude-code", "model": "opus", "forkSeq": 7 })
+        );
+        let submit = ClientControl::MergeSubmit {
+            client_seq: 5,
+            run_id: "run-0001".into(),
+            files: vec![MergeFile {
+                file_id: 2,
+                base_version: 1,
+                update: "AQ==".into(),
+                blob: "a".repeat(64),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&submit).unwrap()["files"][0],
+            serde_json::json!({ "fileId": 2, "baseVersion": 1, "update": "AQ==", "blob": "a".repeat(64) })
+        );
+        let end = ClientControl::RunEnd {
+            client_seq: 6,
+            run_id: "run-0001".into(),
+            outcome: RunOutcome::Interrupted,
+        };
+        assert_eq!(
+            serde_json::to_value(&end).unwrap(),
+            serde_json::json!({ "t": "run.end", "clientSeq": 6, "runId": "run-0001", "outcome": "interrupted" })
+        );
+        let rejected: ServerControl = serde_json::from_value(serde_json::json!({
+            "t": "merge.rejected", "clientSeq": 5, "runId": "run-0001",
+            "versions": [{ "fileId": 2, "version": 3 }]
+        }))
+        .unwrap();
+        assert!(
+            matches!(rejected, ServerControl::MergeRejected { ref versions, .. }
+            if versions == &[FileVersion { file_id: 2, version: 3 }])
+        );
+        let run: ServerControl = serde_json::from_value(serde_json::json!({
+            "t": "run", "run": { "runId": "run-0001", "runNo": 1, "promptedBy": "u1",
+            "runnerId": "u1", "agent": "a", "model": "m", "forkSeq": 0, "contextAnchor": null,
+            "status": "running", "startedAt": 1, "endedAt": null, "mergedVersion": null }
+        }))
+        .unwrap();
+        assert!(matches!(run, ServerControl::Run { ref run } if run.run_no == 1));
+        // Frames this client does not act on are read, not reported unreadable.
+        let presence: ServerControl =
+            serde_json::from_str(r#"{"t":"bundle.pending","clientSeq":1,"requestId":"r"}"#)
+                .unwrap();
+        assert_eq!(presence, ServerControl::Other);
+        let entry: TreeEntry = serde_json::from_str(
+            r#"{"fileId":1,"path":"a.ts","kind":"text","baseBlob":null,"mergeVersion":2}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.merge_version, Some(2));
+
         let ack: ServerControl =
             serde_json::from_str(r#"{"t":"ack","clientSeq":1,"seq":4,"fileId":9}"#).unwrap();
         assert_eq!(

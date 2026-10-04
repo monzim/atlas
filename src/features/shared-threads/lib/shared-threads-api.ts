@@ -10,6 +10,37 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 /** Pushed by Rust whenever a joined thread's status changes. */
 export const SHARED_THREADS_EVENT = "atlas:shared-threads";
 
+/** Pushed by Rust for every live frame of somebody else's Run (ATL-405). */
+export const SHARED_RUN_FRAME_EVENT = "atlas:shared-run-frame";
+
+/**
+ * A Run (ATL-405): one agent turn in the thread, run by a participant in their
+ * own Run worktree and merged back when it ends.
+ */
+export interface SharedThreadRun {
+  runId: string;
+  /** The thread-local number shown on its chip. */
+  runNo: number;
+  promptedBy: string;
+  runnerId: string;
+  agent: string;
+  model: string;
+  forkSeq: number;
+  status: "running" | "merged" | "ended" | "interrupted" | "declined" | (string & {});
+  startedAt: number;
+  endedAt: number | null;
+  mergedVersion: number | null;
+  /** The paths its merge changed. */
+  files: string[];
+}
+
+/** One live frame: a `SessionDelta` the Runner's agent emitted. */
+export interface SharedRunFrame {
+  sharedThreadId: string;
+  runNo: number;
+  delta: { kind: string; delta?: string; [key: string]: unknown };
+}
+
 export interface SharedThreadStatus {
   connected: boolean;
   role: string | null;
@@ -22,6 +53,8 @@ export interface SharedThreadStatus {
   files: number;
   /** Files kept on this machine because they now look like they hold a secret. */
   held: string[];
+  /** The thread's Runs, newest first. */
+  runs: SharedThreadRun[];
   error: string | null;
 }
 
@@ -60,7 +93,10 @@ export interface SharedThreadError {
 
 export function sharedThreadError(e: unknown): SharedThreadError {
   if (e && typeof e === "object" && "code" in e && "message" in e) {
-    return { code: String((e as SharedThreadError).code), message: String((e as SharedThreadError).message) };
+    return {
+      code: String((e as SharedThreadError).code),
+      message: String((e as SharedThreadError).message),
+    };
   }
   return { code: "unknown", message: e instanceof Error ? e.message : String(e) };
 }
@@ -80,6 +116,14 @@ export function openThread(sharedThreadId: string) {
   return invoke<string>("shared_thread_open", { sharedThreadId });
 }
 
+/**
+ * The thread's Run worktree on this machine, holding canonical state now. An
+ * agent session opened there runs every prompt as a Run in the thread.
+ */
+export function runWorktree(sharedThreadId: string) {
+  return invoke<string>("shared_thread_run_worktree", { sharedThreadId });
+}
+
 export function listThreads() {
   return invoke<SharedThreadView[]>("shared_thread_list");
 }
@@ -89,6 +133,12 @@ export function leaveThread(sharedThreadId: string) {
   return invoke<void>("shared_thread_leave", { sharedThreadId });
 }
 
-export function onSharedThreadsChanged(apply: (threads: SharedThreadView[]) => void): Promise<UnlistenFn> {
+export function onSharedRunFrame(apply: (frame: SharedRunFrame) => void): Promise<UnlistenFn> {
+  return listen<SharedRunFrame>(SHARED_RUN_FRAME_EVENT, (event) => apply(event.payload));
+}
+
+export function onSharedThreadsChanged(
+  apply: (threads: SharedThreadView[]) => void,
+): Promise<UnlistenFn> {
   return listen<SharedThreadView[]>(SHARED_THREADS_EVENT, (event) => apply(event.payload));
 }

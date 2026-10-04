@@ -15,7 +15,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::wire::{self, ClientControl, Frame, FrameKind, Role, ServerControl, TreeEntry};
+use base64::Engine as _;
+
+use crate::session::BlobSink;
+use crate::wire::{
+    self, ClientControl, FileVersion, Frame, FrameKind, MergedFile, Role, RunOutcome,
+    ServerControl, ThreadRun, TreeEntry,
+};
 
 /// One message on the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +146,16 @@ struct Hub {
     conns: HashMap<u64, Conn>,
     /// Every binary frame any client sent, for tests that count echoes.
     received_updates: u64,
+    runs: Vec<FakeRun>,
+    /// Accepted merges by `(user, client, clientSeq)`, for idempotent resends.
+    merges: HashMap<(String, String, u64), ServerControl>,
+    /// Live Run frames relayed, for tests that check nothing was stored.
+    run_frames_relayed: u64,
+}
+
+struct FakeRun {
+    run: ThreadRun,
+    runner_client: String,
 }
 
 struct Conn {
@@ -197,6 +213,63 @@ impl FakeThreadServer {
     pub fn head(&self) -> u64 {
         self.hub.lock().expect("hub").journal.len() as u64
     }
+
+    /// The Runs the server holds, by `runNo`.
+    pub fn runs(&self) -> Vec<ThreadRun> {
+        self.hub
+            .lock()
+            .expect("hub")
+            .runs
+            .iter()
+            .map(|r| r.run.clone())
+            .collect()
+    }
+
+    /// A file's merge version.
+    pub fn merge_version(&self, file_id: u64) -> Option<u64> {
+        self.hub
+            .lock()
+            .expect("hub")
+            .tree
+            .iter()
+            .find(|e| e.file_id == file_id)
+            .and_then(|e| e.merge_version)
+    }
+
+    /// Live Run frames relayed so far. None of them is ever journaled.
+    pub fn run_frames_relayed(&self) -> u64 {
+        self.hub.lock().expect("hub").run_frames_relayed
+    }
+}
+
+/// An in-memory stand-in for the thread's blob door.
+#[derive(Clone, Default)]
+pub struct FakeBlobs {
+    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl FakeBlobs {
+    pub fn get(&self, sha256: &str) -> Option<Vec<u8>> {
+        self.blobs.lock().expect("blobs").get(sha256).cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.blobs.lock().expect("blobs").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl BlobSink for FakeBlobs {
+    async fn put(&self, sha256: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.blobs
+            .lock()
+            .map_err(|_| "poisoned".to_string())?
+            .insert(sha256.to_string(), bytes);
+        Ok(())
+    }
 }
 
 impl Hub {
@@ -205,6 +278,54 @@ impl Hub {
             let _ =
                 c.tx.send(Message::Text(serde_json::to_string(frame).expect("json")));
         }
+    }
+
+    fn broadcast(&self, frame: &ServerControl) {
+        let text = serde_json::to_string(frame).expect("json");
+        for c in self.conns.values() {
+            if c.client.is_some() {
+                let _ = c.tx.send(Message::Text(text.clone()));
+            }
+        }
+    }
+
+    fn nack(&self, conn: u64, client_seq: u64, code: &str) {
+        self.reply(
+            conn,
+            &ServerControl::Nack {
+                client_seq,
+                code: code.into(),
+                message: code.into(),
+            },
+        );
+    }
+
+    fn head(&self) -> u64 {
+        self.journal.len() as u64
+    }
+
+    /// The runner's socket went away: its Runs are interrupted, as the real
+    /// server's heartbeat sweep does.
+    fn disconnect(&mut self, conn: u64) {
+        let Some(c) = self.conns.remove(&conn) else {
+            return;
+        };
+        let Some(client) = c.client else { return };
+        let mut ended = Vec::new();
+        for r in &mut self.runs {
+            if r.run.status == "running" && r.run.runner_id == c.user && r.runner_client == client {
+                r.run.status = "interrupted".into();
+                r.run.ended_at = Some(2);
+                ended.push(r.run.clone());
+            }
+        }
+        for run in ended {
+            self.broadcast(&ServerControl::Run { run });
+        }
+    }
+
+    fn run_mut(&mut self, run_id: &str) -> Option<&mut FakeRun> {
+        self.runs.iter_mut().find(|r| r.run.run_id == run_id)
     }
 
     fn relay(&self, from: u64, message: Message) {
@@ -256,7 +377,12 @@ impl Hub {
                             (Some(entry), _) => Message::Text(
                                 serde_json::to_string(&ServerControl::Tree {
                                     seq: j.seq,
-                                    entry: entry.clone(),
+                                    entry: self
+                                        .tree
+                                        .iter()
+                                        .find(|e| e.file_id == entry.file_id)
+                                        .unwrap_or(entry)
+                                        .clone(),
                                 })
                                 .expect("json"),
                             ),
@@ -305,6 +431,7 @@ impl Hub {
                         file_id: self.tree.len() as u64 + 1,
                         path,
                         kind,
+                        merge_version: Some(0),
                     };
                     self.tree.push(entry.clone());
                     self.journal.push(Journaled {
@@ -329,6 +456,207 @@ impl Hub {
                         Message::Text(serde_json::to_string(&relayed).expect("json")),
                     );
                 }
+                Ok(ClientControl::RunStart {
+                    client_seq,
+                    run_id,
+                    agent,
+                    model,
+                    fork_seq,
+                    context_anchor,
+                }) => {
+                    let Some(client) = client else { return };
+                    if let Some(existing) = self.runs.iter().find(|r| r.run.run_id == run_id) {
+                        if existing.run.runner_id != user {
+                            return self.nack(conn, client_seq, "run_conflict");
+                        }
+                        let run = existing.run.clone();
+                        self.reply(
+                            conn,
+                            &ServerControl::Ack {
+                                client_seq,
+                                seq: self.head(),
+                                file_id: None,
+                            },
+                        );
+                        return self.reply(conn, &ServerControl::Run { run });
+                    }
+                    let run = ThreadRun {
+                        run_id,
+                        run_no: self.runs.len() as u64 + 1,
+                        prompted_by: user.clone(),
+                        runner_id: user,
+                        agent,
+                        model,
+                        fork_seq,
+                        context_anchor,
+                        status: "running".into(),
+                        started_at: 1,
+                        ended_at: None,
+                        merged_version: None,
+                    };
+                    self.runs.push(FakeRun {
+                        run: run.clone(),
+                        runner_client: client,
+                    });
+                    self.reply(
+                        conn,
+                        &ServerControl::Ack {
+                            client_seq,
+                            seq: self.head(),
+                            file_id: None,
+                        },
+                    );
+                    self.broadcast(&ServerControl::Run { run });
+                }
+                Ok(ClientControl::RunEnd {
+                    client_seq,
+                    run_id,
+                    outcome,
+                }) => {
+                    let head = self.head();
+                    let Some(r) = self.run_mut(&run_id) else {
+                        return self.nack(conn, client_seq, "run_unknown");
+                    };
+                    if r.run.runner_id != user {
+                        return self.nack(conn, client_seq, "not_runner");
+                    }
+                    if r.run.status == "running" {
+                        r.run.status = match (outcome, r.run.merged_version) {
+                            (RunOutcome::Interrupted, _) => "interrupted",
+                            (RunOutcome::Completed, Some(_)) => "merged",
+                            (RunOutcome::Completed, None) => "ended",
+                        }
+                        .into();
+                        r.run.ended_at = Some(2);
+                    }
+                    let run = r.run.clone();
+                    self.reply(
+                        conn,
+                        &ServerControl::Ack {
+                            client_seq,
+                            seq: head,
+                            file_id: None,
+                        },
+                    );
+                    self.broadcast(&ServerControl::Run { run });
+                }
+                Ok(ClientControl::MergeSubmit {
+                    client_seq,
+                    run_id,
+                    files,
+                }) => {
+                    let Some(client) = client else { return };
+                    let key = (user.clone(), client.clone(), client_seq);
+                    if let Some(prior) = self.merges.get(&key) {
+                        return self.reply(conn, &prior.clone());
+                    }
+                    match self.runs.iter().find(|r| r.run.run_id == run_id) {
+                        None => return self.nack(conn, client_seq, "run_unknown"),
+                        Some(r) if r.run.runner_id != user => {
+                            return self.nack(conn, client_seq, "not_runner")
+                        }
+                        Some(r) if r.run.status != "running" => {
+                            return self.nack(conn, client_seq, "run_unknown")
+                        }
+                        Some(_) => {}
+                    }
+                    let current = |id: u64| {
+                        self.tree
+                            .iter()
+                            .find(|e| e.file_id == id)
+                            .map(|e| e.merge_version.unwrap_or(0))
+                    };
+                    if files.iter().any(|f| current(f.file_id).is_none()) {
+                        return self.nack(conn, client_seq, "unknown_file");
+                    }
+                    if files
+                        .iter()
+                        .any(|f| current(f.file_id) != Some(f.base_version))
+                    {
+                        let versions = files
+                            .iter()
+                            .map(|f| FileVersion {
+                                file_id: f.file_id,
+                                version: current(f.file_id).unwrap_or(0),
+                            })
+                            .collect();
+                        return self.reply(
+                            conn,
+                            &ServerControl::MergeRejected {
+                                client_seq,
+                                run_id,
+                                versions,
+                            },
+                        );
+                    }
+                    let mut stored = Vec::new();
+                    let mut landed = Vec::new();
+                    let merge_client = format!("{client}#merge{client_seq}");
+                    for (i, f) in files.iter().enumerate() {
+                        let Ok(update) =
+                            base64::engine::general_purpose::STANDARD.decode(&f.update)
+                        else {
+                            return self.nack(conn, client_seq, "bad_frame");
+                        };
+                        let seq = self.journal.len() as u64 + 1;
+                        let frame = Frame {
+                            seq,
+                            ..Frame::update(f.file_id, 0, update)
+                        };
+                        self.journal.push(Journaled {
+                            seq,
+                            tree: None,
+                            frame: Some(frame.clone()),
+                            author: user.clone(),
+                            client: merge_client.clone(),
+                            client_seq: i as u64 + 1,
+                        });
+                        let entry = self
+                            .tree
+                            .iter_mut()
+                            .find(|e| e.file_id == f.file_id)
+                            .expect("checked above");
+                        let version = entry.merge_version.unwrap_or(0) + 1;
+                        entry.merge_version = Some(version);
+                        landed.push(FileVersion {
+                            file_id: f.file_id,
+                            version,
+                        });
+                        stored.push(frame);
+                    }
+                    let version = self.head();
+                    if let Some(r) = self.run_mut(&run_id) {
+                        r.run.merged_version = Some(version);
+                    }
+                    let accepted = ServerControl::MergeAccepted {
+                        client_seq,
+                        run_id: run_id.clone(),
+                        version,
+                        files: landed.clone(),
+                    };
+                    self.merges.insert(key, accepted.clone());
+                    self.reply(conn, &accepted);
+                    for frame in &stored {
+                        self.relay(conn, Message::Binary(wire::encode(frame).expect("encode")));
+                    }
+                    let merged = ServerControl::Merged {
+                        run_id,
+                        version,
+                        files: landed
+                            .iter()
+                            .zip(&files)
+                            .map(|(l, f)| MergedFile {
+                                file_id: l.file_id,
+                                version: l.version,
+                                blob: f.blob.clone(),
+                            })
+                            .collect(),
+                    };
+                    self.relay(
+                        conn,
+                        Message::Text(serde_json::to_string(&merged).expect("json")),
+                    );
+                }
                 Err(_) => {}
             },
             Message::Binary(bytes) => {
@@ -336,6 +664,29 @@ impl Hub {
                 let Some(frame) = wire::decode(&bytes) else {
                     return;
                 };
+                if frame.kind == FrameKind::RunStream as u8
+                    || frame.kind == FrameKind::RunFile as u8
+                {
+                    let ours = self.runs.iter().any(|r| {
+                        r.run.run_no == frame.file_id
+                            && r.run.status == "running"
+                            && r.run.runner_id == user
+                            && r.runner_client == client
+                    });
+                    if !ours {
+                        return self.nack(conn, frame.client_seq, "run_unknown");
+                    }
+                    self.run_frames_relayed += 1;
+                    let relayed = Frame {
+                        seq: 0,
+                        client_seq: 0,
+                        ..frame
+                    };
+                    return self.relay(
+                        conn,
+                        Message::Binary(wire::encode(&relayed).expect("encode")),
+                    );
+                }
                 if frame.kind != FrameKind::CanonicalUpdate as u8 {
                     return;
                 }
@@ -401,7 +752,7 @@ impl Transport for FakeTransport {
 impl Drop for FakeTransport {
     fn drop(&mut self) {
         if let Ok(mut hub) = self.hub.lock() {
-            hub.conns.remove(&self.conn);
+            hub.disconnect(self.conn);
         }
     }
 }

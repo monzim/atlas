@@ -2,115 +2,18 @@
 //! through the crate's public API: real temporary git repositories, and the
 //! in-process fake thread server that keeps the real one's rules.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use atlas_thread_sync::{
-    run, Command as SyncCommand, FakeThreadServer, FakeTransport, LocalChange, Replica,
-    ReplicaError, SecretReason, SyncStatus, ThreadSession,
+    run, transport::FakeBlobs, Command as SyncCommand, FakeThreadServer, FakeTransport,
+    LocalChange, Replica, ReplicaError, SecretReason, SyncStatus, ThreadSession,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 const QUIET: Duration = Duration::from_millis(50);
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn init_repo(dir: &Path) {
-    fs::create_dir_all(dir).unwrap();
-    git(dir, &["init", "--quiet", "--initial-branch=main"]);
-    git(dir, &["config", "user.name", "Atlas Test"]);
-    git(dir, &["config", "user.email", "test@atlas.invalid"]);
-}
-
-fn write(dir: &Path, rel: &str, content: &str) {
-    let target = dir.join(rel);
-    fs::create_dir_all(target.parent().unwrap()).unwrap();
-    fs::write(target, content).unwrap();
-}
-
-fn read(dir: &Path, rel: &str) -> String {
-    fs::read_to_string(dir.join(rel)).unwrap()
-}
-
-/// Joy's repository with a committed Base and some uncommitted work on top,
-/// and Monzim's clone of it — so both hold the Base.
-struct World {
-    _tmp: tempfile::TempDir,
-    joy: PathBuf,
-    monzim: PathBuf,
-    base: String,
-    replicas: PathBuf,
-}
-
-fn world() -> World {
-    let tmp = tempfile::tempdir().unwrap();
-    let joy = tmp.path().join("joy");
-    init_repo(&joy);
-    write(&joy, "src/banner.css", ".banner {\n  color: blue;\n}\n");
-    write(&joy, "README.md", "# Site\n");
-    write(&joy, ".gitignore", "dist/\n");
-    git(&joy, &["add", "-A"]);
-    git(&joy, &["commit", "--quiet", "-m", "base"]);
-    let base = git(&joy, &["rev-parse", "HEAD"]);
-
-    let monzim = tmp.path().join("monzim");
-    git(
-        tmp.path(),
-        &[
-            "clone",
-            "--quiet",
-            joy.to_str().unwrap(),
-            monzim.to_str().unwrap(),
-        ],
-    );
-
-    // Joy's uncommitted work: an edit, a new file, and build output that
-    // must never sync.
-    write(&joy, "src/banner.css", ".banner {\n  color: green;\n}\n");
-    write(&joy, "notes.md", "todo: red?\n");
-    write(&joy, "dist/bundle.js", "minified();\n");
-    write(&joy, ".env.local", "STRIPE_KEY=sk_live_not_really\n");
-
-    let replicas = tmp.path().join("replicas");
-    World {
-        _tmp: tmp,
-        joy,
-        monzim,
-        base,
-        replicas,
-    }
-}
-
-async fn open(
-    server: &FakeThreadServer,
-    repo: &Path,
-    base: &str,
-    root: &Path,
-    user: &str,
-) -> ThreadSession<FakeTransport> {
-    let replica = Replica::new(repo, base, root).unwrap();
-    ThreadSession::open(server.connect(user), replica, &format!("{user}-replica-1"))
-        .await
-        .unwrap()
-}
+mod common;
+use common::*;
 
 #[tokio::test]
 async fn sharer_work_reaches_a_joiner_who_already_has_the_base() {
@@ -348,17 +251,14 @@ async fn the_run_loop_syncs_watched_saves_and_never_echoes() {
     .await;
 
     let spawn = |session: ThreadSession<FakeTransport>| {
-        let (commands, rx) = mpsc::channel(8);
+        let (commands, rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(SyncStatus::default());
-        tokio::spawn(run(session, rx, status_tx));
+        tokio::spawn(run(session, rx, status_tx, FakeBlobs::default()));
         (commands, status)
     };
-    let materialize = |commands: mpsc::Sender<SyncCommand>| async move {
+    let materialize = |commands: mpsc::UnboundedSender<SyncCommand>| async move {
         let (reply, answer) = oneshot::channel();
-        commands
-            .send(SyncCommand::Materialize(reply))
-            .await
-            .unwrap();
+        commands.send(SyncCommand::Materialize(reply)).unwrap();
         answer.await.unwrap().unwrap()
     };
 
@@ -389,8 +289,8 @@ async fn the_run_loop_syncs_watched_saves_and_never_echoes() {
         "a remote write was echoed back"
     );
 
-    joy_cmd.send(SyncCommand::Stop).await.unwrap();
-    monzim_cmd.send(SyncCommand::Stop).await.unwrap();
+    joy_cmd.send(SyncCommand::Stop).unwrap();
+    monzim_cmd.send(SyncCommand::Stop).unwrap();
 }
 
 #[tokio::test]
