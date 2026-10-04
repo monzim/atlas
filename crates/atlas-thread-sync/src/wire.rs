@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// The `hello` capability of a desktop that runs Remote Runs (ATL-417).
+pub const CAPABILITY_REMOTE_RUN: &str = "remote_run";
+
 /// Largest payload one frame may carry. The server refuses anything bigger
 /// with `nack payload_too_large`, so the client splits first.
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -219,6 +222,13 @@ pub enum ClientControl {
         protocol: u8,
         client_id: String,
         since: u64,
+        /// `remote_run` (ATL-417): this desktop shows Remote Run requests and
+        /// executes approved ones.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+        /// The agents it runs a Remote Run with — what a teammate may ask for.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<String>,
     },
     /// What this replica says about itself (ATL-400, ATL-407): the file it is
     /// typing in, its cursors, its Runs' current files, how far behind it is.
@@ -294,6 +304,10 @@ pub enum ClientControl {
         fork_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_anchor: Option<String>,
+        /// The approved Remote Run this Run executes (ATL-417): the server
+        /// then records whoever asked as its prompter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_request_id: Option<String>,
     },
     /// The Run's turn is over.
     #[serde(rename = "run.end", rename_all = "camelCase")]
@@ -313,6 +327,28 @@ pub enum ClientControl {
         /// ones and accepted or rejected with them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conflicts: Vec<ConflictHunk>,
+    },
+    /// This Runner's own Remote Run choices for the thread (ATL-417): accept
+    /// Remote Runs, and whose requests to approve without asking. A field
+    /// left out keeps what is there; `Some(None)` clears auto-approve.
+    #[serde(rename = "remote.settings", rename_all = "camelCase")]
+    RemoteSettings {
+        client_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accept: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        auto_approve: Option<Option<String>>,
+    },
+    /// The Runner approves or declines a pending Remote Run.
+    #[serde(rename = "remote.answer", rename_all = "camelCase")]
+    RemoteAnswer {
+        client_seq: u64,
+        request_id: String,
+        approve: bool,
     },
     /// Resolve a Conflict through the same compare-and-set a merge uses:
     /// `update` (base64 Yjs) turns canonical's hunk into `resolution`.
@@ -534,7 +570,9 @@ impl ClientControl {
             | ClientControl::RunStart { client_seq, .. }
             | ClientControl::RunEnd { client_seq, .. }
             | ClientControl::MergeSubmit { client_seq, .. }
-            | ClientControl::ConflictResolve { client_seq, .. } => *client_seq,
+            | ClientControl::ConflictResolve { client_seq, .. }
+            | ClientControl::RemoteSettings { client_seq, .. }
+            | ClientControl::RemoteAnswer { client_seq, .. } => *client_seq,
         }
     }
 }
@@ -606,6 +644,64 @@ pub struct ThreadRun {
     pub ended_at: Option<u64>,
     #[serde(default)]
     pub merged_version: Option<u64>,
+}
+
+/// A field that may be absent, `null` or a value: present at all is `Some`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// Where a Remote Run request stands (ADR-0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRunStatus {
+    /// Waiting for the Runner's answer.
+    Pending,
+    /// Approved, by the Runner or their auto-approve: the Runner starts it.
+    Approved,
+    /// Declined by the Runner, or ended because access or the thread did.
+    Declined,
+    /// Nobody answered — or started it — in time.
+    TimedOut,
+    /// Its Run started.
+    Executed,
+}
+
+impl RemoteRunStatus {
+    /// Still waiting on somebody: answered or started.
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::Approved)
+    }
+}
+
+/// A Remote Run request (ATL-414, ATL-417): `requested_by` asks `runner_id`'s
+/// desktop to run `prompt` with `agent`, on the Runner's machine and bill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRun {
+    pub request_id: String,
+    pub thread_id: String,
+    pub requested_by: String,
+    pub runner_id: String,
+    pub prompt: String,
+    pub agent: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub status: RemoteRunStatus,
+    /// Approved by the Runner's auto-approve rather than by hand.
+    pub auto: bool,
+    pub requested_at: u64,
+    /// When it times out unless answered (pending) or started (approved).
+    pub expires_at: u64,
+    #[serde(default)]
+    pub answered_at: Option<u64>,
+    /// The Run that executed it.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// Control frames the server sends.
@@ -763,6 +859,30 @@ pub enum ServerControl {
     /// A peer's last socket went.
     #[serde(rename = "presence.left", rename_all = "camelCase")]
     PresenceLeft { peer_id: String, user_id: String },
+    /// Files were set back to a Thread Version (ATL-415, ATL-419): the
+    /// change's updates came first, in `seq` order; here is where each file
+    /// now stands.
+    #[serde(rename = "restored", rename_all = "camelCase")]
+    Restored {
+        version: u64,
+        from: u64,
+        author_id: String,
+        files: Vec<MergedFile>,
+    },
+    /// A Thread Version was added or marked: read the list again.
+    #[serde(rename = "version")]
+    VersionAdded { version: u64 },
+    /// A Remote Run request changed (ATL-417) — told to its Runner and to
+    /// whoever asked. `pending` asks the Runner; `approved` is the cue to run.
+    #[serde(rename = "remote.run")]
+    RemoteRun { request: RemoteRun },
+    /// This Runner's own Remote Run choices, after `synced` and on change.
+    #[serde(rename = "remote.settings", rename_all = "camelCase")]
+    RemoteSettings {
+        accept: bool,
+        #[serde(default)]
+        auto_approve: Option<String>,
+    },
     /// Any frame this client does not act on yet (presence, bundles, roles…):
     /// read and ignored rather than reported as unreadable.
     #[serde(other)]
@@ -845,11 +965,100 @@ mod tests {
     }
 
     #[test]
+    fn remote_run_frames_speak_the_servers_json() {
+        let hello = ClientControl::Hello {
+            protocol: 1,
+            client_id: "replica-01".into(),
+            since: 0,
+            capabilities: vec!["remote_run".into()],
+            agents: vec!["claude-code".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap(),
+            serde_json::json!({ "t": "hello", "protocol": 1, "clientId": "replica-01", "since": 0,
+                "capabilities": ["remote_run"], "agents": ["claude-code"] })
+        );
+        let settings = ClientControl::RemoteSettings {
+            client_seq: 3,
+            accept: Some(true),
+            auto_approve: Some(None),
+        };
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            serde_json::json!({ "t": "remote.settings", "clientSeq": 3, "accept": true, "autoApprove": null })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientControl>(
+                serde_json::to_value(&settings).unwrap()
+            )
+            .unwrap(),
+            settings
+        );
+        let keep = ClientControl::RemoteSettings {
+            client_seq: 4,
+            accept: None,
+            auto_approve: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&keep).unwrap(),
+            serde_json::json!({ "t": "remote.settings", "clientSeq": 4 })
+        );
+        let answer = ClientControl::RemoteAnswer {
+            client_seq: 5,
+            request_id: "R1".into(),
+            approve: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            serde_json::json!({ "t": "remote.answer", "clientSeq": 5, "requestId": "R1", "approve": false })
+        );
+        let start = ClientControl::RunStart {
+            client_seq: 6,
+            run_id: "run-0001".into(),
+            agent: "claude-code".into(),
+            model: "opus".into(),
+            fork_seq: 0,
+            context_anchor: None,
+            remote_request_id: Some("R1".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["remoteRequestId"],
+            serde_json::json!("R1")
+        );
+        let told: ServerControl = serde_json::from_value(serde_json::json!({
+            "t": "remote.run", "request": {
+                "requestId": "R1", "threadId": "T", "requestedBy": "monzim", "runnerId": "joy",
+                "prompt": "make it teal", "agent": "claude-code", "model": null, "status": "timed_out",
+                "auto": false, "requestedAt": 1, "expiresAt": 60001, "answeredAt": 60001, "runId": null
+            }
+        }))
+        .unwrap();
+        let ServerControl::RemoteRun { request } = told else {
+            panic!("not a remote.run");
+        };
+        assert_eq!(request.status, RemoteRunStatus::TimedOut);
+        assert!(!request.status.is_open());
+        let mine: ServerControl = serde_json::from_value(serde_json::json!({
+            "t": "remote.settings", "accept": true, "autoApprove": "monzim"
+        }))
+        .unwrap();
+        assert_eq!(
+            mine,
+            ServerControl::RemoteSettings {
+                accept: true,
+                auto_approve: Some("monzim".into())
+            }
+        );
+    }
+
+    #[test]
     fn control_frames_speak_the_servers_json() {
         let hello = ClientControl::Hello {
             protocol: 1,
             client_id: "replica-01".into(),
             since: 3,
+            capabilities: vec![],
+            agents: vec![],
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
@@ -886,6 +1095,7 @@ mod tests {
             model: "opus".into(),
             fork_seq: 7,
             context_anchor: None,
+            remote_request_id: None,
         };
         assert_eq!(
             serde_json::to_value(&start).unwrap(),

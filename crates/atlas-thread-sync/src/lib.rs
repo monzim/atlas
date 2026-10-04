@@ -20,6 +20,9 @@
 //! * [`share`] — what a share uploads, and what it holds back (ATL-402);
 //! * [`bootstrap`] — bringing the Base to a machine without it (ATL-402);
 //! * [`store`] — the thread's blob, bundle and snapshot doors;
+//! * [`versions`] — diffs against the Base or a Thread Version (ATL-419);
+//! * [`doc`] also anchors and resolves line comments (ATL-416), and the
+//!   session answers Remote Run requests made of this desktop (ATL-417);
 //! * [`run`] — the loop an app spawns per joined thread.
 
 pub mod apply;
@@ -36,6 +39,7 @@ pub mod session;
 pub mod share;
 pub mod store;
 pub mod transport;
+pub mod versions;
 pub mod watch;
 pub mod wire;
 
@@ -53,8 +57,8 @@ pub use runs::{ActiveRun, RunReport, RunSpec, RunWorktree};
 pub use secrets::SecretReason;
 pub use session::Verification;
 pub use session::{
-    Bootstrapped, ConflictView, OpenedDoc, PeerCursor, PeerRun, PeerView, Resolve, RunView,
-    SessionError, ShareReport, ThreadEvent, ThreadSession,
+    Bootstrapped, ConflictView, OpenedDoc, PeerCursor, PeerRun, PeerView, RemoteView, Resolve,
+    RunView, SessionError, ShareReport, ThreadEvent, ThreadSession,
 };
 pub use share::{ShareFile, ShareKind, SharePreview};
 pub use store::{FakeStore, ObjectStore, StoreError};
@@ -62,7 +66,7 @@ pub use transport::{
     Connector, FakeConnector, FakeThreadServer, FakeTransport, Message, NoReconnect, Transport,
     TransportError, WsTransport,
 };
-pub use wire::SyncState;
+pub use wire::{RemoteRun, RemoteRunStatus, SyncState};
 
 /// What the app can ask a running thread to do.
 pub enum Command {
@@ -151,6 +155,47 @@ pub enum Command {
     /// Whether to send this repository's history to teammates who lack the
     /// Base (ATL-402). Off until the person agrees.
     ServeHistory(bool),
+    /// This Runner's Remote Run choices here (ATL-417): accept them or not,
+    /// and whose to approve without asking (`Some(None)` clears it).
+    RemoteSettings {
+        accept: Option<bool>,
+        auto_approve: Option<Option<String>>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Approve or decline a Remote Run this person was asked to run; answers
+    /// where it stands after.
+    AnswerRemoteRun {
+        request_id: String,
+        approve: bool,
+        reply: oneshot::Sender<Result<RemoteRunStatus, String>>,
+    },
+    /// The thread's files against the Base, or against a Thread Version's
+    /// files as the server captured them (ATL-419).
+    Diff {
+        against: Option<versions::VersionFiles>,
+        reply: oneshot::Sender<Vec<versions::FileDiff>>,
+    },
+    /// The merge version this replica holds for each of `file_ids`: what a
+    /// Restore names, so a file that moved since is refused, not overwritten.
+    MergeVersions {
+        file_ids: Vec<u64>,
+        reply: oneshot::Sender<Vec<(u64, u64)>>,
+    },
+    /// Anchor lines of a text file for a line comment (ATL-416): its id and
+    /// the range, or `None` for lines or a file the thread does not have.
+    AnchorRange {
+        /// The file by its id, or else by its path in the thread.
+        file_id: Option<u64>,
+        path: String,
+        span: doc::LineSpan,
+        reply: oneshot::Sender<Option<(u64, doc::RangeAnchor)>>,
+    },
+    /// Where each `(file id, start, end)` range is now, in lines; `None`
+    /// where its text is gone.
+    ResolveRanges {
+        ranges: Vec<(u64, String, String)>,
+        reply: oneshot::Sender<Vec<Option<doc::LineSpan>>>,
+    },
     /// Close the connection and end the loop.
     Stop,
 }
@@ -202,6 +247,9 @@ pub struct SyncStatus {
     pub peers: Vec<PeerView>,
     /// Whether this replica is current, syncing or behind.
     pub sync: Option<SyncState>,
+    /// Remote Runs: this Runner's choices, and the requests this person
+    /// asked or must run (ATL-417).
+    pub remote: RemoteView,
     pub error: Option<String>,
 }
 
@@ -226,6 +274,7 @@ fn status_of<T: Transport>(session: &ThreadSession<T>, error: Option<String>) ->
         conflicts: session.conflicts(),
         peers: session.peers(),
         sync: Some(session.sync_state()),
+        remote: session.remote(),
         error,
     }
 }
@@ -510,6 +559,39 @@ pub async fn run_with<C: Connector>(
                 let _ = reply.send(session.digest_input(&goal, scope));
                 Ok(())
             }
+            Event::Command(Some(Command::Diff { against, reply })) => {
+                let diffs = match &against {
+                    Some(at) => session.diff_against_version(at).await,
+                    None => session.diff_against_base(),
+                };
+                let _ = reply.send(diffs);
+                Ok(())
+            }
+            Event::Command(Some(Command::AnchorRange {
+                file_id,
+                path,
+                span,
+                reply,
+            })) => {
+                let _ = reply.send(match file_id {
+                    Some(id) => session.anchor_range_of(id, span),
+                    None => session.anchor_range(&path, span),
+                });
+                Ok(())
+            }
+            Event::Command(Some(Command::ResolveRanges { ranges, reply })) => {
+                let _ = reply.send(session.resolve_ranges(&ranges));
+                Ok(())
+            }
+            Event::Command(Some(Command::MergeVersions { file_ids, reply })) => {
+                let _ = reply.send(
+                    file_ids
+                        .into_iter()
+                        .map(|id| (id, session.merge_version(id)))
+                        .collect(),
+                );
+                Ok(())
+            }
             Event::Command(Some(Command::RunFile { run_id, path })) => {
                 session.set_run_file(&run_id, path.as_deref());
                 Ok(())
@@ -542,6 +624,31 @@ pub async fn run_with<C: Connector>(
                         result.map(|_| ())
                     }
                     None => Ok(()),
+                }
+            }
+            Event::Command(Some(Command::RemoteSettings {
+                accept,
+                auto_approve,
+                reply,
+            })) => {
+                let result = session.set_remote_settings(accept, auto_approve).await;
+                let _ = reply.send(result.as_ref().copied().map_err(ToString::to_string));
+                // A refusal is the panel's to show; it is not the loop's error.
+                match result {
+                    Err(SessionError::Refused { .. }) => Ok(()),
+                    other => other,
+                }
+            }
+            Event::Command(Some(Command::AnswerRemoteRun {
+                request_id,
+                approve,
+                reply,
+            })) => {
+                let result = session.answer_remote_run(&request_id, approve).await;
+                let _ = reply.send(result.as_ref().map(|s| *s).map_err(ToString::to_string));
+                match result {
+                    Err(SessionError::Refused { .. }) => Ok(()),
+                    other => other.map(|_| ()),
                 }
             }
             Event::Command(Some(Command::ServeHistory(on))) => {

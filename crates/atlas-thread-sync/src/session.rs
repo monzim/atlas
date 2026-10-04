@@ -19,6 +19,7 @@ use crate::digest::{
     line_stats, DigestConflict, DigestFile, DigestInput, DigestRun, DigestScope, FileChange,
     RunTranscript,
 };
+use crate::doc::{LineSpan, RangeAnchor};
 use crate::git;
 use crate::merge::{self, MergeError};
 use crate::replica::{kind_of, EditorEdit, LocalChange, Replica, ReplicaError};
@@ -27,10 +28,12 @@ use crate::secrets::{secret_reason, SecretReason};
 use crate::share::{self, ShareKind};
 use crate::store::{NoStore, ObjectStore, StoreError};
 use crate::transport::{Message, Transport, TransportError};
+use crate::versions::{self, FileDiff, Side, VersionFiles};
 use crate::wire::{
     self, AwarenessState, BundleFailure, ChecksumStatus, ClientControl, ConflictHunk, ConflictSide,
-    Cursor, FileHash, FileKind, FileVersion, Frame, FrameKind, LineRange, MergeFile, Peer, Role,
-    RunAt, RunOutcome, ServerControl, SyncState, ThreadConflict, ThreadRun, ThreadStatus,
+    Cursor, FileHash, FileKind, FileVersion, Frame, FrameKind, LineRange, MergeFile, Peer,
+    RemoteRun, RemoteRunStatus, Role, RunAt, RunOutcome, ServerControl, SyncState, ThreadConflict,
+    ThreadRun, ThreadStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +113,30 @@ pub enum ThreadEvent {
     /// editor's copy of its document (ATL-407). It may hold changes the
     /// editor already has, which Yjs ignores.
     DocUpdate { file_id: u64, update: Vec<u8> },
+    /// A Remote Run request this person asked or must run changed (ATL-417):
+    /// `pending` for the Runner is a request to approve or decline, and
+    /// `approved` is the Runner's cue to run it.
+    RemoteRun(RemoteRun),
+    /// The thread's Thread Versions changed — a merge, a resolution, a
+    /// Restore or a mark (ATL-419): read the list again.
+    VersionsChanged,
+}
+
+/// Remote Runs as this replica knows them (ATL-417).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteView {
+    /// Who this replica is on the thread: the Runner of requests naming it.
+    pub user_id: Option<String>,
+    /// The agents this desktop offers for Remote Runs; empty when it does not
+    /// run them at all.
+    pub agents: Vec<String>,
+    /// "Accept Remote Runs" in this thread, as the server last said.
+    pub accept: bool,
+    /// The one person whose requests here are approved without asking.
+    pub auto_approve: Option<String>,
+    /// Requests this person asked or must run, newest first.
+    pub requests: Vec<RemoteRun>,
 }
 
 /// A peer as the app shows it: its awareness with file ids turned into paths.
@@ -178,6 +205,9 @@ const MERGE_ATTEMPTS: u32 = 8;
 
 /// Runs kept for display; the server has the full list.
 const RUNS_KEPT: usize = 50;
+
+/// Remote Run requests kept for display once they are over.
+const REMOTE_KEPT: usize = 20;
 
 /// What the server answered to one frame this session is waiting on.
 #[derive(Debug)]
@@ -329,6 +359,14 @@ pub struct ThreadSession<T: Transport> {
     /// New files saved while this replica could not change the thread, to
     /// introduce once it can.
     unsent_new: std::collections::BTreeSet<String>,
+    /// The agents this desktop runs Remote Runs with, said at every `hello`;
+    /// empty when it does not run them (ATL-417).
+    remote_agents: Vec<String>,
+    /// The Runner's own choices here, as the server last said.
+    remote_accept: bool,
+    remote_auto: Option<String>,
+    /// Remote Run requests this person asked or must run, by id.
+    remote_requests: BTreeMap<String, RemoteRun>,
 }
 
 impl<T: Transport> ThreadSession<T> {
@@ -352,6 +390,20 @@ impl<T: Transport> ThreadSession<T> {
         replica: Replica,
         client_id: &str,
         store: Arc<dyn ObjectStore>,
+    ) -> Result<Self, SessionError> {
+        Self::connect_offering(transport, replica, client_id, store, Vec::new()).await
+    }
+
+    /// [`ThreadSession::connect`] as a desktop that runs Remote Runs with
+    /// `agents` (ATL-417): it says so at every `hello`, hears requests made of
+    /// it, and may be asked by teammates once the person accepts. With no
+    /// agents it is an ordinary replica.
+    pub async fn connect_offering(
+        transport: T,
+        replica: Replica,
+        client_id: &str,
+        store: Arc<dyn ObjectStore>,
+        agents: Vec<String>,
     ) -> Result<Self, SessionError> {
         let mut session = Self {
             transport,
@@ -394,6 +446,10 @@ impl<T: Transport> ThreadSession<T> {
             closed: false,
             awaiting_approval: false,
             unsent_new: std::collections::BTreeSet::new(),
+            remote_agents: agents,
+            remote_accept: false,
+            remote_auto: None,
+            remote_requests: BTreeMap::new(),
         };
         if session.greet(0).await? {
             // Nothing can be ahead of a thread from 0.
@@ -411,10 +467,17 @@ impl<T: Transport> ThreadSession<T> {
         // A new socket: presence starts over, and this replica says its piece again.
         self.peers.clear();
         self.said = None;
+        let offers = !self.remote_agents.is_empty();
         let hello = ClientControl::Hello {
             protocol: wire::PROTOCOL_VERSION,
             client_id: self.client_id.clone(),
             since,
+            capabilities: if offers {
+                vec![wire::CAPABILITY_REMOTE_RUN.to_string()]
+            } else {
+                Vec::new()
+            },
+            agents: self.remote_agents.clone(),
         };
         self.send_control(&hello).await?;
         loop {
@@ -1019,6 +1082,124 @@ impl<T: Transport> ThreadSession<T> {
     }
 
     // -----------------------------------------------------------------------
+    // Thread Versions (ATL-419)
+    // -----------------------------------------------------------------------
+
+    /// Each file as canonical state holds it now: absent once deleted.
+    fn sides_now(&self) -> Vec<(u64, String, String, Side)> {
+        self.replica
+            .file_states()
+            .into_iter()
+            .map(|(id, f)| {
+                let now = if f.deleted {
+                    Side::Absent
+                } else if f.kind == FileKind::Text {
+                    Side::Text(f.text.unwrap_or_default())
+                } else {
+                    Side::Binary(f.blob)
+                };
+                (id, f.path, f.origin, now)
+            })
+            .collect()
+    }
+
+    /// The thread's files against its Base: what canonical state changed,
+    /// each file compared with what its first path held at the Base.
+    pub fn diff_against_base(&self) -> Vec<FileDiff> {
+        let has_base = self.replica.has_base();
+        let mut diffs: Vec<FileDiff> = self
+            .sides_now()
+            .into_iter()
+            .filter_map(|(id, path, origin, now)| {
+                let base = if !has_base {
+                    Side::Unavailable
+                } else {
+                    match self.replica.base_bytes(&origin) {
+                        Ok(None) => Side::Absent,
+                        Ok(Some(bytes)) if crate::replica::looks_textual(&bytes) => {
+                            Side::Text(String::from_utf8_lossy(&bytes).into_owned())
+                        }
+                        Ok(Some(_)) => Side::Binary(None),
+                        Err(_) => Side::Unavailable,
+                    }
+                };
+                versions::compare(id, &path, &base, &now, false)
+            })
+            .collect();
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        diffs
+    }
+
+    /// The thread's files against Thread Version `at` (ATL-419): each file
+    /// as the server captured it then — text fetched by its blob from the
+    /// thread's store — against canonical state now. A file whose content
+    /// cannot be read says so rather than failing the rest.
+    pub async fn diff_against_version(&self, at: &VersionFiles) -> Vec<FileDiff> {
+        let mut then: HashMap<u64, Side> = HashMap::new();
+        for f in &at.files {
+            let side = match (f.kind, &f.blob) {
+                (FileKind::Text, Some(sha)) => match self.store.get_blob(sha.clone()).await {
+                    Ok(bytes) => Side::Text(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(e) => {
+                        tracing::debug!(target: "atlas_thread_sync", "Version {} blob {sha}: {e}", at.version);
+                        Side::Unavailable
+                    }
+                },
+                (FileKind::Text, None) => Side::Unavailable,
+                (FileKind::Binary, blob) => Side::Binary(blob.clone()),
+            };
+            then.insert(f.file_id, side);
+        }
+        let mut diffs = Vec::new();
+        for (id, path, _, now) in self.sides_now() {
+            let base = then.remove(&id).unwrap_or(Side::Absent);
+            diffs.extend(versions::compare(id, &path, &base, &now, true));
+        }
+        // Files the Version had that this replica has never heard of.
+        for f in &at.files {
+            if let Some(base) = then.remove(&f.file_id) {
+                diffs.extend(versions::compare(f.file_id, &f.path, &base, &Side::Absent, true));
+            }
+        }
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        diffs
+    }
+
+    // -----------------------------------------------------------------------
+    // Line comments (ATL-413, ATL-416)
+    // -----------------------------------------------------------------------
+
+    /// Anchor lines `span` of the text file at `path`: its id and the range
+    /// a `thread_range` comment carries. `None` for a path the thread does
+    /// not hold as text, or lines it does not have.
+    pub fn anchor_range(&self, path: &str, span: LineSpan) -> Option<(u64, RangeAnchor)> {
+        self.anchor_range_of(self.replica.file_id(path)?, span)
+    }
+
+    /// [`ThreadSession::anchor_range`] for a file named by its id — what an
+    /// editor bound to the file holds.
+    pub fn anchor_range_of(&self, file_id: u64, span: LineSpan) -> Option<(u64, RangeAnchor)> {
+        let anchor = self.replica.doc_of(file_id)?.anchor_lines(span)?;
+        Some((file_id, anchor))
+    }
+
+    /// Where each comment's range is now: its lines in the file's text as
+    /// this replica holds it, or `None` when that text is gone (outdated) or
+    /// the file is.
+    pub fn resolve_ranges(&self, ranges: &[(u64, String, String)]) -> Vec<Option<LineSpan>> {
+        ranges
+            .iter()
+            .map(|(file_id, start, end)| self.replica.doc_of(*file_id)?.resolve_lines(start, end))
+            .collect()
+    }
+
+    fn tell_versions(&self) {
+        if let Some(events) = &self.events {
+            let _ = events.send(ThreadEvent::VersionsChanged);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Runs (ADR-0022, ATL-405)
     // -----------------------------------------------------------------------
 
@@ -1091,6 +1272,9 @@ impl<T: Transport> ThreadSession<T> {
         worktree: &RunWorktree,
         spec: RunSpec,
     ) -> Result<ActiveRun, SessionError> {
+        if let Some(id) = &spec.remote_request_id {
+            self.runnable_remote(id)?;
+        }
         let fork = self.fork()?;
         worktree.reset(&fork)?;
         let client_seq = self.take_client_seq();
@@ -1101,6 +1285,7 @@ impl<T: Transport> ThreadSession<T> {
             model: spec.model,
             fork_seq: fork.seq,
             context_anchor: spec.context_anchor,
+            remote_request_id: spec.remote_request_id,
         };
         match self.ask(client_seq, &start).await? {
             Answer::Ack => {}
@@ -1744,6 +1929,131 @@ impl<T: Transport> ThreadSession<T> {
     // -----------------------------------------------------------------------
     // Presence, the Atlas editor and sync state (ATL-407)
     // -----------------------------------------------------------------------
+
+    /// Remote Runs here, as this replica knows them (ATL-417).
+    pub fn remote(&self) -> RemoteView {
+        let mut requests: Vec<RemoteRun> = self.remote_requests.values().cloned().collect();
+        requests.sort_by(|a, b| {
+            b.requested_at
+                .cmp(&a.requested_at)
+                .then_with(|| b.request_id.cmp(&a.request_id))
+        });
+        RemoteView {
+            user_id: self.user_id.clone(),
+            agents: self.remote_agents.clone(),
+            accept: self.remote_accept,
+            auto_approve: self.remote_auto.clone(),
+            requests,
+        }
+    }
+
+    /// One Remote Run request this replica has heard of.
+    pub fn remote_request(&self, request_id: &str) -> Option<&RemoteRun> {
+        self.remote_requests.get(request_id)
+    }
+
+    fn note_remote(&mut self, request: RemoteRun) {
+        self.remote_requests
+            .insert(request.request_id.clone(), request.clone());
+        // Keep every open request, and the newest of the rest.
+        let mut over: Vec<(u64, String)> = self
+            .remote_requests
+            .values()
+            .filter(|r| !r.status.is_open())
+            .map(|r| (r.requested_at, r.request_id.clone()))
+            .collect();
+        if over.len() > REMOTE_KEPT {
+            over.sort();
+            for (_, id) in &over[..over.len() - REMOTE_KEPT] {
+                self.remote_requests.remove(id);
+            }
+        }
+        if let Some(events) = &self.events {
+            let _ = events.send(ThreadEvent::RemoteRun(request));
+        }
+    }
+
+    /// Is `request_id` an approved Remote Run this person is to run? What a
+    /// Run executing it must be.
+    fn runnable_remote(&self, request_id: &str) -> Result<&RemoteRun, SessionError> {
+        let request = self
+            .remote_requests
+            .get(request_id)
+            .filter(|r| Some(r.runner_id.as_str()) == self.user_id.as_deref())
+            .ok_or_else(|| SessionError::Refused {
+                code: "remote_run_unknown".into(),
+                message: "no Remote Run of yours by that id".into(),
+            })?;
+        if request.status != RemoteRunStatus::Approved {
+            return Err(SessionError::Refused {
+                code: "remote_run_unknown".into(),
+                message: "that Remote Run is not approved".into(),
+            });
+        }
+        Ok(request)
+    }
+
+    /// Change this Runner's own Remote Run choices here (ATL-417): accept
+    /// Remote Runs or not, and whose requests to approve without asking —
+    /// `Some(None)` clears that. `None` keeps what is there.
+    pub async fn set_remote_settings(
+        &mut self,
+        accept: Option<bool>,
+        auto_approve: Option<Option<String>>,
+    ) -> Result<(), SessionError> {
+        if self.remote_agents.is_empty() {
+            return Err(SessionError::Refused {
+                code: "remote_run_unsupported".into(),
+                message: "this desktop does not run Remote Runs".into(),
+            });
+        }
+        let client_seq = self.take_client_seq();
+        let frame = ClientControl::RemoteSettings {
+            client_seq,
+            accept,
+            auto_approve: auto_approve.clone(),
+        };
+        match self.ask(client_seq, &frame).await? {
+            Answer::Ack => {}
+            Answer::Nack { code, message } => return Err(SessionError::Refused { code, message }),
+            other => return Err(unexpected(&other)),
+        }
+        // The server's `remote.settings` follows the ack; until it does, what
+        // was asked is what is.
+        if let Some(accept) = accept {
+            self.remote_accept = accept;
+        }
+        if let Some(auto) = auto_approve {
+            self.remote_auto = auto;
+        }
+        Ok(())
+    }
+
+    /// Approve or decline a Remote Run this person was asked to run. The
+    /// server answers whatever the request is now — a request that timed out
+    /// meanwhile stays timed out — and says so on `remote.run`.
+    pub async fn answer_remote_run(
+        &mut self,
+        request_id: &str,
+        approve: bool,
+    ) -> Result<RemoteRunStatus, SessionError> {
+        let client_seq = self.take_client_seq();
+        let frame = ClientControl::RemoteAnswer {
+            client_seq,
+            request_id: request_id.to_string(),
+            approve,
+        };
+        match self.ask(client_seq, &frame).await? {
+            Answer::Ack => {}
+            Answer::Nack { code, message } => return Err(SessionError::Refused { code, message }),
+            other => return Err(unexpected(&other)),
+        }
+        // The `remote.run` saying where it stands came before the ack.
+        Ok(self
+            .remote_requests
+            .get(request_id)
+            .map_or(RemoteRunStatus::Declined, |r| r.status))
+    }
 
     /// Everybody else here now, with paths for the files they point at.
     pub fn peers(&self) -> Vec<PeerView> {
@@ -2862,6 +3172,7 @@ impl<T: Transport> ThreadSession<T> {
                         self.versions
                             .insert(file_version.file_id, file_version.version);
                         self.conflicts.insert(conflict.conflict_id, conflict);
+                        self.tell_versions();
                     }
                     ServerControl::ConflictAccepted {
                         client_seq,
@@ -2905,7 +3216,18 @@ impl<T: Transport> ThreadSession<T> {
                         if let Some(view) = self.runs.get_mut(&run_id) {
                             view.files = paths;
                         }
+                        self.tell_versions();
                     }
+                    ServerControl::Restored { version, files, .. } => {
+                        // A Restore to Version (ATL-419): its updates came
+                        // ahead of this; here is where each file now stands.
+                        self.head = self.head.max(version);
+                        for f in files {
+                            self.versions.insert(f.file_id, f.version);
+                        }
+                        self.tell_versions();
+                    }
+                    ServerControl::VersionAdded { .. } => self.tell_versions(),
                     ServerControl::RoleChanged { user_id, role } => {
                         if self.user_id.as_deref() == Some(user_id.as_str()) {
                             self.role = Some(role);
@@ -2918,6 +3240,14 @@ impl<T: Transport> ThreadSession<T> {
                     ServerControl::Status { status, .. } => {
                         self.closed = status == ThreadStatus::Closed;
                         self.refresh_read_only();
+                    }
+                    ServerControl::RemoteRun { request } => self.note_remote(request),
+                    ServerControl::RemoteSettings {
+                        accept,
+                        auto_approve,
+                    } => {
+                        self.remote_accept = accept;
+                        self.remote_auto = auto_approve;
                     }
                     ServerControl::JoinRequested { user_id } => {
                         if let Some(events) = &self.events {

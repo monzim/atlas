@@ -191,6 +191,7 @@ async fn a_runs_current_file_shows_for_everyone() {
                 agent: "codex".into(),
                 model: "m".into(),
                 context_anchor: None,
+                remote_request_id: None,
             },
         )
         .await

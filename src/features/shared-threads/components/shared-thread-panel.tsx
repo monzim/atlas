@@ -46,6 +46,8 @@ import { usePersonName } from "../lib/use-person-name";
 import { PresenceBar, SyncBadge } from "./presence-bar";
 import { ConflictList, conflictPlace, type ConflictAction } from "./conflict-view";
 import { OwnerPanel } from "./owner-panel";
+import { RemoteRunsSection } from "./remote-runs";
+import { VersionsPanel } from "./versions-panel";
 import { SharePreviewList, uploads } from "./share-preview";
 
 function shareLabel(count: number): string {
@@ -538,10 +540,23 @@ function ThreadCard({
         />
       )}
 
+      {!compact && (
+        <VersionsPanel
+          sharedThreadId={thread.sharedThreadId}
+          head={status.head}
+          runs={status.runs}
+          canEdit={mayRun}
+          me={status.remote?.userId ?? null}
+          nameOf={nameOf}
+        />
+      )}
+      {!compact && <RemoteRunsSection thread={thread} mayRun={mayRun} />}
+
       {status.runs.length > 0 && (
         <RunList
           threadId={thread.sharedThreadId}
           runs={status.runs}
+          nameOf={nameOf}
           onContinue={mayRun && !starting ? (run) => void continueFromRun(run) : undefined}
         />
       )}
@@ -613,10 +628,12 @@ const RUN_STATUS: Record<
 function RunList({
   threadId,
   runs,
+  nameOf,
   onContinue,
 }: {
   threadId: string;
   runs: SharedThreadRun[];
+  nameOf: (userId: string) => string;
   onContinue?: (run: SharedThreadRun) => void;
 }) {
   const live = useSharedThreadsStore.use.live();
@@ -649,8 +666,8 @@ function RunList({
             )}
             <span className="truncate text-[var(--muted-foreground)]">
               {run.promptedBy === run.runnerId
-                ? `Prompted and run by ${run.runnerId}`
-                : `Prompted by ${run.promptedBy}, run by ${run.runnerId}`}
+                ? `Prompted and run by ${nameOf(run.runnerId)}`
+                : `Prompted by ${nameOf(run.promptedBy)}, run on ${nameOf(run.runnerId)}'s machine`}
             </span>
             {run.files.length > 0 && (
               <span

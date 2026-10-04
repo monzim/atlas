@@ -20,8 +20,8 @@ use base64::Engine as _;
 use crate::store::FakeStore;
 use crate::wire::{
     self, BundleFailure, ClientControl, ConflictInvolved, ConflictResolution, FileKind,
-    FileVersion, Frame, FrameKind, MergedFile, RaisedConflict, Role, RunOutcome, ServerControl,
-    ThreadConflict, ThreadRun, TreeEntry,
+    FileVersion, Frame, FrameKind, MergedFile, RaisedConflict, RemoteRun, RemoteRunStatus, Role,
+    RunOutcome, ServerControl, ThreadConflict, ThreadRun, TreeEntry,
 };
 
 /// One message on the socket.
@@ -230,6 +230,11 @@ struct Hub {
     /// Conflicts merges held back (ATL-410), with who resolved each and by
     /// which frame, for idempotent resends.
     conflicts: Vec<(ThreadConflict, Option<Resolver>)>,
+    /// Remote Run requests (ATL-417), oldest first.
+    remote: Vec<RemoteRun>,
+    /// Who accepts Remote Runs, and whose requests each auto-approves.
+    accepts: std::collections::HashSet<String>,
+    auto_approve: HashMap<String, String>,
 }
 
 /// Who resolved a Conflict, by which frame, and what they were answered.
@@ -246,6 +251,8 @@ struct Conn {
     tx: mpsc::UnboundedSender<Message>,
     /// Its latest awareness (ATL-400): kept with the connection, never stored.
     presence: Option<wire::AwarenessState>,
+    /// The agents it runs Remote Runs with, when it declared `remote_run`.
+    remote_agents: Vec<String>,
 }
 
 /// An in-process thread server with the real one's rules: everything is
@@ -305,6 +312,7 @@ impl FakeThreadServer {
                 client: None,
                 tx,
                 presence: None,
+                remote_agents: Vec::new(),
             },
         );
         FakeTransport {
@@ -363,6 +371,54 @@ impl FakeThreadServer {
         self.hub.lock().expect("hub").racing_merge = Some((file_id, update));
     }
 
+    /// A Restore to Version `from` by `author`, as `POST /restore` lands one
+    /// (ATL-415): `update` (computed by the caller against canonical state)
+    /// is journaled and relayed, the file's merge version moves on, and every
+    /// socket hears `restored`. Answers the Thread Version it made.
+    pub fn restore(&self, author: &str, from: u64, file_id: u64, update: Vec<u8>, blob: &str) -> u64 {
+        let mut hub = self.hub.lock().expect("hub");
+        let seq = hub.journal.len() as u64 + 1;
+        let frame = Frame {
+            seq,
+            ..Frame::update(file_id, 0, update)
+        };
+        hub.journal.push(Journaled {
+            seq,
+            tree: None,
+            frame: Some(frame.clone()),
+            author: author.to_string(),
+            client: format!("{author}#restore"),
+            client_seq: seq,
+        });
+        let version = hub
+            .tree
+            .iter_mut()
+            .find(|e| e.file_id == file_id)
+            .map(|e| {
+                let v = e.merge_version.unwrap_or(0) + 1;
+                e.merge_version = Some(v);
+                v
+            })
+            .unwrap_or(1);
+        let bytes = wire::encode(&frame).expect("encode");
+        for c in hub.conns.values() {
+            if c.client.is_some() {
+                let _ = c.tx.send(Message::Binary(bytes.clone()));
+            }
+        }
+        hub.broadcast(&ServerControl::Restored {
+            version: seq,
+            from,
+            author_id: author.to_string(),
+            files: vec![MergedFile {
+                file_id,
+                version,
+                blob: blob.to_string(),
+            }],
+        });
+        seq
+    }
+
     /// Live Run frames relayed so far. None of them is ever journaled.
     pub fn run_frames_relayed(&self) -> u64 {
         self.hub.lock().expect("hub").run_frames_relayed
@@ -397,6 +453,80 @@ impl FakeThreadServer {
             hub.closed.insert(conn, code);
             hub.disconnect(conn);
         }
+    }
+
+    /// `asker` asks `runner` for a Remote Run, as `POST /remote-runs` would
+    /// once the door's three gates passed (ATL-417): the object's gates —
+    /// the Runner accepting and an editor, the asker an editor, the Runner
+    /// online on a desktop offering `agent` — then pending, or approved at
+    /// once by the Runner's auto-approve. A refusal names the gate.
+    pub fn request_remote_run(
+        &self,
+        asker: &str,
+        runner: &str,
+        prompt: &str,
+        agent: &str,
+    ) -> Result<RemoteRun, &'static str> {
+        let mut hub = self.hub.lock().expect("hub");
+        let editor = |hub: &Hub, user: &str| {
+            !matches!(hub.roles.get(user), Some(Role::Viewer)) && !hub.thread_closed
+        };
+        if !hub.accepts.contains(runner) || !editor(&hub, runner) {
+            return Err("runner_not_accepting");
+        }
+        if !editor(&hub, asker) {
+            return Err("requester_not_participant");
+        }
+        let online = hub.conns.values().any(|c| {
+            c.user == runner && c.client.is_some() && c.remote_agents.iter().any(|a| a == agent)
+        });
+        if !online {
+            return Err("runner_offline");
+        }
+        let auto = hub.auto_approve.get(runner).map(String::as_str) == Some(asker);
+        let at = hub.remote.len() as u64 + 1;
+        let request = RemoteRun {
+            request_id: format!("remote-{at:04}"),
+            thread_id: "fake-thread".into(),
+            requested_by: asker.to_string(),
+            runner_id: runner.to_string(),
+            prompt: prompt.to_string(),
+            agent: agent.to_string(),
+            model: None,
+            status: if auto {
+                RemoteRunStatus::Approved
+            } else {
+                RemoteRunStatus::Pending
+            },
+            auto,
+            requested_at: at,
+            expires_at: at + 60_000,
+            answered_at: auto.then_some(at),
+            run_id: None,
+        };
+        hub.remote.push(request.clone());
+        hub.tell_remote(&request);
+        Ok(request)
+    }
+
+    /// The alarm's sweep: every request still open times out, unanswered
+    /// or approved and never started.
+    pub fn expire_remote_runs(&self) {
+        let mut hub = self.hub.lock().expect("hub");
+        let mut told = Vec::new();
+        for r in hub.remote.iter_mut().filter(|r| r.status.is_open()) {
+            r.status = RemoteRunStatus::TimedOut;
+            r.answered_at = Some(r.expires_at);
+            told.push(r.clone());
+        }
+        for r in &told {
+            hub.tell_remote(r);
+        }
+    }
+
+    /// Every Remote Run request, oldest first.
+    pub fn remote_runs(&self) -> Vec<RemoteRun> {
+        self.hub.lock().expect("hub").remote.clone()
     }
 
     /// Set somebody's role, and tell every socket — as the owner's `PUT
@@ -526,6 +656,19 @@ impl FakeThreadServer {
             .journal
             .iter()
             .filter_map(|j| j.frame.as_ref().map(|f| f.payload.clone()))
+            .collect()
+    }
+
+    /// One file's canonical updates journaled, in `seq` order.
+    pub fn journaled_for(&self, file_id: u64) -> Vec<Vec<u8>> {
+        self.hub
+            .lock()
+            .expect("hub")
+            .journal
+            .iter()
+            .filter_map(|j| j.frame.as_ref())
+            .filter(|f| f.file_id == file_id)
+            .map(|f| f.payload.clone())
             .collect()
     }
 
@@ -737,6 +880,33 @@ impl Hub {
         }
     }
 
+    /// Send to every greeted socket of `users`.
+    fn tell_users(&self, users: &[&str], frame: &ServerControl) {
+        let text = serde_json::to_string(frame).expect("json");
+        for c in self.conns.values() {
+            if c.client.is_some() && users.contains(&c.user.as_str()) {
+                let _ = c.tx.send(Message::Text(text.clone()));
+            }
+        }
+    }
+
+    /// A request changed: its Runner and whoever asked hear it.
+    fn tell_remote(&self, request: &RemoteRun) {
+        self.tell_users(
+            &[&request.runner_id, &request.requested_by],
+            &ServerControl::RemoteRun {
+                request: request.clone(),
+            },
+        );
+    }
+
+    fn remote_settings_of(&self, user: &str) -> ServerControl {
+        ServerControl::RemoteSettings {
+            accept: self.accepts.contains(user),
+            auto_approve: self.auto_approve.get(user).cloned(),
+        }
+    }
+
     /// A connection as presence describes it, once it has said hello.
     fn peer(&self, conn: u64) -> Option<wire::Peer> {
         let c = self.conns.get(&conn)?;
@@ -796,8 +966,22 @@ impl Hub {
     ) {
         match parsed {
             Ok(ClientControl::Hello {
-                client_id, since, ..
+                client_id,
+                since,
+                capabilities,
+                agents,
+                ..
             }) => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.remote_agents = if capabilities
+                        .iter()
+                        .any(|c| c == wire::CAPABILITY_REMOTE_RUN)
+                    {
+                        agents
+                    } else {
+                        Vec::new()
+                    };
+                }
                 if since > self.head() {
                     if let Some(c) = self.conns.get_mut(&conn) {
                         c.client = None;
@@ -924,6 +1108,98 @@ impl Hub {
                         ),
                     );
                 }
+                // Remote Runs (ATL-417): a capable desktop learns its own
+                // settings, and anyone the requests still open they are in.
+                if !self.conns[&conn].remote_agents.is_empty() {
+                    self.reply(conn, &self.remote_settings_of(&user));
+                }
+                for r in self
+                    .remote
+                    .iter()
+                    .filter(|r| r.status.is_open() && (r.runner_id == user || r.requested_by == user))
+                {
+                    self.reply(conn, &ServerControl::RemoteRun { request: r.clone() });
+                }
+            }
+            Ok(ClientControl::RemoteSettings {
+                client_seq,
+                accept,
+                auto_approve,
+            }) => {
+                if client.is_none() {
+                    return;
+                }
+                if auto_approve.as_ref().and_then(Option::as_deref) == Some(user.as_str()) {
+                    return self.nack(conn, client_seq, "bad_frame");
+                }
+                match accept {
+                    Some(true) => {
+                        self.accepts.insert(user.clone());
+                    }
+                    Some(false) => {
+                        self.accepts.remove(&user);
+                    }
+                    None => {}
+                }
+                match auto_approve {
+                    Some(Some(person)) => {
+                        self.auto_approve.insert(user.clone(), person);
+                    }
+                    Some(None) => {
+                        self.auto_approve.remove(&user);
+                    }
+                    None => {}
+                }
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq: self.head(),
+                        file_id: None,
+                    },
+                );
+                let settings = self.remote_settings_of(&user);
+                self.tell_users(&[&user], &settings);
+            }
+            Ok(ClientControl::RemoteAnswer {
+                client_seq,
+                request_id,
+                approve,
+            }) => {
+                if client.is_none() {
+                    return;
+                }
+                let Some(r) = self
+                    .remote
+                    .iter_mut()
+                    .find(|r| r.request_id == request_id && r.runner_id == user)
+                else {
+                    return self.nack(conn, client_seq, "remote_run_unknown");
+                };
+                let told = if r.status == RemoteRunStatus::Pending {
+                    r.status = if approve {
+                        RemoteRunStatus::Approved
+                    } else {
+                        RemoteRunStatus::Declined
+                    };
+                    r.answered_at = Some(r.requested_at + 1);
+                    Some(r.clone())
+                } else {
+                    let unchanged = r.clone();
+                    self.reply(conn, &ServerControl::RemoteRun { request: unchanged });
+                    None
+                };
+                if let Some(told) = told {
+                    self.tell_remote(&told);
+                }
+                self.reply(
+                    conn,
+                    &ServerControl::Ack {
+                        client_seq,
+                        seq: self.head(),
+                        file_id: None,
+                    },
+                );
             }
             Ok(ClientControl::Awareness { state, .. }) => {
                 if client.is_none() {
@@ -1230,8 +1506,24 @@ impl Hub {
                 model,
                 fork_seq,
                 context_anchor,
+                remote_request_id,
             }) => {
                 let Some(client) = client else { return };
+                // Executing a Remote Run: an approved request of this Runner's,
+                // prompted by whoever asked.
+                let mut prompted_by = user.clone();
+                if let Some(id) = &remote_request_id {
+                    let approved = self.remote.iter().find(|r| {
+                        &r.request_id == id
+                            && r.runner_id == user
+                            && (r.status == RemoteRunStatus::Approved
+                                || r.run_id.as_deref() == Some(run_id.as_str()))
+                    });
+                    match approved {
+                        Some(r) => prompted_by = r.requested_by.clone(),
+                        None => return self.nack(conn, client_seq, "remote_run_unknown"),
+                    }
+                }
                 if let Some(existing) = self.runs.iter().find(|r| r.run.run_id == run_id) {
                     if existing.run.runner_id != user {
                         return self.nack(conn, client_seq, "run_conflict");
@@ -1247,10 +1539,21 @@ impl Hub {
                     );
                     return self.reply(conn, &ServerControl::Run { run });
                 }
+                if let Some(id) = &remote_request_id {
+                    let fresh = |r: &&mut RemoteRun| {
+                        &r.request_id == id && r.status == RemoteRunStatus::Approved
+                    };
+                    if let Some(r) = self.remote.iter_mut().find(fresh) {
+                        r.status = RemoteRunStatus::Executed;
+                        r.run_id = Some(run_id.clone());
+                        let told = r.clone();
+                        self.tell_remote(&told);
+                    }
+                }
                 let run = ThreadRun {
                     run_id,
                     run_no: self.runs.len() as u64 + 1,
-                    prompted_by: user.clone(),
+                    prompted_by,
                     runner_id: user,
                     agent,
                     model,

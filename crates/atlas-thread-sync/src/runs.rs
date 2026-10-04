@@ -25,6 +25,8 @@ pub struct RunSpec {
     pub model: String,
     /// A timeline event to "continue from here".
     pub context_anchor: Option<String>,
+    /// The approved Remote Run this Run executes (ATL-417).
+    pub remote_request_id: Option<String>,
 }
 
 impl RunSpec {

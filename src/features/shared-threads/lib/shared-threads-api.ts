@@ -22,6 +22,12 @@ export const SHARED_PRESENCE_EVENT = "atlas:shared-thread-presence";
 /** Pushed by Rust when a file open in the Atlas editor changed (ATL-407). */
 export const SHARED_DOC_UPDATE_EVENT = "atlas:shared-doc-update";
 
+/** Pushed by Rust when a joined thread's Thread Versions changed (ATL-419). */
+export const SHARED_VERSIONS_EVENT = "atlas:shared-thread-versions";
+
+/** Pushed by Rust when a Remote Run request this person asked or must run changed (ATL-417). */
+export const SHARED_REMOTE_RUN_EVENT = "atlas:shared-remote-run";
+
 /** How far a replica is from the thread's head, as it says of itself. */
 export type SyncState = "current" | "syncing" | "behind";
 
@@ -118,6 +124,52 @@ export interface SharedThreadConflict {
   proposed: string | null;
 }
 
+/** Where a Remote Run request stands (ADR-0023). */
+export type RemoteRunStatus = "pending" | "approved" | "declined" | "timed_out" | "executed";
+
+/**
+ * A Remote Run request (ATL-417): `requestedBy` asks `runnerId`'s desktop to
+ * run `prompt` with `agent`, on the Runner's machine and bill.
+ */
+export interface RemoteRun {
+  requestId: string;
+  threadId: string;
+  requestedBy: string;
+  runnerId: string;
+  prompt: string;
+  agent: string;
+  model: string | null;
+  status: RemoteRunStatus;
+  /** Approved by the Runner's auto-approve rather than by hand. */
+  auto: boolean;
+  requestedAt: number;
+  /** When it times out unless answered (pending) or started (approved). */
+  expiresAt: number;
+  answeredAt: number | null;
+  /** The Run that executed it. */
+  runId: string | null;
+}
+
+/** Remote Runs as this machine knows them in one thread (ATL-417). */
+export interface SharedRemote {
+  /** Who this person is on the thread. */
+  userId: string | null;
+  /** The agents this machine offers for Remote Runs here; empty until it first accepts. */
+  agents: string[];
+  /** "Accept Remote Runs" in this thread. */
+  accept: boolean;
+  /** The one person whose requests here are approved without asking. */
+  autoApprove: string | null;
+  /** Requests this person asked or must run, newest first. */
+  requests: RemoteRun[];
+}
+
+/** Whom this person may ask now: the gate refusing every ask, or the Runners online. */
+export interface RemoteRunners {
+  gate: string | null;
+  runners: Array<{ userId: string; agents: string[] }>;
+}
+
 export interface SharedThreadStatus {
   connected: boolean;
   role: string | null;
@@ -158,6 +210,8 @@ export interface SharedThreadStatus {
   peers: SharedPeer[];
   /** Whether this replica is current, syncing or behind. */
   sync: SyncState | null;
+  /** Remote Runs here (ATL-417). Absent from a status pushed before it. */
+  remote?: SharedRemote;
   error: string | null;
 }
 
@@ -357,6 +411,178 @@ export function continueFrom(sharedThreadId: string, runNo: number) {
   return invoke<string>("shared_thread_continue_from", { sharedThreadId, runNo });
 }
 
+/**
+ * This Runner's Remote Run choices in one thread (ATL-417): accept them or
+ * not, the agents this machine runs them with (a change reconnects the
+ * thread), and whose requests to approve without asking.
+ */
+export function setRemoteSettings(
+  sharedThreadId: string,
+  settings: { accept?: boolean; agents?: string[]; autoApprove?: string | null },
+) {
+  return invoke<void>("shared_thread_remote_settings", {
+    sharedThreadId,
+    accept: settings.accept ?? null,
+    agents: settings.agents ?? null,
+    autoApprove: settings.autoApprove ?? null,
+    clearAutoApprove: settings.autoApprove === null,
+  });
+}
+
+/** Approve or decline a Remote Run this person was asked to run; answers where it stands. */
+export function answerRemoteRun(sharedThreadId: string, requestId: string, approve: boolean) {
+  return invoke<RemoteRunStatus>("shared_thread_answer_remote_run", {
+    sharedThreadId,
+    requestId,
+    approve,
+  });
+}
+
+/**
+ * Execute an approved Remote Run in `sessionId`, an agent session opened in
+ * the thread's Run worktree with the request's agent: answers the exact
+ * prompt to send there, which starts the Run that executes it.
+ */
+export function executeRemoteRun(sharedThreadId: string, requestId: string, sessionId: string) {
+  return invoke<string>("shared_thread_execute_remote_run", { sharedThreadId, requestId, sessionId });
+}
+
+/** Whom this person may ask for a Remote Run in this thread now. */
+export function remoteRunners(sharedThreadId: string) {
+  return invoke<RemoteRunners>("shared_thread_remote_runners", { sharedThreadId });
+}
+
+/** Ask `runner`'s desktop to run `prompt` with `agent`, on their machine and bill. */
+export function requestRemoteRun(sharedThreadId: string, runner: string, agent: string, prompt: string) {
+  return invoke<RemoteRun>("shared_thread_request_remote_run", {
+    sharedThreadId,
+    runner,
+    agent,
+    prompt,
+  });
+}
+
+/** A Thread Version (ATL-415): a merge, a Conflict resolution, a Restore, or a mark. */
+export interface ThreadVersion {
+  version: number;
+  kind: "merge" | "resolve" | "restore" | "mark" | (string & {});
+  runId: string | null;
+  conflictId: number | null;
+  /** The Version a Restore set its files back to. */
+  restoredFrom: number | null;
+  authorId: string;
+  at: number;
+  files: Array<{ fileId: number; blob: string }>;
+  mark: { label: string | null; by: string; at: number } | null;
+}
+
+/** One file's difference from the diff base (ATL-419). */
+export interface FileDiff {
+  fileId: number;
+  path: string;
+  change: "added" | "modified" | "deleted" | "binary" | "unavailable";
+  /** A git-style unified diff section; empty for a binary or unavailable file. */
+  diff: string;
+  /** Restore to the chosen Version can set it back. */
+  restorable: boolean;
+}
+
+/** The thread's Thread Versions, newest first. */
+export function listVersions(sharedThreadId: string) {
+  return invoke<ThreadVersion[]>("shared_thread_versions", { sharedThreadId });
+}
+
+/**
+ * The thread's files against the Base (no `version`) or a Thread Version.
+ * A Version made a moment ago is refused `version_pending` until captured.
+ */
+export function diffAgainst(sharedThreadId: string, version: number | null) {
+  return invoke<FileDiff[]>("shared_thread_diff", { sharedThreadId, version });
+}
+
+/** Restore these files to Thread Version `version`: a new change everyone sees. */
+export function restoreToVersion(sharedThreadId: string, version: number, fileIds: number[]) {
+  return invoke<{ version: number | null; files: Array<{ fileId: number; version: number }> }>(
+    "shared_thread_restore",
+    { sharedThreadId, version, fileIds },
+  );
+}
+
+/** Mark the thread as it is now as a Version. */
+export function markVersion(sharedThreadId: string, label?: string) {
+  return invoke<ThreadVersion>("shared_thread_mark_version", { sharedThreadId, label: label ?? null });
+}
+
+export function onVersionsChanged(apply: (event: { sharedThreadId: string }) => void): Promise<UnlistenFn> {
+  return listen<{ sharedThreadId: string }>(SHARED_VERSIONS_EVENT, (event) => apply(event.payload));
+}
+
+/** Lines of a file, 1-based and inclusive. */
+export interface LineSpan {
+  start: number;
+  end: number;
+}
+
+/**
+ * A comment on lines of a thread's file (ATL-413, ATL-416), as the server
+ * keeps it, and — for a root on lines — where those lines are in the text
+ * now; `lines` is `null` when its text is gone: it is outdated, show `quote`.
+ */
+export interface LineComment {
+  id: string;
+  parentId: string | null;
+  authorId: string;
+  body: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  votes?: { up: string[]; down: string[] };
+  threadRange: {
+    threadId: string;
+    fileId: number;
+    path: string;
+    start: string;
+    end: string;
+    quote: string;
+  } | null;
+  lines: LineSpan | null;
+}
+
+/** The thread's line comments, each root placed on its lines as this replica's text has them. */
+export function listLineComments(sharedThreadId: string) {
+  return invoke<LineComment[]>("shared_thread_comments", { sharedThreadId });
+}
+
+/** Comment on lines (1-based) of one of the thread's text files, by its id or its path in the thread. */
+export function commentOnLines(
+  sharedThreadId: string,
+  file: { fileId: number } | { path: string },
+  lines: LineSpan,
+  body: string,
+) {
+  return invoke<unknown>("shared_thread_comment_lines", {
+    sharedThreadId,
+    fileId: "fileId" in file ? file.fileId : null,
+    path: "path" in file ? file.path : null,
+    start: lines.start,
+    end: lines.end,
+    body,
+  });
+}
+
+export function replyToLineComment(sharedThreadId: string, parentId: string, body: string) {
+  return invoke<unknown>("shared_thread_comment_reply", { sharedThreadId, parentId, body });
+}
+
+export function resolveLineComment(sharedThreadId: string, commentId: string, resolved: boolean) {
+  return invoke<unknown>("shared_thread_comment_resolve", { sharedThreadId, commentId, resolved });
+}
+
+/** `1`, `-1`, or `0` to take a vote back. */
+export function voteLineComment(sharedThreadId: string, commentId: string, value: 1 | -1 | 0) {
+  return invoke<unknown>("shared_thread_comment_vote", { sharedThreadId, commentId, value });
+}
+
 /** What Apply did to the person's checkout (ATL-408). */
 export interface Applied {
   /** Written, created or deleted cleanly. */
@@ -438,6 +664,14 @@ export function onJoinRequested(
   apply: (request: { sharedThreadId: string; userId: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ sharedThreadId: string; userId: string }>(SHARED_JOIN_REQUEST_EVENT, (event) =>
+    apply(event.payload),
+  );
+}
+
+export function onRemoteRun(
+  apply: (event: { sharedThreadId: string; request: RemoteRun }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ sharedThreadId: string; request: RemoteRun }>(SHARED_REMOTE_RUN_EVENT, (event) =>
     apply(event.payload),
   );
 }

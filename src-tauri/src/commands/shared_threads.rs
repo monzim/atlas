@@ -54,8 +54,8 @@ use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
     ApplyOutcome, Command as SyncCommand, Connector, DigestComment, DigestScope, ObjectStore,
-    Replica, Resolve, RunReport, RunSpec, SharePreview, SyncStatus, ThreadEvent, ThreadRepo,
-    ThreadSession, TransportError, WsTransport,
+    RemoteRun, RemoteRunStatus, Replica, Resolve, RunReport, RunSpec, SharePreview, SyncStatus,
+    ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,14 @@ pub const SHARED_PRESENCE_EVENT: &str = "atlas:shared-thread-presence";
 /// Pushed when a file open in the Atlas editor changed (ATL-407).
 pub const SHARED_DOC_UPDATE_EVENT: &str = "atlas:shared-doc-update";
 
+/// Pushed when a joined thread's Thread Versions changed — a merge, a
+/// resolution, a Restore or a mark (ATL-419).
+pub const SHARED_VERSIONS_EVENT: &str = "atlas:shared-thread-versions";
+
+/// Pushed when a Remote Run request this person asked or must run changed
+/// (ATL-417): a pending one for the Runner opens the approval dialog.
+pub const SHARED_REMOTE_RUN_EVENT: &str = "atlas:shared-remote-run";
+
 /// What the person sees about one Shared Thread this machine has joined.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +115,11 @@ pub struct SharedThreadEntry {
     pub serve_history: bool,
     /// The link to send a teammate.
     pub link: String,
+    /// The agents this machine runs Remote Runs with in this thread (ATL-417),
+    /// said at every connect. Empty until the person first accepts Remote
+    /// Runs here, so a desktop nobody set up is never offered as a Runner.
+    #[serde(default)]
+    pub remote_agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,6 +240,21 @@ pub struct SharedThreadsState {
     /// "Continue from here": the Run the next Run in each thread anchors its
     /// context on, by thread (ATL-411).
     continue_from: Mutex<HashMap<String, u64>>,
+    /// An approved Remote Run waiting for its prompt, by the agent session
+    /// opened to execute it (ATL-417): that session's next Run executes it.
+    remote_next: Mutex<HashMap<String, RemoteNext>>,
+    /// Remote Runs this machine was handed to execute, so each is run once
+    /// however often its `approved` frame is seen again. Ids are only ever
+    /// added — one per request approved to this person — and die with the app.
+    remote_executing: Mutex<std::collections::HashSet<String>>,
+}
+
+/// An approved Remote Run waiting for its prompt to be sent.
+#[derive(Debug, Clone)]
+struct RemoteNext {
+    shared_thread_id: String,
+    request_id: String,
+    prompt: String,
 }
 
 /// The delta sink, so a Run's start and end can be announced on the session
@@ -258,6 +286,14 @@ struct DocUpdateEvent {
     shared_thread_id: String,
     file_id: u64,
     update: String,
+}
+
+/// A Remote Run request changed (ATL-417).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteRunEvent {
+    shared_thread_id: String,
+    request: RemoteRun,
 }
 
 /// Somebody asked to join, for the owner's panel (ATL-406).
@@ -390,6 +426,7 @@ pub async fn shared_thread_share(
         project_path: Some(project_path.clone()),
         client_id: new_client_id(),
         serve_history: serve_history.unwrap_or(false),
+        remote_agents: Vec::new(),
     };
 
     // Link the local thread before anything can fail on the network, so a
@@ -466,6 +503,7 @@ pub async fn shared_thread_join(
         project_path,
         client_id: new_client_id(),
         serve_history: false,
+        remote_agents: Vec::new(),
     };
     let view = start(&app, entry, None).await?;
     remember(&app, &view.entry)?;
@@ -862,9 +900,15 @@ async fn start(
         shared_thread_id: entry.shared_thread_id.clone(),
         app: app.clone(),
     });
-    let mut session = ThreadSession::connect(transport, replica, &entry.client_id, store)
-        .await
-        .map_err(session_error)?;
+    let mut session = ThreadSession::connect_offering(
+        transport,
+        replica,
+        &entry.client_id,
+        store,
+        entry.remote_agents.clone(),
+    )
+    .await
+    .map_err(session_error)?;
     session.set_thread_repo(thread_repo);
     session.set_serve_bundles(entry.serve_history);
     // Under "approval required" a joiner waits as a viewer until the owner
@@ -955,6 +999,21 @@ async fn start(
                             PresenceEvent {
                                 shared_thread_id: shared_thread_id.clone(),
                                 peers,
+                            },
+                        );
+                    }
+                    ThreadEvent::VersionsChanged => {
+                        let _ = forward.emit(
+                            SHARED_VERSIONS_EVENT,
+                            serde_json::json!({ "sharedThreadId": shared_thread_id }),
+                        );
+                    }
+                    ThreadEvent::RemoteRun(request) => {
+                        let _ = forward.emit(
+                            SHARED_REMOTE_RUN_EVENT,
+                            RemoteRunEvent {
+                                shared_thread_id: shared_thread_id.clone(),
+                                request,
                             },
                         );
                     }
@@ -1351,6 +1410,515 @@ fn disconnected() -> SharedThreadError {
 }
 
 // ---------------------------------------------------------------------------
+// Line comments (ATL-413, ATL-416)
+// ---------------------------------------------------------------------------
+//
+// Comments on lines of a thread's files are ordinary project comments the
+// server keeps under the thread's own Session id; this side only anchors a
+// new one — two Yjs relative positions into the file's text, made by the
+// replica so the web resolves them, and the reverse — and says where each
+// lands in the text now. Replies, resolve and votes are the comment doors'.
+
+/// One comment as the server has it, and — for a root on lines — the lines
+/// it covers in the text now; `null` there when its text is gone (outdated:
+/// show its quote).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineComment {
+    #[serde(flatten)]
+    pub comment: serde_json::Value,
+    pub lines: Option<atlas_thread_sync::doc::LineSpan>,
+}
+
+/// The thread's line comments, each root placed on its lines as this
+/// replica's text has them.
+#[tauri::command]
+pub async fn shared_thread_comments(
+    app: AppHandle,
+    shared_thread_id: String,
+) -> Result<Vec<LineComment>> {
+    #[derive(Deserialize)]
+    struct List {
+        comments: Vec<serde_json::Value>,
+    }
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let list: List = get_json(&thread_url(&entry, "/comments"), &token).await?;
+    // The range each root carries, by its position in the list.
+    let ranges: Vec<(usize, (u64, String, String))> = list
+        .comments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let r = c.get("threadRange")?;
+            Some((
+                i,
+                (
+                    r.get("fileId")?.as_u64()?,
+                    r.get("start")?.as_str()?.to_string(),
+                    r.get("end")?.as_str()?.to_string(),
+                ),
+            ))
+        })
+        .collect();
+    let placed = ask_thread(&app, &shared_thread_id, |reply| SyncCommand::ResolveRanges {
+        ranges: ranges.iter().map(|(_, r)| r.clone()).collect(),
+        reply,
+    })
+    .await?;
+    let mut lines: Vec<Option<atlas_thread_sync::doc::LineSpan>> = vec![None; list.comments.len()];
+    for ((i, _), at) in ranges.iter().zip(placed) {
+        lines[*i] = at;
+    }
+    Ok(list
+        .comments
+        .into_iter()
+        .zip(lines)
+        .map(|(comment, lines)| LineComment { comment, lines })
+        .collect())
+}
+
+/// Comment on lines `start`–`end` (1-based, inclusive) of one of the
+/// thread's text files — by its id, or else its path in the thread. Answers
+/// the comment as the server stored it.
+#[tauri::command]
+pub async fn shared_thread_comment_lines(
+    app: AppHandle,
+    shared_thread_id: String,
+    file_id: Option<u64>,
+    path: Option<String>,
+    start: u32,
+    end: u32,
+    body: String,
+) -> Result<serde_json::Value> {
+    let anchored = ask_thread(&app, &shared_thread_id, |reply| SyncCommand::AnchorRange {
+        file_id,
+        path: path.unwrap_or_default(),
+        span: atlas_thread_sync::doc::LineSpan { start, end },
+        reply,
+    })
+    .await?;
+    let Some((file_id, range)) = anchored else {
+        return Err(SharedThreadError::new(
+            "bad_request",
+            "Those lines are not in a text file of this thread.",
+        ));
+    };
+    comment_write(
+        &app,
+        &shared_thread_id,
+        reqwest::Method::POST,
+        "/comments".into(),
+        serde_json::json!({
+            "anchor_kind": "thread_range",
+            "anchor_id": file_id.to_string(),
+            "body": body,
+            "thread_range": { "start": range.start, "end": range.end, "quote": range.quote },
+        }),
+    )
+    .await
+}
+
+/// Answer a line comment.
+#[tauri::command]
+pub async fn shared_thread_comment_reply(
+    app: AppHandle,
+    shared_thread_id: String,
+    parent_id: String,
+    body: String,
+) -> Result<serde_json::Value> {
+    path_segment(&parent_id)?;
+    comment_write(
+        &app,
+        &shared_thread_id,
+        reqwest::Method::POST,
+        "/comments".into(),
+        serde_json::json!({ "anchor_kind": "thread_range", "parent_id": parent_id, "body": body }),
+    )
+    .await
+}
+
+/// Resolve a line comment, or open it again.
+#[tauri::command]
+pub async fn shared_thread_comment_resolve(
+    app: AppHandle,
+    shared_thread_id: String,
+    comment_id: String,
+    resolved: bool,
+) -> Result<serde_json::Value> {
+    let id = path_segment(&comment_id)?;
+    comment_write(
+        &app,
+        &shared_thread_id,
+        reqwest::Method::PATCH,
+        format!("/comments/{id}"),
+        serde_json::json!({ "resolved": resolved }),
+    )
+    .await
+}
+
+/// Vote on a line comment: `1`, `-1`, or `0` to take a vote back.
+#[tauri::command]
+pub async fn shared_thread_comment_vote(
+    app: AppHandle,
+    shared_thread_id: String,
+    comment_id: String,
+    value: i8,
+) -> Result<serde_json::Value> {
+    let id = path_segment(&comment_id)?;
+    if !(-1..=1).contains(&value) {
+        return Err(SharedThreadError::new("bad_request", "A vote is 1, -1 or 0."));
+    }
+    comment_write(
+        &app,
+        &shared_thread_id,
+        reqwest::Method::PUT,
+        format!("/comments/{id}/vote"),
+        serde_json::json!({ "value": value }),
+    )
+    .await
+}
+
+/// One write through the thread's comment doors, answering the comment.
+async fn comment_write(
+    app: &AppHandle,
+    shared_thread_id: &str,
+    method: reqwest::Method,
+    rest: String,
+    body: serde_json::Value,
+) -> Result<serde_json::Value> {
+    #[derive(Deserialize)]
+    struct Answer {
+        comment: serde_json::Value,
+    }
+    let entry = entry_of(app, shared_thread_id)?;
+    let token = token(app).await?;
+    let res = client()?
+        .request(method, thread_url(&entry, &rest))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| SharedThreadError::new("network", e.to_string()))?;
+    Ok(decode::<Answer>(res).await?.comment)
+}
+
+// ---------------------------------------------------------------------------
+// Thread Versions (ATL-419)
+// ---------------------------------------------------------------------------
+//
+// The thread's diff view compares canonical state with a base: the Base, the
+// last Run's Thread Version, or any Version. A Version's files are the
+// server's capture of them (ATL-415); the comparison is the replica's own.
+// Restore and Mark are the server's doors — a Restore comes back to every
+// replica as a canonical change — and both are participants' only.
+
+/// The thread's Thread Versions, newest first.
+#[tauri::command]
+pub async fn shared_thread_versions(
+    app: AppHandle,
+    shared_thread_id: String,
+) -> Result<Vec<atlas_thread_sync::versions::ThreadVersion>> {
+    #[derive(Deserialize)]
+    struct List {
+        versions: Vec<atlas_thread_sync::versions::ThreadVersion>,
+    }
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    Ok(get_json::<List>(&thread_url(&entry, "/versions"), &token).await?.versions)
+}
+
+/// The thread's files against the Base (`version` absent) or against Thread
+/// Version `version`. A Version made a moment ago answers `version_pending`
+/// until the server has captured its files.
+#[tauri::command]
+pub async fn shared_thread_diff(
+    app: AppHandle,
+    shared_thread_id: String,
+    version: Option<u64>,
+) -> Result<Vec<atlas_thread_sync::versions::FileDiff>> {
+    let against = match version {
+        Some(v) => {
+            let entry = entry_of(&app, &shared_thread_id)?;
+            let token = token(&app).await?;
+            Some(
+                get_json::<atlas_thread_sync::versions::VersionFiles>(
+                    &thread_url(&entry, &format!("/versions/{v}")),
+                    &token,
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+    ask_thread(&app, &shared_thread_id, |reply| SyncCommand::Diff { against, reply }).await
+}
+
+/// Restore these files to Thread Version `version`: a new change, made by
+/// the server and synced to everyone. Each names the merge version this
+/// replica holds, so a file that moved since is refused rather than
+/// overwritten.
+#[tauri::command]
+pub async fn shared_thread_restore(
+    app: AppHandle,
+    shared_thread_id: String,
+    version: u64,
+    file_ids: Vec<u64>,
+) -> Result<serde_json::Value> {
+    if file_ids.is_empty() {
+        return Err(SharedThreadError::new("bad_request", "Choose the files to restore."));
+    }
+    let at = ask_thread(&app, &shared_thread_id, |reply| SyncCommand::MergeVersions {
+        file_ids,
+        reply,
+    })
+    .await?;
+    let files: Vec<serde_json::Value> = at
+        .into_iter()
+        .map(|(file_id, base)| serde_json::json!({ "fileId": file_id, "baseVersion": base }))
+        .collect();
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    post_json(
+        &thread_url(&entry, "/restore"),
+        &token,
+        &serde_json::json!({ "version": version, "files": files }),
+    )
+    .await
+}
+
+/// Mark the thread as it is now as a Version, with an optional label.
+#[tauri::command]
+pub async fn shared_thread_mark_version(
+    app: AppHandle,
+    shared_thread_id: String,
+    label: Option<String>,
+) -> Result<atlas_thread_sync::versions::ThreadVersion> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let body = match label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+        Some(label) => serde_json::json!({ "label": label }),
+        None => serde_json::json!({}),
+    };
+    post_json(&thread_url(&entry, "/versions"), &token, &body).await
+}
+
+// ---------------------------------------------------------------------------
+// Remote Runs (ADR-0023, ATL-417)
+// ---------------------------------------------------------------------------
+//
+// A teammate asks this person's desktop to run a prompt. The request reaches
+// every desktop of theirs in the thread; the renderer shows who asks, the
+// exact prompt and agent, and that it bills them, and answers. An approved
+// request — by hand, or by the auto-approve they set for one person in one
+// thread — is executed like any Run of theirs: an agent session in the Run
+// worktree, sent exactly the prompt asked for, whose `begin_run` names the
+// request so the thread records the asker as its prompter.
+
+/// Longest agent name, and most agents, a desktop offers (the server's caps).
+const REMOTE_AGENT_MAX: usize = 40;
+const REMOTE_AGENTS_MAX: usize = 8;
+
+/// Turn "Accept Remote Runs" on or off in this thread, and set (or, with
+/// `clear_auto_approve`, clear) the one person whose requests are approved
+/// without asking. `agents` are the agents this machine runs them with: they
+/// are said when the thread connects, so offering different ones reconnects.
+#[tauri::command]
+pub async fn shared_thread_remote_settings(
+    app: AppHandle,
+    shared_thread_id: String,
+    accept: Option<bool>,
+    auto_approve: Option<String>,
+    clear_auto_approve: Option<bool>,
+    agents: Option<Vec<String>>,
+) -> Result<()> {
+    if let Some(agents) = agents {
+        offer_agents(&app, &shared_thread_id, agents).await?;
+    }
+    let auto_approve = if clear_auto_approve == Some(true) {
+        Some(None)
+    } else {
+        auto_approve.map(Some)
+    };
+    ask_thread(&app, &shared_thread_id, |reply| SyncCommand::RemoteSettings {
+        accept,
+        auto_approve,
+        reply,
+    })
+    .await?
+    .map_err(|e| SharedThreadError::new("remote_settings_refused", e))
+}
+
+/// Offer `agents` for Remote Runs in this thread from now on. They are said
+/// at `hello`, so a change takes a fresh connection — never under a Run.
+async fn offer_agents(app: &AppHandle, shared_thread_id: &str, agents: Vec<String>) -> Result<()> {
+    let agents = offerable(agents);
+    let entry = entry_of(app, shared_thread_id)?;
+    if entry.remote_agents == agents {
+        return Ok(());
+    }
+    let busy = app
+        .state::<SharedThreadsState>()
+        .runs
+        .lock()
+        .map_err(|_| poisoned())?
+        .values()
+        .any(|r| r.shared_thread_id == shared_thread_id);
+    if busy {
+        return Err(SharedThreadError::new(
+            "run_in_flight",
+            "A Run is in progress in this thread. Change what you offer once it ends.",
+        ));
+    }
+    let entry = SharedThreadEntry {
+        remote_agents: agents,
+        ..entry
+    };
+    remember(app, &entry)?;
+    let previous = {
+        let state = app.state::<SharedThreadsState>();
+        let mut running = state.running.lock().map_err(|_| poisoned())?;
+        running.remove(shared_thread_id)
+    };
+    if let Some(previous) = previous {
+        let _ = previous.commands.send(SyncCommand::Stop);
+    }
+    start(app, entry, None).await.map(|_| ())
+}
+
+/// Agent names as the server takes them: short, plain, at most eight.
+fn offerable(agents: Vec<String>) -> Vec<String> {
+    let mut agents: Vec<String> = agents
+        .into_iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| {
+            !a.is_empty()
+                && a.len() <= REMOTE_AGENT_MAX
+                && a.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_.".contains(ch))
+        })
+        .collect();
+    agents.sort();
+    agents.dedup();
+    agents.truncate(REMOTE_AGENTS_MAX);
+    agents
+}
+
+/// Approve or decline a Remote Run this person was asked to run. Answers
+/// where it stands after: a request that timed out meanwhile stays so.
+#[tauri::command]
+pub async fn shared_thread_answer_remote_run(
+    app: AppHandle,
+    shared_thread_id: String,
+    request_id: String,
+    approve: bool,
+) -> Result<RemoteRunStatus> {
+    ask_thread(&app, &shared_thread_id, |reply| SyncCommand::AnswerRemoteRun {
+        request_id,
+        approve,
+        reply,
+    })
+    .await?
+    .map_err(|e| SharedThreadError::new("remote_run_unknown", e))
+}
+
+/// Execute an approved Remote Run of this person's in the agent session
+/// `session_id`, opened in the thread's Run worktree with the request's
+/// agent: that session's next prompt — which must be the request's own,
+/// answered here — starts the Run that executes it, recorded as prompted by
+/// whoever asked. Once per request.
+#[tauri::command]
+pub async fn shared_thread_execute_remote_run(
+    app: AppHandle,
+    shared_thread_id: String,
+    request_id: String,
+    session_id: String,
+) -> Result<String> {
+    let request = {
+        let state = app.state::<SharedThreadsState>();
+        let running = state.running.lock().map_err(|_| poisoned())?;
+        let remote = running
+            .get(&shared_thread_id)
+            .map(|r| r.status.borrow().remote.clone())
+            .ok_or_else(|| {
+                SharedThreadError::new("not_joined", "This thread is not joined on this machine.")
+            })?;
+        remote
+            .requests
+            .into_iter()
+            .find(|r| {
+                r.request_id == request_id
+                    && r.status == RemoteRunStatus::Approved
+                    && remote.user_id.as_deref() == Some(r.runner_id.as_str())
+            })
+            .ok_or_else(|| {
+                SharedThreadError::new(
+                    "remote_run_unknown",
+                    "That Remote Run is not approved for you to run.",
+                )
+            })?
+    };
+    let state = app.state::<SharedThreadsState>();
+    if !state
+        .remote_executing
+        .lock()
+        .map_err(|_| poisoned())?
+        .insert(request_id.clone())
+    {
+        return Err(SharedThreadError::new(
+            "already_running",
+            "That Remote Run is already running on this machine.",
+        ));
+    }
+    state.remote_next.lock().map_err(|_| poisoned())?.insert(
+        session_id,
+        RemoteNext {
+            shared_thread_id,
+            request_id,
+            prompt: request.prompt.clone(),
+        },
+    );
+    Ok(request.prompt)
+}
+
+/// Whom this person may ask for a Remote Run in this thread now: the gate
+/// that refuses every ask, or the participants online on a desktop that
+/// accepts them, with the agents each offers. A hint; the ask checks again.
+#[tauri::command]
+pub async fn shared_thread_remote_runners(
+    app: AppHandle,
+    shared_thread_id: String,
+) -> Result<serde_json::Value> {
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    get_json(&thread_url(&entry, "/remote-runs"), &token).await
+}
+
+/// Ask `runner`'s desktop to run `prompt` with `agent`, on their machine and
+/// bill. Refused `remote_run_refused` with the gate's words.
+#[tauri::command]
+pub async fn shared_thread_request_remote_run(
+    app: AppHandle,
+    shared_thread_id: String,
+    runner: String,
+    agent: String,
+    prompt: String,
+) -> Result<RemoteRun> {
+    #[derive(Deserialize)]
+    struct Asked {
+        request: RemoteRun,
+    }
+    let entry = entry_of(&app, &shared_thread_id)?;
+    let token = token(&app).await?;
+    let asked: Asked = post_json(
+        &thread_url(&entry, "/remote-runs"),
+        &token,
+        &serde_json::json!({ "runner": runner, "agent": agent, "prompt": prompt }),
+    )
+    .await?;
+    Ok(asked.request)
+}
+
+// ---------------------------------------------------------------------------
 // Runs (ATL-405)
 // ---------------------------------------------------------------------------
 
@@ -1398,6 +1966,9 @@ pub async fn begin_run(
     } else {
         context_digest(app, &commands, &shared_thread_id, scope).await
     };
+    // An approved Remote Run executes as the prompt it asked for, and only
+    // that prompt: anything else typed here is the person's own Run.
+    let remote = take_remote_next(app, session_id, &shared_thread_id, prompt)?;
     let (reply, answer) = oneshot::channel();
     commands
         .send(SyncCommand::StartRun {
@@ -1407,6 +1978,7 @@ pub async fn begin_run(
                 agent: agent.to_string(),
                 model: model.unwrap_or("default").to_string(),
                 context_anchor: anchor.map(|run_no| format!("run:{run_no}")),
+                remote_request_id: remote.as_ref().map(|r| r.request_id.clone()),
             },
             reply,
         })
@@ -1414,10 +1986,16 @@ pub async fn begin_run(
     let started = match answer.await {
         Ok(Ok(started)) => started,
         refused => {
-            // The Run never began: "continue from here" still applies to the next one.
+            // The Run never began: "continue from here" still applies to the
+            // next one, and so does an approved Remote Run.
             if let Some(run_no) = anchor {
                 if let Ok(mut pending) = app.state::<SharedThreadsState>().continue_from.lock() {
                     pending.entry(shared_thread_id.clone()).or_insert(run_no);
+                }
+            }
+            if let Some(remote) = remote {
+                if let Ok(mut next) = app.state::<SharedThreadsState>().remote_next.lock() {
+                    next.entry(session_id.to_string()).or_insert(remote);
                 }
             }
             return Err(match refused {
@@ -1467,6 +2045,23 @@ pub async fn begin_run(
         },
     );
     Ok(digest)
+}
+
+/// The approved Remote Run this agent session was opened to execute, taken
+/// once — and only for the prompt it asked for, in its thread: anything else
+/// typed there first is the person's own Run.
+fn take_remote_next(
+    app: &AppHandle,
+    session_id: &str,
+    shared_thread_id: &str,
+    prompt: &str,
+) -> std::result::Result<Option<RemoteNext>, String> {
+    let state = app.state::<SharedThreadsState>();
+    let mut next = state.remote_next.lock().map_err(|_| poisoned().message)?;
+    let matches = next.get(session_id).is_some_and(|r| {
+        r.shared_thread_id == shared_thread_id && r.prompt.trim() == prompt.trim()
+    });
+    Ok(if matches { next.remove(session_id) } else { None })
 }
 
 /// Which Runs the next Run's digest covers: the thread's "continue from

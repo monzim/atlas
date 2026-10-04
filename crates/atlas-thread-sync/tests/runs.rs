@@ -56,6 +56,7 @@ fn spec(agent: &str) -> RunSpec {
         agent: agent.into(),
         model: "test-model".into(),
         context_anchor: None,
+        remote_request_id: None,
     }
 }
 

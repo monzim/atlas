@@ -13,9 +13,12 @@
 //! replicas, changes nothing. Edits then happen under each replica's own
 //! random client id.
 
+use base64::Engine as _;
 use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode as _;
 use yrs::{
-    Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, TextRef, Transact, Update,
+    Assoc, Doc, GetString, IndexedSequence, OffsetKind, Options, ReadTxn, StateVector, StickyIndex,
+    Text, TextRef, Transact, Update,
 };
 
 pub const TEXT_NAME: &str = "content";
@@ -50,6 +53,37 @@ pub fn random_client_id() -> u64 {
 pub struct FileDoc {
     doc: Doc,
     text: TextRef,
+}
+
+/// Lines of a file, 1-based and inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LineSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Where a comment on a Shared Thread's lines is (ATL-413, ATL-416): Yjs
+/// relative positions into the file's text, base64 — the same encoding the
+/// web's `yjs` writes, so either side resolves the other's — and the lines as
+/// they read when it was made.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RangeAnchor {
+    pub start: String,
+    pub end: String,
+    pub quote: String,
+}
+
+/// Where each line of `text` starts, as (UTF-16 offset, byte offset).
+fn line_starts(text: &str) -> Vec<(u32, usize)> {
+    let mut starts = vec![(0, 0)];
+    let mut utf16 = 0u32;
+    for (byte, ch) in text.char_indices() {
+        utf16 += ch.len_utf16() as u32;
+        if ch == '\n' {
+            starts.push((utf16, byte + 1));
+        }
+    }
+    starts
 }
 
 impl FileDoc {
@@ -120,6 +154,57 @@ impl FileDoc {
 
     pub fn content(&self) -> String {
         self.text.get_string(&self.doc.transact())
+    }
+
+    /// Anchor lines `span` of the text (ATL-416): relative positions that
+    /// follow it through edits, and the lines as they read now. The start
+    /// sticks to the range's first character and the end to its last, so
+    /// typing just outside it never widens it — as the web anchors them.
+    /// `None` for lines the text does not have.
+    pub fn anchor_lines(&self, span: LineSpan) -> Option<RangeAnchor> {
+        let text = self.content();
+        let starts = line_starts(&text);
+        if span.start < 1 || span.end < span.start || span.start as usize > starts.len() {
+            return None;
+        }
+        let total = (text.encode_utf16().count() as u32, text.len());
+        let from = starts[span.start as usize - 1];
+        let to = starts.get(span.end as usize).copied().unwrap_or(total);
+        if to.0 <= from.0 {
+            return None;
+        }
+        let mut txn = self.doc.transact_mut();
+        let start = self.text.sticky_index(&mut txn, from.0, Assoc::After)?;
+        let end = self.text.sticky_index(&mut txn, to.0, Assoc::Before)?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        Some(RangeAnchor {
+            start: b64.encode(start.encode_v1()),
+            end: b64.encode(end.encode_v1()),
+            quote: text[from.1..to.1].to_string(),
+        })
+    }
+
+    /// The lines an anchor covers in the text now, or `None` when the text
+    /// it was on is gone — the comment is outdated and shows its quote.
+    pub fn resolve_lines(&self, start: &str, end: &str) -> Option<LineSpan> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let start = StickyIndex::decode_v1(&b64.decode(start).ok()?).ok()?;
+        let end = StickyIndex::decode_v1(&b64.decode(end).ok()?).ok()?;
+        let txn = self.doc.transact();
+        let from = start.get_offset(&txn)?.index;
+        let to = end.get_offset(&txn)?.index;
+        if to <= from {
+            return None;
+        }
+        let text = self.text.get_string(&txn);
+        let starts = line_starts(&text);
+        let line_of = |offset: u32| starts.partition_point(|(s, _)| *s <= offset) as u32;
+        // The end sits after the range's last character; that character's
+        // line is the last one.
+        Some(LineSpan {
+            start: line_of(from),
+            end: line_of(to - 1),
+        })
     }
 
     /// Make the text equal `next` with the smallest single edit, and answer the

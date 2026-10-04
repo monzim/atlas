@@ -210,6 +210,7 @@ async fn a_run_after_another_participants_run_has_that_run_in_its_digest_and_con
         agent: "claude-code".into(),
         model: "opus".into(),
         context_anchor: None,
+        remote_request_id: None,
     };
     let run = joy.start_run(&joy_runs, spec).await.unwrap();
     joy.stream_run(
@@ -301,6 +302,7 @@ async fn a_run_after_another_participants_run_has_that_run_in_its_digest_and_con
         agent: "codex".into(),
         model: "gpt".into(),
         context_anchor: Some(format!("run:{}", run.run_no)),
+        remote_request_id: None,
     };
     let mine = monzim.start_run(&monzim_runs, spec).await.unwrap();
     let view = monzim
@@ -339,6 +341,7 @@ async fn a_run_that_ended_after_my_last_run_forked_is_still_news() {
         agent: agent.into(),
         model: "m".into(),
         context_anchor: None,
+        remote_request_id: None,
     };
     // Joy's Run starts first; Monzim's starts while hers is still going.
     let joy_runs = RunWorktree::new(&w.joy, &w.base, &w.replicas.join("joy-run"));

@@ -610,6 +610,36 @@ impl Replica {
             .collect()
     }
 
+    /// Every file the thread holds, deleted ones too, by id — what a diff
+    /// against the Base or a Thread Version compares (ATL-419).
+    pub fn file_states(&self) -> Vec<(u64, ThreadFile)> {
+        self.files
+            .iter()
+            .map(|(id, f)| {
+                (
+                    *id,
+                    ThreadFile {
+                        path: f.path.clone(),
+                        origin: f.origin.clone(),
+                        deleted: f.deleted,
+                        kind: f.kind,
+                        text: (f.kind == FileKind::Text && !f.deleted).then(|| f.doc.content()),
+                        blob: f.blob.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A live text file's document, for anchoring and resolving line
+    /// comments (ATL-416).
+    pub fn doc_of(&self, file_id: u64) -> Option<&FileDoc> {
+        self.files
+            .get(&file_id)
+            .filter(|f| f.kind == FileKind::Text && !f.deleted)
+            .map(|f| &f.doc)
+    }
+
     /// A file's canonical text as this replica holds it.
     pub fn text(&self, path: &str) -> Option<String> {
         let id = self.by_path.get(path)?;
