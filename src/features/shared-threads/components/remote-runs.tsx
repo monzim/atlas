@@ -70,7 +70,17 @@ export function approvedForMe(threads: SharedThreadView[]): Array<{ thread: Shar
     const remote = thread.status.remote;
     if (!remote?.userId) return [];
     return remote.requests
-      .filter((r) => r.status === "approved" && r.runId === null && r.runnerId === remote.userId)
+      // The server approved it; this machine checks again before it runs an
+      // agent on this person's bill (and the backend checks a third time).
+      .filter(
+        (r) =>
+          r.status === "approved" &&
+          r.runId === null &&
+          r.runnerId === remote.userId &&
+          remote.accept &&
+          remote.agents.includes(r.agent) &&
+          (!r.auto || remote.autoApprove === r.requestedBy),
+      )
       .map((request) => ({ thread, request }));
   });
 }

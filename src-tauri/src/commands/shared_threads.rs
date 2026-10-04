@@ -54,7 +54,7 @@ use atlas_thread_metadata::SharedThreadLink;
 use atlas_thread_sync::store::{StoreError, StoreFuture};
 use atlas_thread_sync::{
     ApplyOutcome, Command as SyncCommand, Connector, DigestComment, DigestScope, ObjectStore,
-    RemoteRun, RemoteRunStatus, Replica, Resolve, RunReport, RunSpec, SharePreview, SyncStatus,
+    RemoteRun, RemoteRunStatus, RemoteView, Replica, Resolve, RunReport, RunSpec, SharePreview, SyncStatus,
     ThreadEvent, ThreadRepo, ThreadSession, TransportError, WsTransport,
 };
 use base64::Engine as _;
@@ -1826,6 +1826,20 @@ pub async fn shared_thread_answer_remote_run(
 /// agent: that session's next prompt — which must be the request's own,
 /// answered here — starts the Run that executes it, recorded as prompted by
 /// whoever asked. Once per request.
+/// Whether this machine may run an approved request: it names this person as
+/// Runner, this desktop still accepts Remote Runs here and offers the agent
+/// asked for, and an auto-approval is still for the person who asked. The
+/// server checked all of this when it approved; it is checked again here
+/// because the request arrives over the wire and runs an agent on this
+/// machine, on this person's bill.
+fn runnable_here(remote: &RemoteView, r: &RemoteRun) -> bool {
+    r.status == RemoteRunStatus::Approved
+        && remote.user_id.as_deref() == Some(r.runner_id.as_str())
+        && remote.accept
+        && remote.agents.iter().any(|a| a == &r.agent)
+        && (!r.auto || remote.auto_approve.as_deref() == Some(r.requested_by.as_str()))
+}
+
 #[tauri::command]
 pub async fn shared_thread_execute_remote_run(
     app: AppHandle,
@@ -1844,12 +1858,9 @@ pub async fn shared_thread_execute_remote_run(
             })?;
         remote
             .requests
-            .into_iter()
-            .find(|r| {
-                r.request_id == request_id
-                    && r.status == RemoteRunStatus::Approved
-                    && remote.user_id.as_deref() == Some(r.runner_id.as_str())
-            })
+            .iter()
+            .find(|r| r.request_id == request_id && runnable_here(&remote, r))
+            .cloned()
             .ok_or_else(|| {
                 SharedThreadError::new(
                     "remote_run_unknown",

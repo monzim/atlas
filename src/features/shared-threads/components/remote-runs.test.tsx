@@ -84,6 +84,22 @@ describe("which requests ask this person", () => {
     expect(approvedForMe([thread([{ ...approved, runId: "run-1" }])])).toEqual([]);
     expect(approvedForMe([thread([approved], "monzim")])).toEqual([]);
   });
+
+  it("runs nothing this machine does not accept, offer or auto-approve", () => {
+    const approved = { ...REQUEST, status: "approved" as const };
+    const view = (remote: object) =>
+      ({
+        sharedThreadId: "thr_1",
+        title: "Banner",
+        status: {
+          remote: { userId: "joy", agents: ["claude-code"], accept: true, autoApprove: null, requests: [approved], ...remote },
+        },
+      }) as unknown as SharedThreadView;
+    expect(approvedForMe([view({ accept: false })])).toEqual([]);
+    expect(approvedForMe([view({ requests: [{ ...approved, agent: "codex" }] })])).toEqual([]);
+    expect(approvedForMe([view({ requests: [{ ...approved, auto: true }] })])).toEqual([]);
+    expect(approvedForMe([view({ autoApprove: "monzim", requests: [{ ...approved, auto: true }] })])).toHaveLength(1);
+  });
 });
 
 describe("the approval dialog", () => {
